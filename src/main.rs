@@ -34,14 +34,14 @@ impl FileConfig {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.permissions().mode() & 0o077 != 0 {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "config file holds credentials but is readable by group/other; run: chmod 0600 {}",
-                        path.display()
-                    );
-                }
+            if let Ok(meta) = std::fs::metadata(path)
+                && meta.permissions().mode() & 0o077 != 0
+            {
+                tracing::warn!(
+                    path = %path.display(),
+                    "config file holds credentials but is readable by group/other; run: chmod 0600 {}",
+                    path.display()
+                );
             }
         }
         serde_yaml::from_str(&text)

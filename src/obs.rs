@@ -248,6 +248,9 @@ impl ObsClient {
         (url, auth, date, x_obs)
     }
 
+    // One call = one signed request; grouping these fields into a struct
+    // would only move them one level down without making the call clearer.
+    #[allow(clippy::too_many_arguments)]
     fn send(
         &self,
         method: &str,
@@ -588,8 +591,9 @@ impl ObsClient {
         // at most CONCURRENCY requests (and part * CONCURRENCY bytes of
         // copied chunk data) are live at once.
         let mut handles: Vec<(u32, std::thread::JoinHandle<Result<String>>)> = Vec::new();
-        let mut part_no: u32 = 1;
-        for chunk in data.chunks(part) {
+        for (idx, chunk) in data.chunks(part).enumerate() {
+            // OBS numbers parts from 1.
+            let part_no = idx as u32 + 1;
             let client = self.clone();
             let key = key.to_owned();
             let upload_id = upload_id.clone();
@@ -598,7 +602,6 @@ impl ObsClient {
                 part_no,
                 std::thread::spawn(move || client.upload_part(&key, &upload_id, part_no, &chunk)),
             ));
-            part_no += 1;
             if handles.len() == CONCURRENCY {
                 // Join the whole batch even after a failure, so abort
                 // below cannot race an in-flight part upload.
@@ -772,14 +775,14 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
             }
             Ok(Event::End(e)) => {
                 let name = e.name().as_ref().to_owned();
-                if name == "Contents" {
-                    if let Some(key) = cur_key.take() {
-                        out.objects.push(ListEntry {
-                            is_dir_placeholder: key.ends_with('/'),
-                            key,
-                            size: cur_size,
-                        });
-                    }
+                if name == "Contents"
+                    && let Some(key) = cur_key.take()
+                {
+                    out.objects.push(ListEntry {
+                        is_dir_placeholder: key.ends_with('/'),
+                        key,
+                        size: cur_size,
+                    });
                 }
                 // Commit the element's text now that all fragments are in.
                 if let Some(elem) = cur_text_elem.take() {
@@ -815,10 +818,11 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
         buf.clear();
     }
     // OBS returns NextMarker only when truncated; fall back to the last key.
-    if out.is_truncated && out.next_marker.is_none() {
-        if let Some(last) = out.objects.last() {
-            out.next_marker = Some(last.key.clone());
-        }
+    if out.is_truncated
+        && out.next_marker.is_none()
+        && let Some(last) = out.objects.last()
+    {
+        out.next_marker = Some(last.key.clone());
     }
     Ok(out)
 }

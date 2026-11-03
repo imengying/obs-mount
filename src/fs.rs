@@ -293,11 +293,11 @@ impl Inner {
         }
         // Copy the cached entry out first so the borrow does not overlap
         // the mutable alloc_ino() call below.
-        if let Some(c) = self.meta_cache.get(path).cloned() {
-            if c.expires > Instant::now() {
-                let ino = self.alloc_ino(path);
-                return Some((ino, c.is_dir, c.size, c.mtime));
-            }
+        if let Some(c) = self.meta_cache.get(path).cloned()
+            && c.expires > Instant::now()
+        {
+            let ino = self.alloc_ino(path);
+            return Some((ino, c.is_dir, c.size, c.mtime));
         }
         // File?
         match self.client.head_object(path) {
@@ -390,18 +390,18 @@ impl Inner {
                 }
                 if let Some(open) = self.open_files.get(&fh) {
                     let key = open.key.clone();
-                    if let Some(staging) = open.staging.clone() {
-                        if let Ok(m) = fs::metadata(&staging) {
-                            self.meta_cache.insert(
-                                key,
-                                CachedMeta {
-                                    size: m.len(),
-                                    is_dir: false,
-                                    mtime: SystemTime::now(),
-                                    expires: Instant::now() + Duration::from_secs(5),
-                                },
-                            );
-                        }
+                    if let Some(staging) = open.staging.clone()
+                        && let Ok(m) = fs::metadata(&staging)
+                    {
+                        self.meta_cache.insert(
+                            key,
+                            CachedMeta {
+                                size: m.len(),
+                                is_dir: false,
+                                mtime: SystemTime::now(),
+                                expires: Instant::now() + Duration::from_secs(5),
+                            },
+                        );
                     }
                 }
                 None
@@ -624,18 +624,17 @@ impl Filesystem for ObsFs {
             // Stage the current remote content (if any) for read-modify-write,
             // unless the caller truncated (then start empty).
             let mut data: Vec<u8> = Vec::new();
-            if !trunc {
-                if let Ok(Some(meta)) = inner.client.head_object(&path) {
-                    if meta.size > 0 {
-                        match inner.client.get_range(&path, 0, meta.size as usize) {
-                            Ok(d) => data = d,
-                            Err(e) => {
-                                tracing::warn!(path, error = %e, "staging download failed");
-                                let err = inner.upload_error_reply(&e);
-                                reply.error(err);
-                                return;
-                            }
-                        }
+            if !trunc
+                && let Ok(Some(meta)) = inner.client.head_object(&path)
+                && meta.size > 0
+            {
+                match inner.client.get_range(&path, 0, meta.size as usize) {
+                    Ok(d) => data = d,
+                    Err(e) => {
+                        tracing::warn!(path, error = %e, "staging download failed");
+                        let err = inner.upload_error_reply(&e);
+                        reply.error(err);
+                        return;
                     }
                 }
             }
@@ -643,11 +642,9 @@ impl Filesystem for ObsFs {
                 reply.error(io_errno(&e));
                 return;
             }
-        } else if trunc {
-            if let Err(e) = fs::write(&staging, &[]) {
-                reply.error(io_errno(&e));
-                return;
-            }
+        } else if trunc && let Err(e) = fs::write(&staging, []) {
+            reply.error(io_errno(&e));
+            return;
         }
         let fh = inner.next_fh;
         inner.next_fh += 1;
@@ -800,7 +797,7 @@ impl Filesystem for ObsFs {
         let path = join_path(&parent_path, &name);
         let ino = inner.alloc_ino(&path);
         let staging = inner.staging_path(ino);
-        if let Err(e) = fs::write(&staging, &[]) {
+        if let Err(e) = fs::write(&staging, []) {
             reply.error(io_errno(&e));
             return;
         }
@@ -884,26 +881,24 @@ impl Filesystem for ObsFs {
             .get(&fh.0)
             .map(|f| f.dirty)
             .unwrap_or(false);
-        if dirty {
-            if let Err(e) = inner.upload_staging(fh.0) {
-                tracing::error!(error = %e, "release upload failed");
-                let err = inner.upload_error_reply(&e);
-                // Drop the handle anyway but keep the staging file: it may be
-                // the only copy of the data, and leaving it in place keeps it
-                // discoverable via the inode path.
-                inner.open_files.remove(&fh.0);
-                reply.error(err);
-                return;
-            }
+        if dirty && let Err(e) = inner.upload_staging(fh.0) {
+            tracing::error!(error = %e, "release upload failed");
+            let err = inner.upload_error_reply(&e);
+            // Drop the handle anyway but keep the staging file: it may be
+            // the only copy of the data, and leaving it in place keeps it
+            // discoverable via the inode path.
+            inner.open_files.remove(&fh.0);
+            reply.error(err);
+            return;
         }
-        if let Some(open) = inner.open_files.remove(&fh.0) {
-            if let Some(staging) = open.staging {
-                // Several handles can share one staging file (same inode);
-                // only the last one out may unlink it, otherwise a sibling
-                // handle's next write hits ENOENT. Read-only handles also
-                // reference the file, so every handle releases it.
-                inner.release_staging(&staging);
-            }
+        if let Some(open) = inner.open_files.remove(&fh.0)
+            && let Some(staging) = open.staging
+        {
+            // Several handles can share one staging file (same inode);
+            // only the last one out may unlink it, otherwise a sibling
+            // handle's next write hits ENOENT. Read-only handles also
+            // reference the file, so every handle releases it.
+            inner.release_staging(&staging);
         }
         reply.ok();
     }
@@ -1149,12 +1144,11 @@ impl Filesystem for ObsFs {
             let had_staging = staging.exists();
             if !had_staging {
                 let mut data: Vec<u8> = Vec::new();
-                if let Ok(Some(meta)) = inner.client.head_object(&path) {
-                    if meta.size > 0 {
-                        if let Ok(d) = inner.client.get_range(&path, 0, meta.size as usize) {
-                            data = d;
-                        }
-                    }
+                if let Ok(Some(meta)) = inner.client.head_object(&path)
+                    && meta.size > 0
+                    && let Ok(d) = inner.client.get_range(&path, 0, meta.size as usize)
+                {
+                    data = d;
                 }
                 if let Err(e) = fs::write(&staging, &data) {
                     reply.error(io_errno(&e));
