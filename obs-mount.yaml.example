@@ -6,7 +6,18 @@
 # 配置只含以下字段，未知字段启动时直接报错（不静默忽略）。
 mountpoint: /mnt/obs
 bucket: your-bucket-name
+
+# endpoint 支持两种写法，程序会从 host 自动判断用虚拟主机式还是路径式：
+#
+# 1) 桶虚拟主机式（推荐，少一层路径，符合 OBS 惯例）
 endpoint: https://your-bucket-name.obs.cn-north-4.myhuaweicloud.com
+#
+# 2) 服务级 endpoint + 单独的 bucket（与华为 obsfs 的配置习惯一致；
+#    host 里不含桶名时自动改用 /<bucket>/<key> 路径式请求）
+# endpoint: https://obs.cn-north-4.myhuaweicloud.com
+#
+# 用 IP 或自定义域名（VPN、内网穿透、CNAME）时也会自动走路径式。
+
 ak: YOUR_ACCESS_KEY_HERE
 sk: YOUR_SECRET_KEY_HERE
 # multipart_threshold: 8388608   # 可选，不配就默认 8 MiB（AWS 默认），达到该大小用分段上传

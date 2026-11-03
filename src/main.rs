@@ -4,7 +4,7 @@ mod obs;
 use clap::Parser;
 use fs::ObsFs;
 use fuser::MountOption;
-use obs::ObsClient;
+use obs::{BucketKind, ObsClient};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -173,7 +173,38 @@ fn main() -> anyhow::Result<()> {
     let staging_dir = std::env::temp_dir().join("obs-mount-staging");
     std::fs::create_dir_all(&staging_dir)?;
     let client = ObsClient::new(ak, sk, bucket.clone(), endpoint.clone());
-    // Startup self-check: the bucket must be listable before we mount,
+    tracing::info!(
+        endpoint = %endpoint,
+        addressing = if client.uses_path_style() { "path-style (/bucket/key)" } else { "virtual-host (bucket.host/key)" },
+        "OBS client configured"
+    );
+    // Startup self-check 1: refuse a POSIX/file bucket.
+    //
+    // OBS exposes both flat object buckets and POSIX file buckets behind the
+    // same endpoint. This program implements object-bucket semantics
+    // (placeholder objects for directories, copy+delete rename, whole-file
+    // uploads), so running it against a file bucket would silently misbehave.
+    // Huawei's obsfs makes the same distinction via `HEAD /` and
+    // x-obs-bucket-type / x-obs-fs-file-interface.
+    match client.bucket_kind() {
+        Ok(BucketKind::File) => {
+            anyhow::bail!(
+                "bucket {bucket} is an OBS POSIX/file bucket (HEAD / reports x-obs-bucket-type: POSIX). \
+                 This program only supports object buckets; a file bucket is already POSIX and \
+                 does not need a FUSE translation layer."
+            );
+        }
+        Ok(BucketKind::Object) => tracing::debug!(bucket = %bucket, "bucket is an object bucket"),
+        Ok(BucketKind::Unknown) => tracing::debug!(
+            bucket = %bucket,
+            "bucket type not reported; assuming an object bucket"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "HEAD / for bucket-type detection failed; continuing, the listing check below decides"
+        ),
+    }
+    // Startup self-check 2: the bucket must be listable before we mount,
     // otherwise a bad AK/SK or region shows up as an empty-looking mount.
     match client.list_dir("") {
         Ok(_) => {

@@ -42,14 +42,17 @@ const USAGE_TTL: Duration = Duration::from_secs(60);
 /// real limit -- it only keeps tools that precheck free space from treating
 /// the mount as full.
 ///
-/// Matches Huawei's own obsfs, which fills `f_blocks`/`f_bavail` with
-/// `0xFFFFFFFF` block of 4096 bytes (16 TiB) and comments "S3 doesn't have a
-/// real concept of filesystem size/limits". Same idea, larger ceiling: 16 TiB
-/// is small enough that a backup could plausibly fill it, which would make a
-/// statvfs() precheck refuse to write.
-const SYNTHETIC_TOTAL: u64 = 1 << 50; // 1 PiB
+/// Matches Huawei's own obsfs, which fills `f_blocks`/`f_bfree`/`f_bavail`
+/// with `0xFFFFFFFF` blocks of 4096 bytes and comments "S3 doesn't have a real
+/// concept of filesystem size/limits" (src/s3fs_operations.cpp:3109).
+/// Aligning with the vendor keeps `df` output recognizable to anyone who has
+/// used obsfs, and 16 TiB is the ceiling they settled on.
+const OBSFS_SYNTHETIC_BLOCKS: u64 = 0xFFFF_FFFF;
 const STATFS_BLOCK_SIZE: u32 = 4096;
-/// OBS keys are limited to 1023 bytes.
+const SYNTHETIC_TOTAL: u64 = OBSFS_SYNTHETIC_BLOCKS * STATFS_BLOCK_SIZE as u64;
+/// OBS object keys are limited to 1023 bytes; obsfs uses NAME_MAX (255)
+/// because it also serves generic S3 endpoints. Reporting the real key limit
+/// keeps `getconf NAME_MAX` honest for tools that check it.
 const STATFS_NAME_MAX: u32 = 1023;
 const ROOT_INO: u64 = 1;
 
@@ -1210,15 +1213,15 @@ impl Filesystem for ObsFs {
         let total_blocks = usage.total / bs;
         let used_blocks = (usage.used / bs).min(total_blocks);
         let free_blocks = total_blocks - used_blocks;
-        // No per-file limit is meaningful here, so report the standard
-        // "no limit" pair rather than inventing numbers that `df -i` would
-        // chart.
+        // obsfs reports 0xFFFFFFFF inodes as well; mirror it so `df -i` shows
+        // a number instead of "-", which some dashboards treat as an error.
+        let files = OBSFS_SYNTHETIC_BLOCKS;
         reply.statfs(
             total_blocks,
             free_blocks,
             free_blocks,
-            u64::MAX,
-            u64::MAX,
+            files,
+            files,
             STATFS_BLOCK_SIZE,
             STATFS_NAME_MAX,
             STATFS_BLOCK_SIZE,

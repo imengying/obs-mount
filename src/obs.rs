@@ -155,6 +155,28 @@ pub struct ListEntry {
     pub is_dir_placeholder: bool,
 }
 
+/// What kind of bucket sits behind the endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketKind {
+    /// Normal object bucket: flat key space, which is what this program expects.
+    Object,
+    /// OBS POSIX/file bucket (parallel file system). Mounting it as if it were
+    /// an object bucket would be wrong, so callers refuse.
+    File,
+    /// HeadBucket did not answer in a way we could interpret.
+    Unknown,
+}
+
+/// Decide the bucket kind from the two headers OBS uses for it. Split out so
+/// the rule is testable without a server.
+pub fn classify_bucket(bucket_type: &str, fs_interface: &str) -> BucketKind {
+    if bucket_type.eq_ignore_ascii_case("posix") || fs_interface.eq_ignore_ascii_case("enabled") {
+        BucketKind::File
+    } else {
+        BucketKind::Object
+    }
+}
+
 /// Bucket usage as reported by `GET /?storageinfo`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BucketUsage {
@@ -182,8 +204,68 @@ pub struct ObsClient {
     ak: String,
     sk: String,
     bucket: String,
-    endpoint: String, // e.g. https://obs.cn-north-4.myhuaweicloud.com (no trailing /)
+    /// Bare endpoint host, no trailing slash, e.g.
+    /// `https://obs.cn-north-4.myhuaweicloud.com`.
+    endpoint: String,
+    /// Whether requests put the bucket in the path (`/bucket/key`) instead of
+    /// the host (`bucket.obs.../key`). obsfs exposes this as
+    /// `pathrequeststyle` and switches to it automatically for IP endpoints,
+    /// where `bucket.1.2.3.4` is not a resolvable name. Without it, mounting
+    /// through a VPN/proxy/CNAME endpoint is impossible.
+    path_style: bool,
     http: Client,
+}
+
+/// Whether an endpoint must be addressed path-style (`/bucket/key`).
+///
+/// Two cases force it, both handled by obsfs as well (`pathrequeststyle`):
+///
+///  * the host is a bare IP address, where `bucket.10.0.0.1` cannot resolve;
+///  * the endpoint is a *service* endpoint whose host does not already start
+///    with the bucket name, e.g. `https://obs.cn-north-4.myhuaweicloud.com`.
+///
+/// The second case matters for usability: obsfs takes a service endpoint plus
+/// a separate bucket name, and users coming from it will configure the same
+/// way. Detecting it from the host means both spellings work with no extra
+/// flag:
+///
+///   endpoint: https://my-bucket.obs.cn-north-4.myhuaweicloud.com  (virtual)
+///   endpoint: https://obs.cn-north-4.myhuaweicloud.com            (path-style)
+fn needs_path_style(endpoint: &str, bucket: &str) -> bool {
+    match host_of(endpoint) {
+        Some(host) => is_ip_address(&host) || !host.starts_with(&format!("{bucket}.")),
+        None => false,
+    }
+}
+
+/// Extract the host (no scheme, no port, no path) from a URL.
+fn host_of(endpoint: &str) -> Option<String> {
+    let rest = endpoint
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(endpoint);
+    let host = rest.split('/').next().unwrap_or(rest);
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// True for IPv4 dotted quads and bracketed/simple IPv6 literals.
+fn is_ip_address(host: &str) -> bool {
+    if let Some(inner) = host.strip_prefix('[') {
+        return inner.contains(']');
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() == 4 {
+        return parts.iter().all(|p| {
+            !p.is_empty() && p.len() <= 3 && p.parse::<u16>().map(|n| n <= 255) == Ok(true)
+        });
+    }
+    // Bare IPv6 literal, e.g. "::1".
+    host.contains(':')
 }
 
 impl ObsClient {
@@ -192,13 +274,29 @@ impl ObsClient {
             .timeout(Duration::from_secs(120))
             .build()
             .expect("reqwest client");
+        let path_style = needs_path_style(&endpoint, &bucket);
         Self {
             ak,
             sk,
             bucket,
             endpoint: endpoint.trim_end_matches('/').to_string(),
+            path_style,
             http,
         }
+    }
+
+    /// Prefix that object URLs are appended to.
+    fn object_base(&self) -> String {
+        if self.path_style {
+            format!("{}/{}", self.endpoint, self.bucket)
+        } else {
+            self.endpoint.clone()
+        }
+    }
+
+    /// Whether requests must use path-style addressing.
+    pub fn uses_path_style(&self) -> bool {
+        self.path_style
     }
 
     #[allow(dead_code)]
@@ -251,15 +349,12 @@ impl ObsClient {
         );
         let auth = format!("OBS {}:{}", self.ak, sig);
         let url = if query.is_empty() {
-            format!("{}/{}", self.endpoint, encode_key(key))
+            format!("{}/{}", self.object_base(), encode_key(key))
         } else {
-            format!("{}/{}?{}", self.endpoint, encode_key(key), query)
+            format!("{}/{}?{}", self.object_base(), encode_key(key), query)
         };
-        // When endpoint already contains the bucket as virtual host, the
-        // object URL is <endpoint>/<key>. When a custom endpoint without a
-        // bucket host is used, callers pass OBS_ENDPOINT including the bucket
-        // host (documented in README); the resource string above still uses
-        // /<bucket>/<key> as the API requires.
+        // The canonical resource above is always /<bucket>/<key>; only the
+        // URL shape differs between virtual-hosted and path-style requests.
         (url, auth, date, x_obs)
     }
 
@@ -357,6 +452,41 @@ impl ObsClient {
                 body,
             })
         }
+    }
+
+    /// Bucket kind, as revealed by `HEAD /` (HeadBucket).
+    ///
+    /// OBS serves two very different things behind the same endpoint: an
+    /// *object* bucket (flat key space, what this program targets) and a
+    /// *POSIX/file* bucket (parallel file system semantics). A file bucket
+    /// answers `HEAD /` with `x-obs-bucket-type: POSIX` and/or
+    /// `x-obs-fs-file-interface: Enabled`; an object bucket sends neither.
+    /// Huawei's obsfs does exactly this detection before mounting
+    /// (S3fsCurl::DetectBucketTypeFromHeaders).
+    ///
+    /// Mounting a file bucket through this program would produce subtly wrong
+    /// behaviour (placeholder objects instead of real directories, no atomic
+    /// rename), so the caller is expected to refuse rather than guess.
+    pub fn bucket_kind(&self) -> Result<BucketKind> {
+        let resp = self.send("HEAD", "", "", None, "", &[], &[])?;
+        let status = resp.status().as_u16();
+        if status == 404 || status == 403 {
+            // Not readable as a bucket: let the caller report the real error
+            // via list_dir() instead of masking it as "object bucket".
+            return Ok(BucketKind::Unknown);
+        }
+        let resp = Self::check(resp, "HEAD", "/")?;
+        let headers = resp.headers();
+        let value = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let bucket_type = value("x-obs-bucket-type");
+        let fs_interface = value("x-obs-fs-file-interface");
+        Ok(classify_bucket(&bucket_type, &fs_interface))
     }
 
     pub fn head_object(&self, key: &str) -> Result<Option<ObjectMeta>> {
@@ -993,6 +1123,79 @@ mod tests {
     fn parse_tag_unescapes_entities() {
         let xml = "<R><Key>a&amp;b&lt;c</Key></R>";
         assert_eq!(parse_tag(xml, "Key"), Some("a&b<c".to_string()));
+    }
+
+    #[test]
+    fn virtual_host_endpoint_keeps_virtual_host_style() {
+        // The documented Huawei form: the host already starts with the bucket.
+        assert!(!needs_path_style(
+            "https://my-bucket.obs.cn-north-4.myhuaweicloud.com",
+            "my-bucket"
+        ));
+        assert!(!needs_path_style(
+            "https://my-bucket.obs.cn-north-4.myhuaweicloud.com/",
+            "my-bucket"
+        ));
+    }
+
+    #[test]
+    fn service_endpoint_uses_path_style() {
+        // obsfs takes a service endpoint plus a separate bucket name; the
+        // host does not contain the bucket, so the bucket must go in the path.
+        assert!(needs_path_style(
+            "https://obs.cn-north-4.myhuaweicloud.com",
+            "my-bucket"
+        ));
+        assert!(needs_path_style(
+            "http://obs.cn-north-4.myhuaweicloud.com:8080",
+            "my-bucket"
+        ));
+    }
+
+    #[test]
+    fn ip_endpoints_use_path_style() {
+        // "bucket.10.0.0.1" cannot resolve, so virtual-host style is impossible.
+        assert!(needs_path_style("http://10.0.0.1", "b"));
+        assert!(needs_path_style("https://192.168.1.100:8080", "b"));
+        assert!(needs_path_style("http://[::1]:9000", "b"));
+    }
+
+    #[test]
+    fn object_url_follows_the_addressing_style() {
+        let virtual_host = ObsClient::new(
+            "ak".into(),
+            "sk".into(),
+            "b".into(),
+            "https://b.obs.cn-north-4.myhuaweicloud.com".into(),
+        );
+        assert!(!virtual_host.uses_path_style());
+        assert_eq!(
+            virtual_host.object_base(),
+            "https://b.obs.cn-north-4.myhuaweicloud.com"
+        );
+
+        let path_style = ObsClient::new(
+            "ak".into(),
+            "sk".into(),
+            "b".into(),
+            "https://obs.cn-north-4.myhuaweicloud.com".into(),
+        );
+        assert!(path_style.uses_path_style());
+        assert_eq!(
+            path_style.object_base(),
+            "https://obs.cn-north-4.myhuaweicloud.com/b"
+        );
+    }
+
+    /// OBS serves POSIX/file buckets behind the same endpoint; mounting one as
+    /// an object bucket would be silently wrong. Mirrors obsfs's detection.
+    #[test]
+    fn bucket_kind_follows_obs_headers() {
+        assert_eq!(classify_bucket("POSIX", ""), BucketKind::File);
+        assert_eq!(classify_bucket("posix", "Enabled"), BucketKind::File);
+        assert_eq!(classify_bucket("", "enabled"), BucketKind::File);
+        assert_eq!(classify_bucket("", ""), BucketKind::Object);
+        assert_eq!(classify_bucket("OBJECT", "Disabled"), BucketKind::Object);
     }
 
     #[test]

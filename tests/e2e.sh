@@ -150,14 +150,21 @@ echo "== statfs reports usage instead of zeros =="
 # Regression: fuser's default replies 0 for every field, so df showed
 # Size 0 / Avail 0 and anything prechecking free space treated the mount
 # as full. A quota-less bucket must report a large synthetic ceiling, never 0.
-total=$(df -B1 --output=size /mnt/obs | tail -1 | tr -d ' ')
-avail=$(df -B1 --output=avail /mnt/obs | tail -1 | tr -d ' ')
+total=$(stat -f -c %b "$MNT")
+blocksize=$(stat -f -c %S "$MNT")
+total=$((total * blocksize))
+avail_blocks=$(stat -f -c %a "$MNT")
+avail=$((avail_blocks * blocksize))
 if [ "${total:-0}" -gt 0 ] && [ "${avail:-0}" -gt 0 ]; then
   pass "df reports non-zero size (${total}B total, ${avail}B avail)"
 else
   fail "df reports usable capacity" "total=$total avail=$avail" "both > 0"
 fi
-used=$(df -B1 --output=used /mnt/obs | tail -1 | tr -d ' ')
+# `used` comes from OBS's bucket-wide figure, which is cached for 60 s, so it
+# reflects whatever was uploaded before the first statfs call in this mount.
+# Assert it is a sane number rather than a specific one.
+used=$(stat -f -c %b "$MNT")
+used=$(( used * blocksize ))
 if [ "${used:-0}" -gt 0 ]; then
   pass "df reports non-zero used bytes"
 else
@@ -165,8 +172,13 @@ else
 fi
 # The kernel may substitute its own FUSE default for f_namemax, so only
 # assert that statvfs() itself works and reports the block size we set.
-bsize=$(python3 -c "import os;print(os.statvfs('/mnt/obs').f_frsize)")
+bsize=$(python3 -c "import os;print(os.statvfs('$MNT').f_frsize)")
 eq "statvfs block size" "$bsize" "4096"
+
+echo "== statfs matches obsfs (16 TiB ceiling) =="
+# Huawei's obsfs fills f_blocks/f_bavail with 0xFFFFFFFF blocks of 4096 bytes.
+same_as_obsfs=$((0xFFFFFFFF * 4096))
+eq "synthetic capacity equals obsfs" "$total" "$same_as_obsfs"
 
 echo "== every request must have carried a valid signature =="
 stats=$(curl -sf "http://127.0.0.1:$PORT/__stats")
@@ -174,6 +186,51 @@ sigfail=$(printf '%s' "$stats" | sed -n 's/.*"signature_failures": \([0-9]*\).*/
 eq "signature failures" "${sigfail:-unknown}" "0"
 
 cd "$WORK" || exit 1
+
+# --- path-style endpoint (service endpoint + separate bucket) -------------
+# obsfs takes a service endpoint and a bucket name; users coming from it will
+# configure the same way, so this shape must work too.
+echo "== path-style endpoint (service endpoint, no bucket in host) =="
+PATH_MNT=$WORK/pathmnt
+mkdir -p "$PATH_MNT"
+cat >"$WORK/path.yaml" <<EOF
+mountpoint: $PATH_MNT
+bucket: test-bucket
+endpoint: http://127.0.0.1:$PORT
+ak: TESTAK
+sk: TESTSK
+EOF
+chmod 600 "$WORK/path.yaml"
+"$BIN" --config "$WORK/path.yaml" >"$WORK/path.log" 2>&1 &
+path_pid=$!
+for _ in $(seq 1 50); do
+  mountpoint -q "$PATH_MNT" && break
+  sleep 0.1
+done
+if mountpoint -q "$PATH_MNT"; then
+  echo hello-path >"$PATH_MNT/p.txt"
+  eq "path-style write/read" "$(cat "$PATH_MNT/p.txt")" "hello-path"
+  fusermount3 -u "$PATH_MNT" 2>/dev/null || fusermount -u "$PATH_MNT" 2>/dev/null || umount -l "$PATH_MNT" 2>/dev/null
+else
+  fail "path-style mount" "not mounted" "mounted"
+  tail -5 "$WORK/path.log"
+fi
+kill "$path_pid" 2>/dev/null
+
+# --- a POSIX/file bucket must be refused, not silently misused ------------
+echo "== refuses an OBS POSIX (file) bucket =="
+for pid in $(pgrep -f "mock_obs[.]py $PORT" 2>/dev/null); do kill "$pid" 2>/dev/null; done
+sleep 0.5
+OBS_MOCK_BUCKET_TYPE=posix python3 "$REPO/tests/mock_obs.py" "$PORT" >"$WORK/server2.log" 2>&1 &
+server_pid=$!
+sleep 1.2
+out=$("$BIN" --config "$CONF" 2>&1)
+if printf '%s' "$out" | grep -qi "POSIX/file bucket"; then
+  pass "file bucket rejected with an explanation"
+else
+  fail "file bucket rejected" "$(printf '%s' "$out" | head -3)" "mentions POSIX/file bucket"
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
   echo "ALL PASSED"

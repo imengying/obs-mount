@@ -29,6 +29,8 @@ OBJECTS = {}          # key -> bytes
 META = {}             # key -> {'mtime': str}
 UPLOADS = {}          # upload_id -> {'key':..., 'parts': {n: bytes}}
 QUOTA = int(os.environ.get("OBS_MOCK_QUOTA", "0"))  # bytes; 0 = no quota set
+# "posix" makes HEAD / report x-obs-bucket-type: POSIX, i.e. an OBS file bucket
+BUCKET_TYPE = os.environ.get("OBS_MOCK_BUCKET_TYPE", "object")
 _lock = threading.Lock()
 _seq = [0]
 
@@ -48,6 +50,10 @@ def canonicalized_resource(path, raw_query):
     # virtual-host style: the bucket is NOT in the URL path
     bucket = BUCKET
     key = unquote(path[1:]) if len(path) > 1 else ""
+    if key == BUCKET:
+        key = ""
+    elif key.startswith(BUCKET + "/"):
+        key = key[len(BUCKET) + 1:]
     res = f"/{bucket}/{key}"
     subs = []
     if raw_query:
@@ -182,6 +188,12 @@ class Handler(BaseHTTPRequestHandler):
     def route(self):
         raw_path, raw_query = self.path.split("?", 1) if "?" in self.path else (self.path, "")
         key = unquote(raw_path[1:]) if len(raw_path) > 1 else ""
+        # Path-style addressing puts the bucket as the first path segment:
+        #   /test-bucket/key   instead of   /key
+        if key == BUCKET:
+            key = ""
+        elif key.startswith(BUCKET + "/"):
+            key = key[len(BUCKET) + 1:]
         return key, parse_qs_strict(raw_query), raw_query
 
     # ---------- HTTP verbs ----------
@@ -244,6 +256,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         if not self.check_auth(b""):
+            return
+        r0 = self.route()
+        if r0 and r0[0] == "":
+            # HeadBucket: used by obs-mount to reject POSIX/file buckets.
+            self.logreq(200)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            if BUCKET_TYPE == "posix":
+                self.send_header("x-obs-bucket-type", "POSIX")
+                self.send_header("x-obs-fs-file-interface", "Enabled")
+            self.end_headers()
             return
         r = self.route()
         if not r:
