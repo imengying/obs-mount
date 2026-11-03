@@ -201,7 +201,18 @@ eq "readlink" "$(readlink link.txt)" "real.txt"
 eq "symlink target readable" "$(cat link.txt)" "target"
 
 echo "== extended attributes =="
-if setfattr -n user.colour -v blue meta.txt 2>/dev/null; then
+# Use an actual invocation rather than `command -v`: it succeeds for
+# non-executable files too, which would make this guard useless.
+have_xattr=0
+if setfattr --version >/dev/null 2>&1 || getfattr --version >/dev/null 2>&1; then
+  have_xattr=1
+fi
+if [ "${OBS_E2E_REQUIRE_XATTR:-0}" = "1" ] && [ "$have_xattr" = "0" ]; then
+  # CI sets this so a missing `attr` package fails the build instead of
+  # skipping -- a silently skipped branch is how the base64-padding bug
+  # survived a whole round of "all tests pass".
+  fail "xattr tools available" "setfattr missing" "install the attr package"
+elif setfattr -n user.colour -v blue meta.txt 2>/dev/null; then
   eq "getfattr" "$(getfattr --only-values -n user.colour meta.txt 2>/dev/null)" "blue"
   eq "listxattr contains name" "$(getfattr -d meta.txt 2>/dev/null | grep -c user.colour)" "1"
   # A second attribute must not clobber the first.
