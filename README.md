@@ -3,25 +3,30 @@
 把华为云 OBS **对象桶**挂成本地目录的 FUSE 程序（Rust edition 2024）。
 
 **只走 OBS 原生 REST 签名**（HMAC-SHA1，`Authorization: OBS <AK>:<签名>`，
-`x-obs-*` 头），不含任何 S3/SigV4 代码路径。签名与接口细节以
-`~/workspace/your_files/Huawei-OBS-Rust-Native-Mount.md` 为准。
+`x-obs-*` 头），不含任何 S3/SigV4 代码路径。签名规则见
+[OBS API 参考](https://support.huaweicloud.com/api-obs/obs_04_0011.html)
+（`StringToSign`、`CanonicalizedHeaders`、`CanonicalizedResource`）。
 
 ## 项目结构
 
 ```text
 obs-mount/
   Cargo.toml / Cargo.lock
+  LICENSE                 # MIT
+  .github/workflows/ci.yml  # 格式/静态检查/测试 + glibc & musl 双构建，tag 发版
   src/
     main.rs   # CLI（clap）：mountpoint、bucket/endpoint/AK/SK（环境变量）、
               #   分段阈值（可选，默认 8 MiB，学 AWS CLI/boto3）；staging 固定在系统临时目录，
               #   allow_root 恒开；启动先做桶可达自检，不过不挂载；
+              #   检测 fusermount，缺失时降级挂载（无 auto_unmount）并提示装 fuse3；
               #   日志到 stderr（systemd journal 直接收）
     obs.rs    # OBS 原生客户端：签名（HMAC-SHA1 + 规范头/规范资源/子资源白名单）、
               #   ListObjects（含翻页）、HeadObject、GetObject Range 读、
               #   PutObject、DeleteObject、CopyObject（rename 用）、
               #   分段上传（初始化/传段/合并/取消）+ XML 解析 + 单测
     fs.rs     # FUSE 文件系统（fuser 0.18）：inode↔key 映射、元数据缓存（5 秒 TTL）、
-              #   写 staging、关闭时整文件上传
+              #   写 staging（按句柄引用计数管理生命周期）、关闭时整文件上传、
+              #   rename 时 inode 号保持不变只改指向
   obs-mount.service       # systemd 单元（见“部署”）
   obs-mount.yaml.example  # 配置模板（YAML，唯一格式；占位符，无真实凭据）
 ```
@@ -32,18 +37,19 @@ obs-mount/
 |---|---|
 | `lookup` / `getattr` | `HEAD /<key>`；目录先查 `<dir>/` 占位对象，再用 `prefix=<dir/>&delimiter=/&max-keys=1` 探查 |
 | `readdir` | `GET ?prefix=<dir/>&delimiter=/` 翻页聚合（`CommonPrefixes` + `Contents`），含 `.` / `..` |
-| `open` / `read` | 读模式直接 Range GET（先 HEAD 定长，越过 EOF 返回空）；写模式把远端内容（如有）下载到 staging 做 read-modify-write |
+| `open` / `read` | 读模式直接 Range GET（先 HEAD 定长，越过 EOF 返回空）；写模式把远端内容（如有）下载到 staging 做 read-modify-write。会话内已有 staging 时读写句柄都用它，避免读到尚未上传的旧内容 |
 | `create` / `write` | 只写本地 staging 文件，不逐次 PUT |
 | `flush` / `fsync` / `release` | 关闭/刷盘时上传：小于阈值单 PUT，大于等于阈值分段上传（默认 8 MiB，学 AWS CLI/boto3），分片 8 MiB（超 80 GiB 的文件自动放大分片以不超 10000 片上限）、4 路并行上传，失败先等齐在途分片再 abort 整个分段上传 |
 | `mkdir` / `rmdir` | PUT `<dir>/` 零字节占位对象 / 非空检查后删占位对象 |
 | `unlink` | `DELETE /<key>` |
-| `rename` | **Copy + Delete，非原子**（目录递归逐 key；中途失败不回滚） |
-| `setattr` | 仅截断（下载→本地截断→重传）；mode/uid/gid/atime 等忽略（OBS 不存 Unix 权限），以免 `cp -p` 类工具失败 |
+| `rename` | **Copy + Delete，非原子**（目录递归逐 key；中途失败不回滚，已在日志中明示）。成功后 inode 号不变、只把映射指向新 key，打开中的句柄同样改 key |
+| `setattr` | 仅截断（下载→本地截断→重传）；mode/uid/gid/atime 等忽略（OBS 不存 Unix 权限），以免 `cp -p` 类工具失败。截断不再销毁仍被句柄使用的 staging，`echo x > file` 可重复执行 |
 | `statfs` | 未重写，用 fuser 默认固定值（`df` 数字是假的，以控制台为准） |
 
 未实现（默认返回 `ENOSYS` 或内核默认）：`symlink` / `hardlink`（OBS 无此语义）、
 `chmod` / `chown` / `xattr`（无存储位置）、`mknod`。`forget` 未重写，
-inode 映射在进程生命周期内只增不减（备份场景可接受，长期挂载会缓慢增长）。
+inode 映射在进程生命周期内只增不减（备份场景可接受，长期挂载会缓慢增长；
+`rename` 会重映射而不是新增条目）。
 
 **并发模型**：fuser 0.18 的 trait 走 `&self`，全部可变状态放在一个
 `Mutex` 后，请求（含 OBS 往返）串行执行。备份场景够用，高并发场景需改分片锁。
@@ -70,17 +76,32 @@ obs-mount.yaml.example 重写一份。
 `OBS_ENDPOINT` 必须是桶虚拟主机域名，不要用裸 service endpoint；
 不要跨区域挂载。服务器时钟必须 NTP 对时（签名 Date 偏差超 15 分钟即 403）。
 
-## 构建（当前默认：动态链接）
+## 构建
+
+需要 Rust stable（edition 2024）。两条路线都验证过：
 
 ```sh
-# 动态链接版（glibc），当前默认做法；Debian 13 上直接这样编即可
+# 1) 动态链接（glibc）：快，适合在目标机直接跑
 cargo build --release
 # 产物：target/release/obs-mount
+
+# 2) 全静态（musl）：拷到任意 x86_64 Linux 都能跑，无需 glibc/libfuse
+sudo apt-get install -y musl-tools            # Debian 13 (trixie) 自带 1.2.5
+rustup target add x86_64-unknown-linux-musl
+CC_x86_64_unknown_linux_musl=musl-gcc \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+  cargo build --release --target x86_64-unknown-linux-musl
+# 产物：target/x86_64-unknown-linux-musl/release/obs-mount
 ```
 
-全静态版（musl）为可选项，不再是默认：此前已验证可行，见下节“静态编译”
-（本机曾用 zig 0.15.1 交叉编译出 7.5MB 全静态二进制）。你说会在 Debian 13
-上手动编译，那就直接用上面动态版，不用走 musl 路线。
+**不需要 zig。** fuser 0.18 默认不链接 libfuse（直接读写 `/dev/fuse`），
+所以 FUSE 层不阻碍静态化；整棵树里唯一的 C 依赖是 rustls 拉进来的
+`aws-lc-sys`，Debian 13 的 `musl-tools` 就够。实测产物 9.3 MB，
+`file` 显示 `static-pie linked`、`ldd` 显示 `statically linked`。
+
+CI（`.github/workflows/ci.yml`）会在 `debian:trixie-slim` 容器里跑这条路，
+所以上面的命令和 GitHub Actions 用的是同一套；推 tag 时两种二进制
+会自动附加到 release。
 
 运行：
 
@@ -96,43 +117,16 @@ obs-mount.yaml.example，含 AK/SK 的文件务必 0600（权限放宽时启动�
 二进制与配置文件统一放在 /etc/obs/ 目录：`/etc/obs/obs-mount` 与
 `/etc/obs/obs-mount.yaml`（见“部署”）。
 
-## 静态编译结论（已验证）
-
-**全静态构建成功。** 关键点：fuser 0.18 默认不链接 libfuse
-（直接走 `/dev/fuse`），所以 FUSE 层不是静态化的障碍；
-真正的卡点在 TLS 的 C 依赖（reqwest 0.13 → rustls → aws-lc-sys），
-它需要一个 musl C 工具链，而本沙箱里：
-
-1. `apt-get install musl-tools` 不可用（apt 源不可达，`apt-get update` 无响应）；
-2. musl.cc 的 `x86_64-linux-musl-cross`（GCC 11.2.1）二进制在本容器里
-   直接段错误（连 `--version` 都跑不起来）；
-3. 改用 zig 0.15.1 的 `zig cc` 后又遇到两处需要手工处理：
-   cc-rs 传的 `--target=x86_64-unknown-linux-musl`（Rust triple）被 zig
-   拒绝（`UnknownOperatingSystem`），以及 rustc 自带的 musl CRT 对象
-   （rcrt1.o）与 zig 的 crt1.o 的 `_start` 重定义冲突。
-   解决：包装脚本过滤掉 Rust triple 参数（`tools/zig-musl-cc.sh`），
-   并以 `RUSTFLAGS="-C link-self-contained=no"` 让 zig 的 CRT 接管。
-
-`ldd` 证据（2026-11-03 实测）：
-
-```text
-$ ldd target/x86_64-unknown-linux-musl/release/obs-mount
-        not a dynamic executable
-
-$ ldd target/release/obs-mount
-        linux-vdso.so.1 (0x00007a9d83461000)
-        libgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1
-        libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
-        /lib64/ld-linux-x86-64.so.2
-```
-
-**退路**（如果在目标机上不想用 zig）：在目标机装好 musl-tools 后，
-`CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc` 走标准 musl 交叉编译
-即可，不需要 zig；或直接用动态链接版（glibc + libgcc_s 即可，无 libfuse 依赖）。
+**挂载需要 fuse3 包提供的 `fusermount` 助手**（Debian/Ubuntu:
+`apt-get install fuse3`）。缺了它程序仍可挂载，只是没有 `auto_unmount`，
+启动时会给出安装提示；以 root 直接走 `/dev/fuse` 时通常感觉不到差别。
 
 ## 部署（systemd）
 
 ```sh
+# 运行期依赖只有一个：fusermount 助手（提供 auto_unmount 与普通用户挂载）
+sudo apt-get install -y fuse3
+
 mkdir -p /etc/obs
 install -m 0755 target/release/obs-mount /etc/obs/obs-mount
 install -m 0644 obs-mount.service /etc/systemd/system/obs-mount.service
@@ -143,24 +137,50 @@ journalctl -u obs-mount -f
 ```
 
 卸载：`systemctl stop obs-mount`（或 `fusermount -u /mnt/obs`）。
-staging 目录在系统临时目录下自动创建，无需手动建；allow_root 恒开，
-挂载同时设了 `auto_unmount`，服务退出时自动卸载。
+staging 目录在系统临时目录下自动创建，无需手动建；allow_root 恒开。
+装了 `fuse3` 时会自动启用 `auto_unmount`，服务退出即懒卸载；
+没装也能挂载，但需要手动 `umount`。`ExecStop` 里的 `/bin/fusermount`
+按 `fuse3` 的安装路径写的，若发行版把它放在别处（如 `/usr/bin/fusermount3`），
+改一下这一行即可。
 
-## 验证状态（2026-11-03，诚实记录）
+## 验证状态
 
-- `cargo build --release` 成功；`cargo test --release` 3/3 通过
-  （签名确定性、子资源过滤、ListBucket XML 解析）。
-- `--help` / `--version` 正常；无配置启动时 clap 明确报缺失参数；
-  挂载点不存在时报 `mountpoint ... is not a directory`；
-  占位凭据启动时桶自检失败、拒绝挂载并给出排查提示（AK/SK、区域、时钟）。
-- **未做真实 OBS 联调**：没有真实凭据，签名只在本地单测层面验证，
-  未对真实桶跑过 List/Get/Put；上生产桶前务必先在测试桶做 P0 只读验证。
-- **未做真实挂载测试**：本容器无 `/dev/fuse`，无法实际 mount；
-  FUSE 操作的正确性目前只到“按 fuser 0.18 trait 签名编译通过”这一层。
-- reqwest 锁定在 0.13.1：`cargo search` 显示 crates.io 最新是 0.13.5，
-  但本地索引解析不到 0.13.5（`--precise 0.13.5` 冲突），故用本地可解析的
-  最新稳定版 0.13.1；其余直接依赖均为本地可解析的最新正式版
-  （libc 0.2 系：1.0 还是 alpha，按要求排除）。
+### 已做到的
+
+- `cargo build --release`、`cargo test`（13 个用例）、`cargo clippy -D warnings`、
+  `cargo fmt --check` 全部通过。
+- **真实挂载 + 端到端读写已验证**（2026-11-03）：容器内有 `/dev/fuse`，
+  用本仓库搭的 OBS 协议模拟服务（严格校验 HMAC-SHA1 签名，签名不符直接 403）
+  挂上 `/mnt/obs` 后实测通过：
+    - 建目录（含多级）、`readdir`/`lookup`/`getattr`，`find` 与 `os.walk` 结果一致
+    - 小文件写读、重复覆盖同名文件、追加写、`truncate`、Range 读
+    - 20 MiB 文件走分段上传（4 路并行），md5 与本地一致；8 MiB 阈值边界判定正确
+    - `unlink`、`rmdir`（含非空返回 `ENOTEMPTY`）、文件与目录 `rename`
+    - 空格、中文、`+`/`%` 等特殊字符 key，同一文件多句柄并发
+- 静态 musl 构建实测 `statically linked`（见“构建”）。
+
+### 仍未做到的（上生产前务必补）
+
+- **没有对真实华为云 OBS 桶跑过**：签名与协议只在本地模拟服务上验证，
+  模拟服务按文档实现，但不保证覆盖真实服务的所有行为差异。
+  上生产前请先在测试桶做一轮只读验证（List / Head / Range Get）。
+- 未做长时间稳定性与断网重连测试；失败重试目前只有 5xx 退避，没有断点续传。
+- `statfs` 仍是 fuser 默认值，`df` 显示的数字无意义。
+
+### 本轮修掉的缺陷
+
+以下都是上面那套端到端测试暴露出来的，此前单元测试无法发现：
+
+1. **分段上传失败**（P0）：XML 解析遇到 `<?xml ?>` 声明就提前退出，
+   `UploadId` 永远解析不到 → 所有 ≥8 MiB 的上传报 `no UploadId in response`。
+2. **覆盖已有文件失败**（P0）：`setattr(size=0)` 在上传后删掉 staging 文件，
+   但同一句柄仍在用它，后续 `write` 报 ENOENT；表现为 `echo x > file` 第二次起失败。
+3. **`rename` 后新名字不可见**（P0）：成功路径把新路径的 inode 映射一起删了，
+   内核还握着那个 inode，`mv a b && cat b` 报 ENOENT 且不发任何请求，
+   直到元数据 TTL 过期。现在改成保留 inode 号、只重指向新路径，打开中的句柄一并改 key。
+4. **缺 `fusermount` 时报裸 ENOENT**：现在会检测助手是否存在，缺了就降级挂载并
+   提示安装 `fuse3`，而不是抛一句 `No such file or directory`。
+5. 同一 inode 的第二个只读句柄读不到刚写入的内容（staging 未被只读句柄复用）。
 
 ## 依赖版本（Cargo.lock 实际锁定，直接依赖）
 
