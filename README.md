@@ -121,19 +121,26 @@ CI（`.github/workflows/ci.yml`）会在 `debian:trixie-slim` 容器里跑这条
 
 ## 发布
 
-**只有推 `v*` tag 才会生成 Release**，分支推送和 PR 只跑检查。发布前：
+**只有推 `v*` tag 才会生成 Release**，分支推送和 PR 只跑检查。
+**版本号直接取自 tag，不需要改 `Cargo.toml`**：
 
-1. 改 `Cargo.toml` 的 `version`；
-2. 提交，然后打**与版本号一致**的 tag：`git tag v0.1.0 && git push origin v0.1.0`。
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
 
-tag 与 `Cargo.toml` 版本不一致时 release job 会**直接失败**，避免出现
-「tag 是 v0.2.0 但二进制 `--version` 报 0.1.0」的资产。Release 里附：
+CI 把 tag 名注入 `OBS_MOUNT_VERSION` 后编译，所以 `obs-mount --version`
+输出的就是 `0.2.0`。本地构建没有这个变量时，回退到 `Cargo.toml` 里的版本。
+（`Cargo.toml` 的 `version` 仍建议顺手更新，它决定 crate 自身的版本，
+但发布产物不看它。）
+
+Release 里附两个文件：
 
 | 文件 | 说明 |
 |---|---|
-| `obs-mount-x86_64-linux-gnu` | 动态链接，glibc ≥ 2.39 |
+| `obs-mount-x86_64-linux-gnu` | 动态链接，需 glibc ≥ 2.39 |
 | `obs-mount-x86_64-linux-musl` | 全静态，任意 x86_64 Linux |
-| `SHA256SUMS` | 校验和 |
+
+校验和由 GitHub 为每个 release 资产自动生成，仓库不再额外发布 `SHA256SUMS`。
 
 工具链由 `rust-toolchain.toml` 指定（`stable` + rustfmt/clippy），
 最低支持的编译器版本写在 `Cargo.toml` 的 `rust-version`。

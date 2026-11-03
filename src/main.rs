@@ -88,8 +88,31 @@ impl FileConfig {
 ///
 /// OBS objects are immutable, rename is Copy+Delete (not atomic), and
 /// every fsync/close re-uploads the whole file.
+/// Version string reported by `--version`.
+///
+/// A release build sets `OBS_MOUNT_VERSION` from the git tag that triggered
+/// it, so the published binary reports exactly the tag it was built from
+/// instead of whatever happened to be in Cargo.toml. Local builds fall back
+/// to the crate version.
+fn version_string() -> &'static str {
+    resolve_version(option_env!("OBS_MOUNT_VERSION"))
+}
+
+/// Pick the version to report.
+///
+/// CI stamps `OBS_MOUNT_VERSION` from the git tag. An *empty* value means a
+/// non-tag build (an unset workflow variable expands to ""), which must fall
+/// back to the crate version rather than printing a bare program name.
+/// A leading "v" from the tag is trimmed so `--version` reads "0.2.0".
+fn resolve_version(injected: Option<&'static str>) -> &'static str {
+    match injected {
+        Some(v) if !v.trim().is_empty() => v.trim().trim_start_matches('v'),
+        _ => env!("CARGO_PKG_VERSION"),
+    }
+}
+
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(version = version_string(), about)]
 struct Args {
     /// Config file (YAML) to read at startup. Defaults to
     /// $OBS_MOUNT_CONFIG, else /etc/obs/obs-mount.yaml if it exists.
@@ -324,6 +347,22 @@ fn is_executable(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_comes_from_the_tag_when_present() {
+        assert_eq!(resolve_version(Some("v0.2.0")), "0.2.0");
+        assert_eq!(resolve_version(Some("0.2.0")), "0.2.0");
+        assert_eq!(resolve_version(Some(" v1.2.3 ")), "1.2.3");
+    }
+
+    #[test]
+    fn version_falls_back_to_crate_version() {
+        const CRATE: &str = env!("CARGO_PKG_VERSION");
+        assert_eq!(resolve_version(None), CRATE);
+        // An unset workflow variable expands to the empty string.
+        assert_eq!(resolve_version(Some("")), CRATE);
+        assert_eq!(resolve_version(Some("   ")), CRATE);
+    }
 
     #[test]
     fn unknown_config_field_is_rejected_not_ignored() {

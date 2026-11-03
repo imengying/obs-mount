@@ -43,6 +43,10 @@ jobs:
         run: cargo test --all-features
 
       - name: cargo build --release
+        env:
+          # A tag build stamps its version into the binary so `--version`
+          # matches the release name; branch builds fall back to Cargo.toml.
+          OBS_MOUNT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
         run: cargo build --release
 
       - name: Binary sanity check
@@ -117,6 +121,7 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          OBS_MOUNT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
         run: cargo build --release --target x86_64-unknown-linux-musl
 
       - name: Verify it is really static
@@ -134,9 +139,9 @@ jobs:
           path: target/x86_64-unknown-linux-musl/release/obs-mount
           if-no-files-found: error
 
-  # Publishing happens only for an annotated v* tag, and only if the tag
-  # matches the version in Cargo.toml -- otherwise the release would carry
-  # binaries whose `--version` disagrees with the tag name.
+  # Publishing happens only for a v* tag. The binaries were stamped with that
+  # tag name during the build, so their `--version` always matches the release
+  # no matter what Cargo.toml says.
   release:
     name: publish release
     needs: [check, static]
@@ -145,24 +150,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Tag must match Cargo.toml version
-        run: |
-          set -eux
-          tag="${GITHUB_REF_NAME#v}"
-          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          echo "tag=$tag crate=$ver"
-          if [ "$tag" != "$ver" ]; then
-            echo "::error::tag v$tag does not match Cargo.toml version $ver"
-            exit 1
-          fi
-
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
 
-      - name: Collect binaries and checksums
+      - name: Collect binaries
         run: |
           set -eux
           mkdir -p dist
@@ -170,16 +162,14 @@ jobs:
             dist/obs-mount-x86_64-linux-gnu
           install -m 0755 artifacts/obs-mount-x86_64-linux-musl/obs-mount \
             dist/obs-mount-x86_64-linux-musl
-          cd dist
-          sha256sum obs-mount-x86_64-linux-gnu obs-mount-x86_64-linux-musl \
-            > SHA256SUMS
-          ls -l
+          ls -l dist
 
+      # GitHub attaches checksums for release assets itself, so no
+      # hand-rolled SHA256SUMS file is published here.
       - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/obs-mount-x86_64-linux-gnu
             dist/obs-mount-x86_64-linux-musl
-            dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
