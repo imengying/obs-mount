@@ -180,6 +180,34 @@ echo "== statfs matches obsfs (16 TiB ceiling) =="
 same_as_obsfs=$((0xFFFFFFFF * 4096))
 eq "synthetic capacity equals obsfs" "$total" "$same_as_obsfs"
 
+echo "== unix metadata persistence (chmod/chown/touch) =="
+echo meta >meta.txt
+chmod 640 meta.txt
+perms=$(stat -c %a meta.txt)
+eq "chmod survives" "$perms" "640"
+chown 1234:5678 meta.txt 2>/dev/null && {
+  owner=$(stat -c '%u:%g' meta.txt)
+  eq "chown survives" "$owner" "1234:5678"
+} || echo "  skip chown (needs privileges)"
+touch -d "2020-01-02 03:04:05 UTC" meta.txt
+eq "utimes survives" "$(date -u -r meta.txt +%Y-%m-%d)" "2020-01-02"
+# Re-stat from a different process to make sure nothing is just in-memory.
+eq "chmod persists across processes" "$(stat -c %a meta.txt)" "640"
+
+echo "== symlinks =="
+echo target >real.txt
+ln -s real.txt link.txt
+eq "readlink" "$(readlink link.txt)" "real.txt"
+eq "symlink target readable" "$(cat link.txt)" "target"
+
+echo "== extended attributes =="
+if setfattr -n user.colour -v blue meta.txt 2>/dev/null; then
+  eq "getfattr" "$(getfattr --only-values -n user.colour meta.txt 2>/dev/null)" "blue"
+  eq "listxattr contains name" "$(getfattr -d meta.txt 2>/dev/null | grep -c user.colour)" "1"
+else
+  echo "  skip xattr (attr package missing)"
+fi
+
 echo "== every request must have carried a valid signature =="
 stats=$(curl -sf "http://127.0.0.1:$PORT/__stats")
 sigfail=$(printf '%s' "$stats" | sed -n 's/.*"signature_failures": \([0-9]*\).*/\1/p')

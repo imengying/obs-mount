@@ -28,6 +28,8 @@ SK = "TESTSK"
 OBJECTS = {}          # key -> bytes
 META = {}             # key -> {'mtime': str}
 UPLOADS = {}          # upload_id -> {'key':..., 'parts': {n: bytes}}
+OBJ_META = {}         # key -> {lower-case x-obs-meta-* headers}
+pending_meta = {}     # upload_id -> metadata to apply at CompleteMultipartUpload
 QUOTA = int(os.environ.get("OBS_MOCK_QUOTA", "0"))  # bytes; 0 = no quota set
 # "posix" makes HEAD / report x-obs-bucket-type: POSIX, i.e. an OBS file bucket
 BUCKET_TYPE = os.environ.get("OBS_MOCK_BUCKET_TYPE", "object")
@@ -285,6 +287,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.send_header("ETag", '"%s"' % hashlib.md5(data).hexdigest())
             self.send_header("Last-Modified", META[key])
+            for mk, mv in OBJ_META.get(key, {}).items():
+                self.send_header(mk, mv)
             self.end_headers()
 
     def do_PUT(self):
@@ -314,10 +318,24 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 OBJECTS[key] = OBJECTS[src_key]
                 META[key] = META[src_key]
+                directive = (self.headers.get("x-obs-metadata-directive") or "").upper()
+                if directive == "REPLACE":
+                    # Metadata replacement keeps the body, swaps the headers.
+                    OBJ_META[key] = {
+                        k.lower(): v for k, v in self.headers.items()
+                        if k.lower().startswith("x-obs-meta-")
+                    }
+                else:
+                    OBJ_META[key] = dict(OBJ_META.get(src_key, {}))
                 self.send_xml(200, "<CopyObjectResult><ETag>\"x\"</ETag></CopyObjectResult>")
                 return
             OBJECTS[key] = body
             META[key] = self.date_header()
+            # x-obs-meta-* is user metadata and must round-trip on HEAD.
+            OBJ_META[key] = {
+                k.lower(): v for k, v in self.headers.items()
+                if k.lower().startswith("x-obs-meta-")
+            }
             self.send_empty(200, {"ETag": '"%s"' % hashlib.md5(body).hexdigest()})
 
     def do_POST(self):
@@ -332,6 +350,10 @@ class Handler(BaseHTTPRequestHandler):
             if "uploads" in q:
                 _seq[0] += 1
                 uid = f"upload-{_seq[0]:04d}"
+                pending_meta[uid] = {
+                    k.lower(): v for k, v in self.headers.items()
+                    if k.lower().startswith("x-obs-meta-")
+                }
                 UPLOADS[uid] = {"key": key, "parts": {}}
                 self.send_xml(
                     200,
@@ -361,6 +383,7 @@ class Handler(BaseHTTPRequestHandler):
                 data = b"".join(up["parts"][n] for n in sorted(nums))
                 OBJECTS[key] = data
                 META[key] = self.date_header()
+                OBJ_META[key] = pending_meta.pop(uid, {})
                 self.send_xml(
                     200,
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"

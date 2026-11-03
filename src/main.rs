@@ -25,6 +25,10 @@ struct FileConfig {
     ak: Option<String>,
     sk: Option<String>,
     multipart_threshold: Option<u64>,
+    /// Multipart chunk size in bytes. Optional; obsfs mounts with 10 MB,
+    /// the default here is 8 MiB. Raised automatically for files big enough
+    /// to exceed the 10000-part limit.
+    multipart_part_size: Option<usize>,
 }
 
 impl FileConfig {
@@ -120,6 +124,11 @@ struct Args {
     /// else 8388608 (8 MiB, AWS CLI/boto3 default) when not configured anywhere.
     #[arg(long, env = "OBS_MULTIPART_THRESHOLD")]
     multipart_threshold: Option<u64>,
+
+    /// Multipart chunk size in bytes (default 8 MiB, i.e. 8388608).
+    /// Huawei's obsfs uses 10485760 (10 MB). OBS requires at least 5 MiB.
+    #[arg(long, env = "OBS_MULTIPART_PART_SIZE")]
+    multipart_part_size: Option<usize>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -221,7 +230,25 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!("OBS bucket check failed: {e}");
         }
     }
-    let fs = ObsFs::new(client, staging_dir, multipart_threshold);
+    let part_size = args
+        .multipart_part_size
+        .or(cfg.multipart_part_size)
+        .unwrap_or(obs::DEFAULT_PART_SIZE);
+    if part_size < 5 * 1024 * 1024 {
+        anyhow::bail!(
+            "multipart_part_size must be at least 5 MiB (OBS minimum part size), got {part_size}"
+        );
+    }
+    let upload = obs::UploadTuning {
+        threshold: multipart_threshold,
+        part_size,
+    };
+    tracing::info!(
+        threshold = upload.threshold,
+        part_size = upload.part_size,
+        "upload tuning"
+    );
+    let fs = ObsFs::new(client, staging_dir, upload);
     // fuser 0.18: allow-root moved from MountOption to the session ACL.
     // allow_root is always on (the mount is normally run as root anyway):
     // root plus the mounting user can see the mount. There is no

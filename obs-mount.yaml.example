@@ -20,4 +20,5 @@ endpoint: https://your-bucket-name.obs.cn-north-4.myhuaweicloud.com
 
 ak: YOUR_ACCESS_KEY_HERE
 sk: YOUR_SECRET_KEY_HERE
-# multipart_threshold: 8388608   # 可选，不配就默认 8 MiB（AWS 默认），达到该大小用分段上传
+# multipart_threshold: 8388608      # 可选，默认 8 MiB（AWS 默认），达到该大小改用分段上传
+# multipart_part_size: 10485760     # 可选，分段大小，默认 8 MiB；华为 obsfs 用 10 MiB，OBS 下限 5 MiB

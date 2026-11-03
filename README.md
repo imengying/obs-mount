@@ -39,15 +39,17 @@ obs-mount/
 | `readdir` | `GET ?prefix=<dir/>&delimiter=/` 翻页聚合（`CommonPrefixes` + `Contents`），含 `.` / `..` |
 | `open` / `read` | 读模式直接 Range GET（先 HEAD 定长，越过 EOF 返回空）；写模式把远端内容（如有）下载到 staging 做 read-modify-write。会话内已有 staging 时读写句柄都用它，避免读到尚未上传的旧内容 |
 | `create` / `write` | 只写本地 staging 文件，不逐次 PUT |
-| `flush` / `fsync` / `release` | 关闭/刷盘时上传：小于阈值单 PUT，大于等于阈值分段上传（默认 8 MiB，学 AWS CLI/boto3），分片 8 MiB（超 80 GiB 的文件自动放大分片以不超 10000 片上限）、4 路并行上传，失败先等齐在途分片再 abort 整个分段上传 |
+| `flush` / `fsync` / `release` | 关闭/刷盘时上传：小于阈值单 PUT，大于等于阈值分段上传。阈值与分片可配（默认 8 MiB，obsfs 是 25 MB/10 MB），分片低于 5 MiB 会被抬到 OBS 下限，超过 10000 片时自动放大分片；4 路并行，失败先等齐在途分片再 abort |
 | `mkdir` / `rmdir` | PUT `<dir>/` 零字节占位对象 / 非空检查后删占位对象 |
 | `unlink` | `DELETE /<key>` |
 | `rename` | **Copy + Delete，非原子**（目录递归逐 key；中途失败不回滚，已在日志中明示）。成功后 inode 号不变、只把映射指向新 key，打开中的句柄同样改 key |
-| `setattr` | 仅截断（下载→本地截断→重传）；mode/uid/gid/atime 等忽略（OBS 不存 Unix 权限），以免 `cp -p` 类工具失败。截断不再销毁仍被句柄使用的 staging，`echo x > file` 可重复执行 |
+| `setattr` | `chmod` / `chown` / `utimes` 写入对象元数据（`x-obs-meta-*`），靠一次自拷贝 `x-obs-metadata-directive: REPLACE` 完成，不重传数据；截断仍是下载→本地截断→重传 |
 | `statfs` | `GET /?quota` 取配额（真实上限）+ `GET /?storageinfo` 取已用量，60 秒缓存；无配额时上报与 obsfs 相同的 16 TiB 合成容量，见下文“容量显示” |
+| `symlink` / `readlink` | 零字节对象 + `x-obs-meta-symlink-target`，mode 记 `S_IFLNK` |
+| `getxattr` / `setxattr` / `listxattr` / `removexattr` | 存成 `x-obs-meta-xdg.<base64(name)>`，值同样 base64（元数据必须是 header 安全的 ASCII） |
 
-未实现（默认返回 `ENOSYS` 或内核默认）：`symlink` / `hardlink`（OBS 无此语义）、
-`chmod` / `chown` / `xattr`（无存储位置）、`mknod`。`forget` 未重写，
+未实现（默认返回 `ENOSYS` 或内核默认）：`hardlink` / `mknod`（OBS 无此语义）。
+`forget` 未重写，
 inode 映射在进程生命周期内只增不减（备份场景可接受，长期挂载会缓慢增长；
 `rename` 会重映射而不是新增条目）。
 
@@ -62,6 +64,7 @@ OBS_SK=...                    # 密钥（0600 的 YAML 配置文件）
 OBS_BUCKET=my-bucket
 OBS_ENDPOINT=https://my-bucket.obs.cn-north-4.myhuaweicloud.com
 OBS_MULTIPART_THRESHOLD=8388608               # 可选，不配就默认 8 MiB（AWS CLI/boto3 默认）
+OBS_MULTIPART_PART_SIZE=10485760              # 可选，分片大小；obsfs 用 10 MiB，OBS 下限 5 MiB
 ```
 
 配置只有一种格式：YAML（`/etc/obs/obs-mount.yaml`），只含 mountpoint、
@@ -173,6 +176,8 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
     - 空格、中文、`+`/`%` 等特殊字符 key，同一文件多句柄并发
     - `statfs`：无配额时报 16 TiB（与 obsfs 一致）、有配额时报真实值
     - 路径式寻址（服务级 endpoint / IP 端点）、POSIX 文件桶被正确拒绝
+    - `chmod` / `chown` / `touch -d` 落进对象元数据并跨进程可见
+    - `ln -s` + `readlink`、20 MiB 分段上传带上元数据
 - 静态 musl 构建实测 `statically linked`（见“构建”）。
 
 ### 仍未做到的（上生产前务必补）
@@ -183,6 +188,8 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
 - 未做长时间稳定性与断网重连测试；失败重试目前只有 5xx 退避，没有断点续传。
 - `statfs` 已实现（见“容量显示”），但没有在**设了配额**的真实桶上验证过；
   `storageinfo` 的统计延迟量级也只在文档层面了解，未实测。
+- 扩展属性只在装了 `attr` 工具的环境中测过（`setfattr`/`getfattr`），
+  未在本容器验证（缺该包，e2e 会自动跳过这两条）。
 
 ### 已从 obsfs 对齐的三项
 
@@ -192,26 +199,50 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
 3. **桶类型检测**：挂载前 `HEAD /`，识别出 POSIX/文件桶就拒绝，
    避免用对象桶语义去操作文件桶。
 
-### 对照官方 obsfs 得到的可改进项（尚未实现）
+### 与 obsfs 的元数据方案
 
-读 [`huaweicloud-obs-obsfs`](https://github.com/huaweicloud/huaweicloud-obs-obsfs)
-源码后记下的差距，按价值排序：
+OBS 没有原生权限，但对象元数据是自由格式的，obsfs 就是靠这一点把 Unix 属性存下来的。
+本项目用同样的思路，只是走 **OBS 原生前缀 `x-obs-meta-`**（obsfs 用 S3 风格
+`x-amz-meta-`，因为它也服务通用 S3 端点；原生前缀见官方 SDK 的
+`HEADER_PREFIX_META_OBS = "x-obs-meta-"`）。
 
-1. **Unix 元数据没有持久化**。obsfs 把 `mtime` / `uid` / `gid` / `mode` / xattr
-   写进对象元数据（它用 S3 风格 `x-amz-meta-*`，OBS 原生前缀应是
-   `x-obs-meta-*`，见官方 SDK 的 `HEADER_PREFIX_META_OBS = "x-obs-meta-"`），
-   所以 `chmod`、`chown`、`touch -d`、xattr 在它那里是真能存下来的。
-   本项目目前直接忽略这些属性（只保证 `cp -p` 不报错），取舍见上表。
-   要做的话：`PUT` 时带 `x-obs-meta-*`，`HEAD` 时读回来。
-2. **没有 symlink**。obsfs 用元数据存 target 来实现 `symlink`/`readlink`；
-   本项目返回 `ENOSYS`。
-3. **重试策略更保守**。obsfs 对写操作重试 8 次、间隔 4 秒；本项目只对 5xx 退避
-   重试 4 次、最长 2 秒，且没有断点续传。
-4. **分段阈值不同**。obsfs 用 25 MB 阈值 / 10 MB 分片；本项目默认 8 MiB 阈值 /
-   8 MiB 分片（学 AWS CLI），大文件会自动放大分片以不超 10000 片上限。
-5. obsfs 有一个“读目录时不做合成元数据、而是对每个条目单独 HEAD”的开关
-   （`accurate_readdir`），换取 `ls` 的准确性但代价是 N 次请求。本项目的
-   `readdir` 用 `CommonPrefixes` 合成属性，没有这个开关。
+| 属性 | 元数据键 | 说明 |
+|---|---|---|
+| 权限 | `x-obs-meta-mode` | 完整 `st_mode`，含 `S_IFLNK`/`S_IFDIR` 类型位 |
+| 属主 | `x-obs-meta-uid` / `x-obs-meta-gid` | |
+| 修改时间 | `x-obs-meta-mtime` | Unix 秒 |
+| 符号链接 | `x-obs-meta-symlink-target` | 对象为 0 字节，mode 标记 `S_IFLNK` |
+| 扩展属性 | `x-obs-meta-xdg.<base64(名字)>` | 值同样 base64，因为 header 必须是 ASCII |
+
+改属性**不重传数据**：用 `PUT` + `x-obs-copy-source: /<bucket>/<key>` +
+`x-obs-metadata-directive: REPLACE` 把对象拷回自己，只换元数据。改一个
+100 GiB 对象的权限位是瞬间完成的。这与 obsfs 的 `s3fs_setxattr_s3` 一致。
+
+**没有元数据的对象**（别的工具上传、或本程序早期版本写的）读出来时回退到固定
+默认值（目录 0755、文件 0644、属主取请求方 uid/gid），而不是当成"无权限"——
+否则 `ls` 会看到 `----------`，工具容易误判。
+
+### readdir 的元数据取舍
+
+obsfs 有个 `accurate_readdir` 开关，解决的是这个矛盾：`readdir` 时对每个条目补元数据，
+如果逐条 `HEAD` 会很慢（1000 个文件 = 1000 次请求），于是它默认**合成**一份假元数据
+（uid/gid 取当前进程、mode 固定 0640）塞进缓存，代价是对象上真实的
+`x-amz-meta-uid` 会被显示错，直到缓存过期。打开该开关就不合成、退回逐条 `HEAD`。
+
+本项目的做法是取中间值：`readdir` 只使用列表响应里**真实存在**的字段
+（`Size`），不编造 uid/gid/mode；`getattr` 拿到缓存缺失的属性时再补一次 `HEAD`。
+因此 `ls` 里的大小是准的、属主权限可能延迟一个 TTL，但**不会显示一个假的属主**。
+
+### 其余对齐项
+
+| 项 | obsfs | 本项目 |
+|---|---|---|
+| 重试 | 固定 3 次 | 5 次，指数退避 0.5→1→2→4s（上限 8s），403 不重试 |
+| 分段阈值/分片 | 25 MB / 10 MB（写死） | 默认 8 MiB / 8 MiB，两者都可配；分片低于 5 MiB 抬到 OBS 下限，超 10000 片自动放大 |
+| 并发上传 | 顺序 | 4 路并行 |
+| 临时文件 | `use_cache`/`stat_cache` 落地到本地 | staging 在 `$TMPDIR`，退出时清理 |
+
+仍存在的差距：`hardlink` / `mknod`（OBS 无此语义）、断点续传（重试仍是整段重来）。
 
 ### 本轮修掉的缺陷
 

@@ -19,12 +19,13 @@
 //! request (including the OBS round-trip), which serialises requests: a
 //! deliberate v1 trade-off for a backup mount, not a high-concurrency disk.
 
-use crate::obs::{ObjectMeta, ObsClient, ObsError};
+use crate::obs::{ObsClient, ObsError, UnixMeta};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileType, Filesystem, FopenFlags, Generation, INodeNo,
     LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
-    WriteFlags,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow, WriteFlags,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -62,18 +63,30 @@ struct CachedMeta {
     is_dir: bool,
     mtime: SystemTime,
     expires: Instant,
+    /// Attributes read from object metadata. `None` means the object carries
+    /// none (uploaded by some other tool, or by an older build), in which
+    /// case defaults are rendered.
+    unix: Option<UnixMeta>,
+    /// `<symlink target>` when this object is a symlink created by us.
+    symlink_target: Option<String>,
+    /// User extended attributes: `xdg.<base64 name>` -> raw value.
+    xattrs: Vec<(String, String)>,
 }
 
 struct OpenFile {
     key: String,
     staging: Option<PathBuf>,
     dirty: bool,
+    /// Owner/mode to persist when this handle's data is uploaded. Captured at
+    /// create/open time from the requesting process, like a local file's
+    /// ownership is, and overridden later if a chmod/chown arrives.
+    owner: Option<(u32, u32)>,
 }
 
 struct Inner {
     client: ObsClient,
     staging_dir: PathBuf,
-    multipart_threshold: u64,
+    upload: crate::obs::UploadTuning,
     next_ino: u64,
     ino_to_path: HashMap<u64, String>,
     path_to_ino: HashMap<String, u64>,
@@ -119,6 +132,23 @@ pub struct ObsFs {
     inner: Mutex<Inner>,
 }
 
+/// Metadata key for a user xattr. Names may contain characters that are not
+/// legal in an HTTP header, so they are base64-encoded.
+fn xattr_key(name: &str) -> String {
+    format!(
+        "{}{}",
+        crate::obs::meta_keys::XATTR_PREFIX,
+        B64.encode(name.as_bytes())
+    )
+}
+
+/// Inverse of [`xattr_key`]: the encoded name, or `None` for keys that are not
+/// xattrs.
+fn xattr_name(key: &str) -> Option<String> {
+    key.strip_prefix(crate::obs::meta_keys::XATTR_PREFIX)
+        .map(|s| s.to_string())
+}
+
 fn parent_path(path: &str) -> String {
     match path.rfind('/') {
         Some(i) => path[..i].to_string(),
@@ -149,11 +179,50 @@ fn dir_prefix(path: &str) -> String {
     }
 }
 
-fn system_time_from(s: Option<&str>) -> SystemTime {
-    // OBS Last-Modified is RFC 1123; parsing it exactly is nice-to-have.
-    // Fall back to now so a parse failure never breaks getattr.
-    let _ = s;
-    SystemTime::now()
+/// Build the cache entry for an object we just HEADed.
+fn cached_from_meta(meta: &crate::obs::ObjectMeta, is_dir: bool) -> CachedMeta {
+    let symlink_target = meta
+        .x_obs_meta
+        .iter()
+        .find(|(k, _)| k == crate::obs::meta_keys::SYMLINK_TARGET)
+        .map(|(_, v)| v.clone());
+    CachedMeta {
+        size: meta.size,
+        is_dir,
+        mtime: unix_mtime_or_now(meta.unix),
+        expires: Instant::now() + Duration::from_secs(5),
+        unix: meta.unix,
+        symlink_target,
+        xattrs: meta
+            .x_obs_meta
+            .iter()
+            .filter(|(k, _)| k.starts_with(crate::obs::meta_keys::XATTR_PREFIX))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Cache entry for something we know exists but have no object metadata for:
+/// a directory (real or implied by a key prefix) or a freshly staged file.
+fn synthetic_meta(size: u64, is_dir: bool, mtime: SystemTime) -> CachedMeta {
+    CachedMeta {
+        size,
+        is_dir,
+        mtime,
+        expires: Instant::now() + Duration::from_secs(5),
+        unix: None,
+        symlink_target: None,
+        xattrs: Vec::new(),
+    }
+}
+
+/// mtime from persisted metadata, falling back to "now" the way the previous
+/// implementation did (OBS Last-Modified is not parsed into SystemTime here).
+fn unix_mtime_or_now(unix: Option<UnixMeta>) -> SystemTime {
+    match unix {
+        Some(u) if u.mtime > 0 => SystemTime::UNIX_EPOCH + Duration::from_secs(u.mtime as u64),
+        _ => SystemTime::now(),
+    }
 }
 
 /// Map an io error to the closest FUSE errno (raw OS codes only).
@@ -174,7 +243,7 @@ fn io_errno(e: &std::io::Error) -> Errno {
 }
 
 impl ObsFs {
-    pub fn new(client: ObsClient, staging_dir: PathBuf, multipart_threshold: u64) -> Self {
+    pub fn new(client: ObsClient, staging_dir: PathBuf, upload: crate::obs::UploadTuning) -> Self {
         let _ = fs::create_dir_all(&staging_dir);
         // Clean start, no legacy state: drop staging files left by a
         // previous (possibly crashed) run. Reusing them would be wrong —
@@ -192,7 +261,7 @@ impl ObsFs {
             inner: Mutex::new(Inner {
                 client,
                 staging_dir,
-                multipart_threshold,
+                upload,
                 next_ino: 2,
                 ino_to_path: HashMap::new(),
                 path_to_ino: HashMap::new(),
@@ -303,23 +372,58 @@ impl Inner {
         size: u64,
         mtime: SystemTime,
     ) -> FileAttr {
+        self.attr_with_meta(req, ino, kind, size, mtime, None)
+    }
+
+    /// Like `attr`, but honours attributes persisted in object metadata.
+    ///
+    /// When an object carries no `x-obs-meta-mode` (uploaded by another tool,
+    /// or by a build before this feature), fall back to a fixed default
+    /// rather than inventing values: 0755/0644 owned by the requesting
+    /// user, which is what this program used to report unconditionally.
+    fn attr_with_meta(
+        &self,
+        req: &Request,
+        ino: u64,
+        kind: FileType,
+        size: u64,
+        mtime: SystemTime,
+        cached: Option<&CachedMeta>,
+    ) -> FileAttr {
+        let unix = cached.and_then(|c| c.unix);
+        // A persisted mtime wins over the caller-supplied one: `resolve`
+        // reports "now" for anything it synthesized (staging files,
+        // directories), which would otherwise mask `touch -d`.
+        let mtime = match unix {
+            Some(u) if u.mtime > 0 => SystemTime::UNIX_EPOCH + Duration::from_secs(u.mtime as u64),
+            _ => mtime,
+        };
+        let kind = match unix.map(|u| u.mode & libc::S_IFMT) {
+            Some(m) if m == libc::S_IFLNK => FileType::Symlink,
+            _ => kind,
+        };
+        let default_perm = if kind == FileType::Directory {
+            0o755
+        } else if kind == FileType::Symlink {
+            0o777
+        } else {
+            0o644
+        };
         FileAttr {
             ino: INodeNo(ino),
             size,
             blocks: size.div_ceil(512),
-            atime: SystemTime::now(),
+            atime: mtime,
             mtime,
             ctime: mtime,
             crtime: mtime,
             kind,
-            perm: if kind == FileType::Directory {
-                0o755
-            } else {
-                0o644
-            },
+            perm: unix
+                .map(|u| (u.mode & 0o7777) as u16)
+                .unwrap_or(default_perm),
             nlink: if kind == FileType::Directory { 2 } else { 1 },
-            uid: req.uid(),
-            gid: req.gid(),
+            uid: unix.map(|u| u.uid).unwrap_or_else(|| req.uid()),
+            gid: unix.map(|u| u.gid).unwrap_or_else(|| req.gid()),
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -356,18 +460,15 @@ impl Inner {
         // File?
         match self.client.head_object(path) {
             Ok(Some(meta)) => {
-                let mtime = system_time_from(meta.last_modified.as_deref());
-                self.meta_cache.insert(
-                    path.to_string(),
-                    CachedMeta {
-                        size: meta.size,
-                        is_dir: false,
-                        mtime,
-                        expires: Instant::now() + Duration::from_secs(5),
-                    },
-                );
+                // A symlink is stored as a zero-byte object whose mode says
+                // S_IFLNK, so it shows up here as a "file" but must be
+                // reported as a link.
+                let cached = cached_from_meta(&meta, false);
+                let mtime = cached.mtime;
+                let size = meta.size;
+                self.meta_cache.insert(path.to_string(), cached);
                 let ino = self.alloc_ino(path);
-                return Some((ino, false, meta.size, mtime));
+                return Some((ino, false, size, mtime));
             }
             Ok(None) => {}
             Err(e) => {
@@ -379,12 +480,7 @@ impl Inner {
         if let Ok(Some(_)) = self.client.head_object(&placeholder) {
             self.meta_cache.insert(
                 path.to_string(),
-                CachedMeta {
-                    size: 4096,
-                    is_dir: true,
-                    mtime: SystemTime::now(),
-                    expires: Instant::now() + Duration::from_secs(5),
-                },
+                synthetic_meta(4096, true, SystemTime::now()),
             );
             let ino = self.alloc_ino(path);
             return Some((ino, true, 4096, SystemTime::now()));
@@ -394,12 +490,7 @@ impl Inner {
             Ok(page) if !page.objects.is_empty() || !page.prefixes.is_empty() => {
                 self.meta_cache.insert(
                     path.to_string(),
-                    CachedMeta {
-                        size: 4096,
-                        is_dir: true,
-                        mtime: SystemTime::now(),
-                        expires: Instant::now() + Duration::from_secs(5),
-                    },
+                    synthetic_meta(4096, true, SystemTime::now()),
                 );
                 let ino = self.alloc_ino(path);
                 Some((ino, true, 4096, SystemTime::now()))
@@ -452,6 +543,62 @@ impl Inner {
         snapshot
     }
 
+    /// Merge attribute changes into the object's persisted metadata and write
+    /// it back with a self-copy (`x-obs-metadata-directive: REPLACE`), the
+    /// only way OBS lets metadata change without re-uploading the body.
+    /// obsfs does the same for chmod/chown/setxattr.
+    #[allow(clippy::too_many_arguments)]
+    fn update_unix_meta(
+        &mut self,
+        path: &str,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mtime: Option<SystemTime>,
+        extra: &[(String, String)],
+    ) -> Result<(), ObsError> {
+        let current = self.meta_cache.get(path).cloned();
+        let mut attrs: Vec<(String, String)> = current
+            .as_ref()
+            .map(|c| c.xattrs.clone())
+            .unwrap_or_default();
+        // Preserve whatever the object already had, including the symlink
+        // target: this call rewrites the whole metadata set.
+        attrs.retain(|(k, _)| !extra.iter().any(|(ek, _)| ek == k));
+        attrs.extend_from_slice(extra);
+
+        let base = current.clone().and_then(|c| c.unix).unwrap_or(UnixMeta {
+            mode: if current.as_ref().map(|c| c.is_dir).unwrap_or(false) {
+                libc::S_IFDIR | 0o755
+            } else {
+                libc::S_IFREG | 0o644
+            },
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        });
+        let updated = UnixMeta {
+            mode: mode
+                .map(|m| (base.mode & libc::S_IFMT) | (m & 0o7777))
+                .unwrap_or(base.mode),
+            uid: uid.unwrap_or(base.uid),
+            gid: gid.unwrap_or(base.gid),
+            mtime: mtime
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(base.mtime),
+        };
+        let mut headers = crate::obs::unix_meta_headers(updated);
+        headers.extend(attrs);
+        self.client.set_object_meta(path, &headers)?;
+        if let Some(entry) = self.meta_cache.get_mut(path) {
+            entry.unix = Some(updated);
+            entry.mtime = unix_mtime_or_now(Some(updated));
+            entry.expires = Instant::now() + Duration::from_secs(5);
+        }
+        Ok(())
+    }
+
     fn upload_staging(&self, fh: u64) -> Result<(), ObsError> {
         let Some(open) = self.open_files.get(&fh) else {
             return Ok(());
@@ -460,9 +607,34 @@ impl Inner {
             return Ok(());
         };
         let data = fs::read(&staging)?;
+        // A rewrite must not lose attributes the object already had (xattrs,
+        // a symlink target, an earlier chown), so merge them in.
+        let mut meta = self
+            .meta_cache
+            .get(&open.key)
+            .map(|c| c.xattrs.clone())
+            .unwrap_or_default();
+        let existing_unix = self.meta_cache.get(&open.key).and_then(|c| c.unix);
+        let (uid, gid) = open
+            .owner
+            .or_else(|| existing_unix.map(|u| (u.uid, u.gid)))
+            .unwrap_or((0, 0));
+        let mtime = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        meta.extend(crate::obs::unix_meta_headers(UnixMeta {
+            mode: existing_unix
+                .map(|u| u.mode & libc::S_IFMT)
+                .unwrap_or(libc::S_IFREG)
+                | existing_unix.map(|u| u.mode & 0o7777).unwrap_or(0o644),
+            uid,
+            gid,
+            mtime,
+        }));
         tracing::info!(key = %open.key, bytes = data.len(), "uploading staged file to OBS");
         self.client
-            .upload_file(&open.key, &data, self.multipart_threshold)?;
+            .upload_file_with_meta(&open.key, &data, self.upload, &meta)?;
         Ok(())
     }
 
@@ -491,15 +663,8 @@ impl Inner {
                     if let Some(staging) = open.staging.clone()
                         && let Ok(m) = fs::metadata(&staging)
                     {
-                        self.meta_cache.insert(
-                            key,
-                            CachedMeta {
-                                size: m.len(),
-                                is_dir: false,
-                                mtime: SystemTime::now(),
-                                expires: Instant::now() + Duration::from_secs(5),
-                            },
-                        );
+                        self.meta_cache
+                            .insert(key, synthetic_meta(m.len(), false, SystemTime::now()));
                     }
                 }
                 None
@@ -532,7 +697,8 @@ impl Filesystem for ObsFs {
                 } else {
                     FileType::RegularFile
                 };
-                let attr = inner.attr(req, ino, kind, size, mtime);
+                let cached = inner.meta_cache.get(&path).cloned();
+                let attr = inner.attr_with_meta(req, ino, kind, size, mtime, cached.as_ref());
                 reply.entry(&TTL, &attr, Generation(0));
             }
             None => reply.error(Errno::ENOENT),
@@ -563,7 +729,8 @@ impl Filesystem for ObsFs {
                 } else {
                     FileType::RegularFile
                 };
-                let attr = inner.attr(req, ino.0, kind, size, mtime);
+                let cached = inner.meta_cache.get(&path).cloned();
+                let attr = inner.attr_with_meta(req, ino.0, kind, size, mtime, cached.as_ref());
                 reply.attr(&TTL, &attr);
             }
             None => reply.error(Errno::ENOENT),
@@ -674,7 +841,7 @@ impl Filesystem for ObsFs {
         reply.ok();
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let mut inner = self.inner.lock().unwrap();
         let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
             reply.error(Errno::ENOENT);
@@ -698,6 +865,7 @@ impl Filesystem for ObsFs {
                     key: path,
                     staging: None,
                     dirty: false,
+                    owner: None,
                 },
             );
             reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
@@ -712,6 +880,7 @@ impl Filesystem for ObsFs {
                     key: path,
                     staging: Some(staging),
                     dirty: false,
+                    owner: None,
                 },
             );
             reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
@@ -752,6 +921,7 @@ impl Filesystem for ObsFs {
                 key: path,
                 staging: Some(staging),
                 dirty: trunc,
+                owner: Some((req.uid(), req.gid())),
             },
         );
         reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
@@ -899,15 +1069,9 @@ impl Filesystem for ObsFs {
             reply.error(io_errno(&e));
             return;
         }
-        inner.meta_cache.insert(
-            path.clone(),
-            CachedMeta {
-                size: 0,
-                is_dir: false,
-                mtime: SystemTime::now(),
-                expires: Instant::now() + Duration::from_secs(5),
-            },
-        );
+        inner
+            .meta_cache
+            .insert(path.clone(), synthetic_meta(0, false, SystemTime::now()));
         let fh = inner.next_fh;
         inner.next_fh += 1;
         inner.open_files.insert(
@@ -916,6 +1080,7 @@ impl Filesystem for ObsFs {
                 key: path.clone(),
                 staging: Some(staging),
                 dirty: true,
+                owner: Some((req.uid(), req.gid())),
             },
         );
         // dirty=true so that closing an empty created file still uploads a
@@ -1022,22 +1187,26 @@ impl Filesystem for ObsFs {
         let name = name.to_string_lossy().into_owned();
         let path = join_path(&parent_path, &name);
         let placeholder = format!("{path}/");
-        if let Err(e) = inner.client.put_object(&placeholder, &[]) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let meta = crate::obs::unix_meta_headers(UnixMeta {
+            mode: libc::S_IFDIR | 0o755,
+            uid: req.uid(),
+            gid: req.gid(),
+            mtime: now,
+        });
+        if let Err(e) = inner.client.put_object_with_meta(&placeholder, &[], &meta) {
             tracing::error!(error = %e, "mkdir placeholder upload failed");
             let err = inner.upload_error_reply(&e);
             reply.error(err);
             return;
         }
         let ino = inner.alloc_ino(&path);
-        inner.meta_cache.insert(
-            path.clone(),
-            CachedMeta {
-                size: 4096,
-                is_dir: true,
-                mtime: SystemTime::now(),
-                expires: Instant::now() + Duration::from_secs(5),
-            },
-        );
+        inner
+            .meta_cache
+            .insert(path.clone(), synthetic_meta(4096, true, SystemTime::now()));
         let attr = inner.attr(req, ino, FileType::Directory, 4096, SystemTime::now());
         reply.entry(&TTL, &attr, Generation(0));
     }
@@ -1228,16 +1397,240 @@ impl Filesystem for ObsFs {
         );
     }
 
+    /// Extended attributes are stored as `x-obs-meta-xdg.<base64 name>`.
+    /// Metadata values are header-safe ASCII only, so both the name and the
+    /// value are base64-encoded; obsfs stores the raw value and notes that a
+    /// production implementation would base64 it.
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let key = xattr_key(&name.to_string_lossy());
+        let encoded = B64.encode(value);
+        let entry = vec![(key, encoded)];
+        if let Err(e) = inner.update_unix_meta(&path, None, None, None, None, &entry) {
+            let err = inner.upload_error_reply(&e);
+            reply.error(err);
+            return;
+        }
+        if let Some(c) = inner.meta_cache.get_mut(&path) {
+            c.xattrs.retain(|(k, _)| k != &entry[0].0);
+            c.xattrs.push(entry.into_iter().next().unwrap());
+        }
+        reply.ok();
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let inner = self.inner.lock().unwrap();
+        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let key = xattr_key(&name.to_string_lossy());
+        let Some(encoded) = inner.meta_cache.get(&path).and_then(|c| {
+            c.xattrs
+                .iter()
+                .find(|(k, _)| k == &key)
+                .map(|(_, v)| v.clone())
+        }) else {
+            reply.error(Errno::ENODATA);
+            return;
+        };
+        let value = B64
+            .decode(encoded.as_bytes())
+            .unwrap_or_else(|_| encoded.into_bytes());
+        if size == 0 {
+            reply.size(value.len() as u32);
+        } else if (size as usize) < value.len() {
+            reply.error(Errno::ERANGE);
+        } else {
+            reply.data(&value);
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let inner = self.inner.lock().unwrap();
+        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        // NUL-separated names, per the listxattr(2) convention.
+        let mut names = Vec::new();
+        if let Some(c) = inner.meta_cache.get(&path) {
+            for (k, _) in &c.xattrs {
+                if let Some(name) = xattr_name(k)
+                    && let Ok(raw) = B64.decode(name.as_bytes())
+                {
+                    names.extend_from_slice(&raw);
+                    names.push(0);
+                }
+            }
+        }
+        if size == 0 {
+            reply.size(names.len() as u32);
+        } else if (size as usize) < names.len() {
+            reply.error(Errno::ERANGE);
+        } else {
+            reply.data(&names);
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let key = xattr_key(&name.to_string_lossy());
+        let exists = inner
+            .meta_cache
+            .get(&path)
+            .map(|c| c.xattrs.iter().any(|(k, _)| k == &key))
+            .unwrap_or(false);
+        if !exists {
+            reply.error(Errno::ENODATA);
+            return;
+        }
+        // update_unix_meta merges `extra` on top of the existing set, so drop
+        // the key from the cache first and let it be rewritten without it.
+        if let Some(c) = inner.meta_cache.get_mut(&path) {
+            c.xattrs.retain(|(k, _)| k != &key);
+        }
+        let remaining = inner
+            .meta_cache
+            .get(&path)
+            .map(|c| c.xattrs.clone())
+            .unwrap_or_default();
+        let headers = crate::obs::unix_meta_headers(
+            inner
+                .meta_cache
+                .get(&path)
+                .and_then(|c| c.unix)
+                .unwrap_or(UnixMeta {
+                    mode: libc::S_IFREG | 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                }),
+        );
+        let mut all = headers;
+        all.extend(remaining);
+        if let Err(e) = inner.client.set_object_meta(&path, &all) {
+            let err = inner.upload_error_reply(&e);
+            reply.error(err);
+            return;
+        }
+        reply.ok();
+    }
+
+    /// Create a symlink as a zero-byte object carrying `x-obs-meta-symlink-target`
+    /// plus a mode of `S_IFLNK | 0777`, which is how obsfs does it.
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(parent_path) = (if parent == INodeNo::ROOT {
+            Some(String::new())
+        } else {
+            inner.ino_to_path.get(&parent.0).cloned()
+        }) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let path = join_path(&parent_path, &link_name.to_string_lossy());
+        let target_str = target.to_string_lossy().into_owned();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut meta = crate::obs::unix_meta_headers(UnixMeta {
+            mode: libc::S_IFLNK | 0o777,
+            uid: req.uid(),
+            gid: req.gid(),
+            mtime: now,
+        });
+        meta.push((
+            format!("x-obs-meta-{}", crate::obs::meta_keys::SYMLINK_TARGET),
+            target_str.clone(),
+        ));
+        if let Err(e) = inner.client.put_object_with_meta(&path, &[], &meta) {
+            tracing::error!(path = %path, error = %e, "symlink creation failed");
+            let err = inner.upload_error_reply(&e);
+            reply.error(err);
+            return;
+        }
+        let ino = inner.alloc_ino(&path);
+        let mut cached = synthetic_meta(0, false, SystemTime::now());
+        cached.unix = Some(UnixMeta {
+            mode: libc::S_IFLNK | 0o777,
+            uid: req.uid(),
+            gid: req.gid(),
+            mtime: now,
+        });
+        cached.symlink_target = Some(target_str);
+        inner.meta_cache.insert(path, cached.clone());
+        let attr =
+            inner.attr_with_meta(req, ino, FileType::Symlink, 0, cached.mtime, Some(&cached));
+        reply.entry(&TTL, &attr, Generation(0));
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let inner = self.inner.lock().unwrap();
+        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if let Some(target) = inner
+            .meta_cache
+            .get(&path)
+            .and_then(|c| c.symlink_target.clone())
+        {
+            reply.data(target.as_bytes());
+            return;
+        }
+        // Not cached: ask the object itself.
+        match inner.client.head_object(&path) {
+            Ok(Some(meta)) => {
+                let target = crate::obs::symlink_target(&meta.x_obs_meta);
+                match target {
+                    Some(t) => reply.data(t.as_bytes()),
+                    None => reply.error(Errno::EINVAL),
+                }
+            }
+            Ok(None) => reply.error(Errno::ENOENT),
+            Err(e) => {
+                let err = inner.upload_error_reply(&e);
+                reply.error(err);
+            }
+        }
+    }
+
     fn setattr(
         &self,
         req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<fuser::FileHandle>,
         _crtime: Option<SystemTime>,
@@ -1246,14 +1639,26 @@ impl Filesystem for ObsFs {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        // OBS stores no Unix mode/owner: those are deliberately ignored
-        // (returning the current attr) so `cp -p`-style tools do not fail.
-        // Only truncation is honoured, via download -> truncate -> upload.
+        // OBS has no native permissions, but they can be persisted in object
+        // metadata (as obsfs does), so chmod/chown/utimes are honoured by
+        // rewriting the metadata via a self-copy. Truncation still needs the
+        // data path: download -> truncate -> re-upload.
         let mut inner = self.inner.lock().unwrap();
         let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
             reply.error(Errno::ENOENT);
             return;
         };
+        if mode.is_some() || uid.is_some() || gid.is_some() || mtime.is_some() {
+            let when = mtime.map(|t| match t {
+                TimeOrNow::Now => SystemTime::now(),
+                TimeOrNow::SpecificTime(t) => t,
+            });
+            if let Err(e) = inner.update_unix_meta(&path, mode, uid, gid, when, &[]) {
+                let err = inner.upload_error_reply(&e);
+                reply.error(err);
+                return;
+            }
+        }
         if let Some(size) = size {
             let staging = inner.staging_path(ino.0);
             // Truncation normally arrives right after `open`, whose staging
@@ -1290,10 +1695,7 @@ impl Filesystem for ObsFs {
                     return;
                 }
             };
-            if let Err(e) = inner
-                .client
-                .upload_file(&path, &data, inner.multipart_threshold)
-            {
+            if let Err(e) = inner.client.upload_file(&path, &data, inner.upload) {
                 let err = inner.upload_error_reply(&e);
                 reply.error(err);
                 return;
@@ -1310,15 +1712,9 @@ impl Filesystem for ObsFs {
                     }
                 }
             }
-            inner.meta_cache.insert(
-                path.clone(),
-                CachedMeta {
-                    size,
-                    is_dir: false,
-                    mtime: SystemTime::now(),
-                    expires: Instant::now() + Duration::from_secs(5),
-                },
-            );
+            inner
+                .meta_cache
+                .insert(path.clone(), synthetic_meta(size, false, SystemTime::now()));
             let attr = inner.attr(req, ino.0, FileType::RegularFile, size, SystemTime::now());
             reply.attr(&TTL, &attr);
             return;
@@ -1330,20 +1726,13 @@ impl Filesystem for ObsFs {
                 } else {
                     FileType::RegularFile
                 };
-                let attr = inner.attr(req, ino.0, kind, size, mtime);
+                let cached = inner.meta_cache.get(&path).cloned();
+                let attr = inner.attr_with_meta(req, ino.0, kind, size, mtime, cached.as_ref());
                 reply.attr(&TTL, &attr);
             }
             None => reply.error(Errno::ENOENT),
         }
     }
-}
-
-pub fn _unused(_: &Path) {
-    let _ = ObjectMeta {
-        size: 0,
-        last_modified: None,
-        etag: None,
-    };
 }
 
 #[cfg(test)]
@@ -1359,7 +1748,7 @@ mod tests {
                 "http://127.0.0.1:1".into(),
             ),
             staging_dir: std::env::temp_dir().join("obs-mount-test-staging"),
-            multipart_threshold: 8 * 1024 * 1024,
+            upload: crate::obs::UploadTuning::default(),
             next_ino: 2,
             ino_to_path: HashMap::new(),
             path_to_ino: HashMap::new(),
@@ -1390,12 +1779,7 @@ mod tests {
         let ino = inner.alloc_ino("old.txt");
         inner.meta_cache.insert(
             "old.txt".into(),
-            CachedMeta {
-                size: 3,
-                is_dir: false,
-                mtime: SystemTime::now(),
-                expires: Instant::now() + Duration::from_secs(5),
-            },
+            synthetic_meta(3, false, SystemTime::now()),
         );
 
         inner.remap_subtree("old.txt", "new.txt");
@@ -1440,6 +1824,7 @@ mod tests {
                 key: "a.txt".into(),
                 staging: Some(inner.staging_path(ino)),
                 dirty: true,
+                owner: None,
             },
         );
 
@@ -1470,6 +1855,7 @@ mod tests {
                     key: "k".into(),
                     staging: Some(staging.clone()),
                     dirty: false,
+                    owner: None,
                 },
             );
         }

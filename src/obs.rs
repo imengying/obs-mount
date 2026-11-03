@@ -30,6 +30,25 @@ use thiserror::Error;
 
 type HmacSha1 = Hmac<Sha1>;
 
+/// Total attempts per request (the first try plus retries). obsfs uses 3
+/// retries; this is 4 attempts, close enough while backing off further.
+const RETRY_ATTEMPTS: u32 = 5;
+const RETRY_BASE_MS: u64 = 500;
+/// Cap so a long outage cannot park a FUSE request for minutes.
+const RETRY_MAX_MS: u64 = 8_000;
+
+/// Exponential backoff: 0.5s, 1s, 2s, 4s (capped).
+fn backoff_delay(attempt: u32) -> Duration {
+    let ms = RETRY_BASE_MS.saturating_mul(1u64 << attempt.min(6));
+    Duration::from_millis(ms.min(RETRY_MAX_MS))
+}
+
+/// Statuses worth retrying: transient server-side failures and throttling.
+/// Everything else (2xx, 3xx, 4xx) is returned to the caller as-is.
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
 #[derive(Debug, Error)]
 pub enum ObsError {
     #[error("HTTP {status} for {method} {path}: {body}")]
@@ -139,12 +158,84 @@ pub fn obs_signature(
     B64.encode(mac.finalize().into_bytes())
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
 pub struct ObjectMeta {
     pub size: u64,
+    /// Kept for logging/diagnostics; nothing branches on it yet.
+    #[allow(dead_code)]
     pub last_modified: Option<String>,
+    /// Same: recorded so a future conditional request can use it.
+    #[allow(dead_code)]
     pub etag: Option<String>,
+    /// POSIX-ish attributes persisted in object metadata. `None` means "not
+    /// recorded on the object", which callers render with a default rather
+    /// than pretending the object has no permissions at all.
+    pub unix: Option<UnixMeta>,
+    /// Every `x-obs-meta-*` header, key without the prefix, lower-case.
+    /// Holds user xattrs and the symlink target as well as `unix`'s fields.
+    pub x_obs_meta: Vec<(String, String)>,
+}
+
+/// The Unix attributes this program persists in object metadata.
+///
+/// OBS has no native permissions, but object metadata is free-form and
+/// Huawei's obsfs persists exactly this information the same way (it uses
+/// the S3-style `x-amz-meta-` prefix because it also serves generic S3;
+/// native OBS is `x-obs-meta-`, which is what this program signs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnixMeta {
+    /// Full st_mode, including the file-type bits.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Seconds since the epoch.
+    pub mtime: i64,
+}
+
+/// Metadata keys this program writes, without the `x-obs-meta-` prefix.
+pub mod meta_keys {
+    pub const UID: &str = "uid";
+    pub const GID: &str = "gid";
+    pub const MODE: &str = "mode";
+    pub const MTIME: &str = "mtime";
+    /// Symlink target, stored on a zero-byte object whose mode says S_IFLNK.
+    pub const SYMLINK_TARGET: &str = "symlink-target";
+    /// Prefix for user extended attributes: `xdg.<base64(name)>`.
+    pub const XATTR_PREFIX: &str = "xdg.";
+}
+
+/// Parse the persisted Unix attributes out of an `x-obs-meta-*` list.
+pub fn parse_unix_meta(meta: &[(String, String)]) -> Option<UnixMeta> {
+    let get = |key: &str| {
+        meta.iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.parse::<i64>().ok())
+    };
+    let mode = get(meta_keys::MODE)?;
+    Some(UnixMeta {
+        mode: mode as u32,
+        uid: get(meta_keys::UID).unwrap_or(0) as u32,
+        gid: get(meta_keys::GID).unwrap_or(0) as u32,
+        mtime: get(meta_keys::MTIME).unwrap_or(0),
+    })
+}
+
+/// Symlink target stored on an object, if any.
+pub fn symlink_target(meta: &[(String, String)]) -> Option<String> {
+    meta.iter()
+        .find(|(k, _)| k == meta_keys::SYMLINK_TARGET)
+        .map(|(_, v)| v.clone())
+}
+
+/// Render `UnixMeta` as the `x-obs-meta-*` pairs to send with a PUT/COPY.
+pub fn unix_meta_headers(meta: UnixMeta) -> Vec<(String, String)> {
+    let h = |k: &str, v: String| (format!("x-obs-meta-{k}"), v);
+    vec![
+        h(meta_keys::MODE, meta.mode.to_string()),
+        h(meta_keys::UID, meta.uid.to_string()),
+        h(meta_keys::GID, meta.gid.to_string()),
+        h(meta_keys::MTIME, meta.mtime.to_string()),
+    ]
 }
 
 #[derive(Debug, Clone)]
@@ -383,7 +474,10 @@ impl ObsClient {
             extra_x_obs,
         );
         let mut last_err: Option<ObsError> = None;
-        for attempt in 0..4 {
+        // obsfs retries 3 times (S3fsCurl::retries) with a fixed delay; this
+        // keeps the same attempt count but backs off exponentially, so a
+        // short throttle clears quickly and a real outage is not hammered.
+        for attempt in 0..RETRY_ATTEMPTS {
             let mut req = self
                 .http
                 .request(
@@ -407,11 +501,13 @@ impl ObsClient {
             match req.send() {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    if status == 403 || !(500..600).contains(&status) {
+                    // 5xx (or 429): retry with backoff, unless this was the
+                    // last try. 403 is never retried -- it means the
+                    // signature or credentials are wrong and will stay wrong.
+                    if status == 403 || !is_retryable_status(status) {
                         return Ok(resp);
                     }
-                    // 5xx: retry with backoff, unless this was the last try.
-                    if attempt == 3 {
+                    if attempt + 1 == RETRY_ATTEMPTS {
                         return Ok(resp);
                     }
                     let body_text = resp.text().unwrap_or_default();
@@ -421,14 +517,14 @@ impl ObsClient {
                         path: key.to_string(),
                         body: body_text,
                     });
-                    std::thread::sleep(Duration::from_millis(500 * (attempt as u64 + 1)));
+                    std::thread::sleep(backoff_delay(attempt));
                 }
                 Err(e) => {
-                    if attempt == 3 {
+                    if attempt + 1 == RETRY_ATTEMPTS {
                         return Err(ObsError::Network(e));
                     }
                     last_err = Some(ObsError::Network(e));
-                    std::thread::sleep(Duration::from_millis(500 * (attempt as u64 + 1)));
+                    std::thread::sleep(backoff_delay(attempt));
                 }
             }
         }
@@ -502,6 +598,15 @@ impl ObsClient {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        let x_obs_meta: Vec<(String, String)> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                let name = name.as_str().to_ascii_lowercase();
+                let key = name.strip_prefix("x-obs-meta-")?;
+                Some((key.to_string(), value.to_str().ok()?.to_string()))
+            })
+            .collect();
+        let unix = parse_unix_meta(&x_obs_meta);
         Ok(Some(ObjectMeta {
             size,
             last_modified: headers
@@ -512,6 +617,8 @@ impl ObsClient {
                 .get("etag")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.trim_matches('"').to_string()),
+            unix,
+            x_obs_meta,
         }))
     }
 
@@ -630,16 +737,44 @@ impl ObsClient {
         Ok(resp.bytes()?.to_vec())
     }
 
-    pub fn put_object(&self, key: &str, data: &[u8]) -> Result<()> {
+    /// PUT with `x-obs-meta-*` headers attached.
+    pub fn put_object_with_meta(
+        &self,
+        key: &str,
+        data: &[u8],
+        meta: &[(String, String)],
+    ) -> Result<()> {
         let resp = self.send(
             "PUT",
             key,
             "",
             Some(data.to_vec()),
             "application/octet-stream",
-            &[],
+            meta,
             &[],
         )?;
+        Self::check(resp, "PUT", key)?;
+        Ok(())
+    }
+
+    /// Rewrite an object's metadata in place without moving its bytes.
+    ///
+    /// OBS exposes metadata replacement only through CopyObject with
+    /// `x-obs-metadata-directive: REPLACE` and the object copied onto itself,
+    /// which is exactly what obsfs does for chmod/chown/setxattr
+    /// (s3fs_setxattr_s3). The data is not re-uploaded, so changing a
+    /// permission bit on a 100 GiB object is cheap.
+    pub fn set_object_meta(&self, key: &str, meta: &[(String, String)]) -> Result<()> {
+        let source = format!("/{}/{}", self.bucket, encode_key(key));
+        let mut headers = vec![
+            ("x-obs-copy-source".to_string(), source),
+            (
+                "x-obs-metadata-directive".to_string(),
+                "REPLACE".to_string(),
+            ),
+        ];
+        headers.extend_from_slice(meta);
+        let resp = self.send("PUT", key, "", None, "", &headers, &[])?;
         Self::check(resp, "PUT", key)?;
         Ok(())
     }
@@ -669,8 +804,14 @@ impl ObsClient {
         Ok(())
     }
 
-    pub fn initiate_multipart(&self, key: &str) -> Result<String> {
-        let resp = self.send("POST", key, "uploads", None, "", &[], &[])?;
+    /// Multipart init with `x-obs-meta-*`; metadata set here ends up on the
+    /// final object, which is the only chance to attach it for a large file.
+    pub fn initiate_multipart_with_meta(
+        &self,
+        key: &str,
+        meta: &[(String, String)],
+    ) -> Result<String> {
+        let resp = self.send("POST", key, "uploads", None, "", meta, &[])?;
         let resp = Self::check(resp, "POST", key)?;
         let text = resp.text()?;
         parse_tag(&text, "UploadId")
@@ -754,12 +895,23 @@ impl ObsClient {
     /// need more than 10000 parts (the multipart limit) — same adaptation
     /// OpenList's S3 driver relies on via the AWS SDK — so a file above
     /// ~80 GiB does not fail at CompleteMultipartUpload.
-    pub fn upload_file(&self, key: &str, data: &[u8], multipart_threshold: u64) -> Result<()> {
-        if data.is_empty() || (data.len() as u64) < multipart_threshold {
-            return self.put_object(key, data);
+    pub fn upload_file(&self, key: &str, data: &[u8], tuning: UploadTuning) -> Result<()> {
+        self.upload_file_with_meta(key, data, tuning, &[])
+    }
+
+    /// As [`upload_file`](Self::upload_file), attaching `x-obs-meta-*`.
+    pub fn upload_file_with_meta(
+        &self,
+        key: &str,
+        data: &[u8],
+        tuning: UploadTuning,
+        meta: &[(String, String)],
+    ) -> Result<()> {
+        if data.is_empty() || (data.len() as u64) < tuning.threshold {
+            return self.put_object_with_meta(key, data, meta);
         }
-        let upload_id = self.initiate_multipart(key)?;
-        let part: usize = multipart_part_size(data.len());
+        let upload_id = self.initiate_multipart_with_meta(key, meta)?;
+        let part: usize = multipart_part_size_with(data.len(), tuning.part_size);
         const CONCURRENCY: usize = 4;
         let mut parts: Vec<(u32, String)> = Vec::new();
         let mut result: Result<()> = Ok(());
@@ -1023,10 +1175,38 @@ pub fn canonical_resource(bucket: &str, key: &str, query: &str) -> String {
 
 /// Part size for a multipart upload: 8 MiB normally, growing just enough
 /// that the file never needs more than 10000 parts.
-pub fn multipart_part_size(file_len: usize) -> usize {
-    const BASE_PART: usize = 8 * 1024 * 1024;
+/// Part size, honouring a configured base size but still growing it so a
+/// huge file never needs more than 10000 parts (the per-upload limit).
+pub fn multipart_part_size_with(file_len: usize, base: usize) -> usize {
     const MAX_PARTS: usize = 10_000;
-    BASE_PART.max(file_len.div_ceil(MAX_PARTS))
+    let base = base.max(5 * 1024 * 1024); // OBS minimum part size is 5 MiB
+    base.max(file_len.div_ceil(MAX_PARTS))
+}
+
+/// obsfs uses 10 MB parts and a 25 MB threshold; 8 MiB is kept as the
+/// default because it matches the AWS CLI and keeps the first retry cheap,
+/// but the part size is now configurable through `multipart_part_size`.
+pub const DEFAULT_PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// How large files are split for upload.
+///
+/// `threshold` decides single PUT vs multipart; `part_size` is the chunk size.
+/// obsfs mounts with 25 MB / 10 MB; the defaults here stay at 8 MiB / 8 MiB
+/// (AWS CLI) but both are configurable, which matters for links where a
+/// 10 MB part is noticeably better than 8 MiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadTuning {
+    pub threshold: u64,
+    pub part_size: usize,
+}
+
+impl Default for UploadTuning {
+    fn default() -> Self {
+        Self {
+            threshold: DEFAULT_PART_SIZE as u64,
+            part_size: DEFAULT_PART_SIZE,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1035,9 +1215,12 @@ mod tests {
 
     #[test]
     fn part_size_stays_8mib_below_limit_and_grows_above() {
-        assert_eq!(multipart_part_size(8 * 1024 * 1024), 8 * 1024 * 1024);
+        assert_eq!(
+            multipart_part_size_with(8 * 1024 * 1024, DEFAULT_PART_SIZE),
+            8 * 1024 * 1024
+        );
         // 100 GiB would need 12800 parts at 8 MiB; grown size keeps it at 10000.
-        let grown = multipart_part_size(100 * 1024 * 1024 * 1024);
+        let grown = multipart_part_size_with(100 * 1024 * 1024 * 1024, DEFAULT_PART_SIZE);
         assert!(grown > 8 * 1024 * 1024);
         assert_eq!((100usize * 1024 * 1024 * 1024).div_ceil(grown), 10_000);
     }
@@ -1196,6 +1379,73 @@ mod tests {
         assert_eq!(classify_bucket("", "enabled"), BucketKind::File);
         assert_eq!(classify_bucket("", ""), BucketKind::Object);
         assert_eq!(classify_bucket("OBJECT", "Disabled"), BucketKind::Object);
+    }
+
+    #[test]
+    fn retry_classification() {
+        // Transient: retry. Permanent: return immediately.
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(429));
+        assert!(!is_retryable_status(403));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(200));
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        assert_eq!(backoff_delay(0), Duration::from_millis(500));
+        assert_eq!(backoff_delay(1), Duration::from_millis(1000));
+        assert_eq!(backoff_delay(2), Duration::from_millis(2000));
+        assert_eq!(backoff_delay(3), Duration::from_millis(4000));
+        // Never parks a FUSE request for minutes.
+        assert_eq!(backoff_delay(20), Duration::from_millis(RETRY_MAX_MS));
+    }
+
+    #[test]
+    fn part_size_respects_configured_base() {
+        // obsfs-style 10 MB parts.
+        let ten_mb = 10 * 1024 * 1024;
+        assert_eq!(multipart_part_size_with(30 * 1024 * 1024, ten_mb), ten_mb);
+        // Never below the OBS 5 MiB minimum, even if configured lower.
+        assert_eq!(
+            multipart_part_size_with(30 * 1024 * 1024, 1024),
+            5 * 1024 * 1024
+        );
+        // Still grows for a file that would need more than 10000 parts.
+        let huge = 100usize * 1024 * 1024 * 1024;
+        assert_eq!(
+            huge.div_ceil(multipart_part_size_with(huge, ten_mb)),
+            10_000
+        );
+    }
+
+    #[test]
+    fn unix_meta_round_trips_through_headers() {
+        let meta = UnixMeta {
+            mode: libc::S_IFREG | 0o640,
+            uid: 1234,
+            gid: 5678,
+            mtime: 1_577_934_245,
+        };
+        let headers = unix_meta_headers(meta);
+        // Header names must survive signing, so they are lower-case x-obs-*.
+        assert!(headers.iter().all(|(k, _)| k.starts_with("x-obs-meta-")));
+        let stripped: Vec<(String, String)> = headers
+            .into_iter()
+            .map(|(k, v)| (k.trim_start_matches("x-obs-meta-").to_string(), v))
+            .collect();
+        assert_eq!(parse_unix_meta(&stripped), Some(meta));
+    }
+
+    #[test]
+    fn unix_meta_absent_when_mode_missing() {
+        assert_eq!(parse_unix_meta(&[]), None);
+        assert_eq!(
+            parse_unix_meta(&[("uid".to_string(), "7".to_string())]),
+            None,
+            "uid alone is not enough to claim the object is annotated"
+        );
     }
 
     #[test]
