@@ -22,7 +22,6 @@ use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest as _, Md5};
 use quick_xml::Reader;
-use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use reqwest::blocking::Client;
 use sha1::Sha1;
@@ -660,30 +659,65 @@ impl ObsClient {
     }
 }
 
+/// Extract the text of the first `<tag>...</tag>` element.
+///
+/// OBS always prefixes its XML responses with an `<?xml ... ?>` declaration,
+/// so every event kind that is not the tag we are looking for must be
+/// *skipped*, not treated as end-of-input: an early `break` on e.g.
+/// `Event::Decl` made multipart uploads fail with "no UploadId in response"
+/// against a real bucket.
+///
+/// Text is accumulated across events because character references such as
+/// `&amp;` are reported as separate `Text` events, so stopping at the first
+/// one would silently truncate values like `a&b`.
 fn parse_tag(xml: &str, tag: &str) -> Option<String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
     let mut in_tag = false;
+    let mut text = String::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 if e.name().as_ref() == tag {
                     in_tag = true;
+                } else if in_tag {
+                    // Nested element inside the target: not a plain value.
+                    return None;
                 }
             }
             Ok(Event::Text(e)) => {
                 if in_tag {
-                    return unescape(&e.xml10_content()).ok().map(|c| c.into_owned());
+                    text.push_str(&e.xml10_content());
+                }
+            }
+            // `&amp;` and friends arrive as their own event; resolve them so
+            // values containing '&' / '<' are not silently dropped.
+            Ok(Event::GeneralRef(e)) => {
+                if in_tag {
+                    match e.resolve_char_ref() {
+                        Ok(Some(ch)) => text.push(ch),
+                        _ => text.push_str(
+                            quick_xml::escape::resolve_predefined_entity(e.as_ref())
+                                .unwrap_or(e.as_ref()),
+                        ),
+                    }
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if in_tag {
+                    text.push_str(&e.xml10_content());
                 }
             }
             Ok(Event::End(e)) => {
                 if e.name().as_ref() == tag {
-                    in_tag = false;
+                    return Some(text);
                 }
             }
+            // Decl, Comment, PI, DocType, ... : keep reading.
             Ok(Event::Eof) => break,
-            _ => break,
+            Err(_) => break,
+            _ => {}
         }
         buf.clear();
     }
@@ -703,6 +737,7 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
     let mut cur_key: Option<String> = None;
     let mut cur_size: u64 = 0;
     let mut cur_text_elem: Option<String> = None;
+    let mut cur_text = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -716,25 +751,22 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
                 cur_text_elem = Some(name);
             }
             Ok(Event::Text(e)) => {
-                if let Some(elem) = &cur_text_elem {
-                    let text = unescape(&e.xml10_content())
-                        .unwrap_or_default()
-                        .into_owned();
-                    let in_contents = stack.iter().any(|s| s == "Contents");
-                    let in_prefix = stack.iter().any(|s| s == "CommonPrefixes");
-                    match elem.as_str() {
-                        "Key" if in_contents => cur_key = Some(text),
-                        "Size" if in_contents => cur_size = text.parse().unwrap_or(0),
-                        "Prefix" if in_prefix => out.prefixes.push(text),
-                        "IsTruncated" if stack.len() == 2 => {
-                            out.is_truncated = text == "true";
-                        }
-                        "NextMarker" if stack.len() == 2 => {
-                            if !text.is_empty() {
-                                out.next_marker = Some(text);
-                            }
-                        }
-                        _ => {}
+                if cur_text_elem.is_some() {
+                    // Accumulate instead of assigning: one element can arrive
+                    // as several Text events when it contains a character
+                    // reference (`a&amp;b` is Text + GeneralRef + Text), and
+                    // assigning would keep only the last fragment.
+                    cur_text.push_str(&e.xml10_content());
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if cur_text_elem.is_some() {
+                    match e.resolve_char_ref() {
+                        Ok(Some(ch)) => cur_text.push(ch),
+                        _ => cur_text.push_str(
+                            quick_xml::escape::resolve_predefined_entity(e.as_ref())
+                                .unwrap_or(e.as_ref()),
+                        ),
                     }
                 }
             }
@@ -749,8 +781,32 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
                         });
                     }
                 }
+                // Commit the element's text now that all fragments are in.
+                if let Some(elem) = cur_text_elem.take() {
+                    let in_contents = stack.iter().any(|s| s == "Contents");
+                    let in_prefix = stack.iter().any(|s| s == "CommonPrefixes");
+                    match elem.as_str() {
+                        "Key" if in_contents => cur_key = Some(std::mem::take(&mut cur_text)),
+                        "Size" if in_contents => {
+                            cur_size = cur_text.parse().unwrap_or(0);
+                            cur_text.clear();
+                        }
+                        "Prefix" if in_prefix => out.prefixes.push(std::mem::take(&mut cur_text)),
+                        "IsTruncated" if stack.len() == 2 => {
+                            out.is_truncated = cur_text == "true";
+                            cur_text.clear();
+                        }
+                        "NextMarker" if stack.len() == 2 => {
+                            if !cur_text.is_empty() {
+                                out.next_marker = Some(std::mem::take(&mut cur_text));
+                            } else {
+                                cur_text.clear();
+                            }
+                        }
+                        _ => cur_text.clear(),
+                    }
+                }
                 stack.pop();
-                cur_text_elem = None;
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(ObsError::Xml(e)),
@@ -857,5 +913,48 @@ mod tests {
         assert_eq!(r.objects[0].key, "backups/a.tar.gz");
         assert_eq!(r.prefixes, vec!["backups/sub/"]);
         assert!(!r.is_truncated);
+    }
+
+    /// Regression: the `<?xml ... ?>` declaration used to abort parsing
+    /// (the match fell through to a `_ => break`), so InitiateMultipart never
+    /// returned an UploadId against a real OBS endpoint, which sends the
+    /// declaration on every response. Every multipart upload above the
+    /// threshold therefore failed with "no UploadId in response".
+    #[test]
+    fn parse_tag_skips_xml_declaration() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://obs.myhuaweicloud.com/doc/2017-01-01/">
+<Bucket>b</Bucket><Key>k</Key><UploadId>upload-0001</UploadId>
+</InitiateMultipartUploadResult>"#;
+        assert_eq!(parse_tag(xml, "UploadId"), Some("upload-0001".to_string()));
+    }
+
+    #[test]
+    fn parse_tag_handles_no_declaration_and_missing_tag() {
+        let xml = "<R><UploadId>u1</UploadId></R>";
+        assert_eq!(parse_tag(xml, "UploadId"), Some("u1".to_string()));
+        assert_eq!(parse_tag(xml, "Nope"), None);
+        assert_eq!(parse_tag("<R></R>", "UploadId"), None);
+    }
+
+    /// Character references arrive as separate events, so a value containing
+    /// '&' must not be truncated or dropped.
+    #[test]
+    fn parse_tag_unescapes_entities() {
+        let xml = "<R><Key>a&amp;b&lt;c</Key></R>";
+        assert_eq!(parse_tag(xml, "Key"), Some("a&b<c".to_string()));
+    }
+
+    #[test]
+    fn list_xml_keeps_escaped_characters_in_keys() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+<IsTruncated>false</IsTruncated>
+<Contents><Key>a&amp;b/中文.txt</Key><Size>7</Size></Contents>
+</ListBucketResult>"#;
+        let r = parse_list_xml(xml).unwrap();
+        assert_eq!(r.objects.len(), 1);
+        assert_eq!(r.objects[0].key, "a&b/中文.txt");
+        assert_eq!(r.objects[0].size, 7);
     }
 }
