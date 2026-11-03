@@ -98,7 +98,9 @@ jobs:
             musl-tools \
             perl \
             pkg-config \
-            git
+            git \
+            file \
+            binutils
           rm -rf /var/lib/apt/lists/*
 
       - uses: actions/checkout@v7

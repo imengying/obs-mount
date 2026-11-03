@@ -39,6 +39,11 @@ if [ ! -e /dev/fuse ]; then
   echo "SKIP: /dev/fuse not available"
   exit 0
 fi
+if [ ! -r /dev/fuse ] || [ ! -w /dev/fuse ]; then
+  echo "SKIP: /dev/fuse not accessible to $(id -un)"
+  ls -l /dev/fuse
+  exit 0
+fi
 if [ ! -x "$BIN" ]; then
   echo "SKIP: $BIN not built (run: cargo build --release)"
   exit 0
@@ -75,7 +80,13 @@ for _ in $(seq 1 50); do
 done
 if ! mountpoint -q "$MNT"; then
   echo "FAIL: mount did not come up"
-  tail -20 "$WORK/mount.log"
+  echo "--- diagnostics ---"
+  ls -l /dev/fuse 2>&1 || echo "/dev/fuse MISSING"
+  id
+  command -v fusermount3 fusermount mountpoint 2>&1 || true
+  cat /proc/filesystems | grep -i fuse || echo "fuse not in /proc/filesystems"
+  echo "--- mount log ---"
+  tail -30 "$WORK/mount.log"
   exit 1
 fi
 
