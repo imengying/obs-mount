@@ -1,0 +1,6 @@
+[toolchain]
+# `stable` rather than an exact version: security and bugfix releases should
+# reach CI without a commit, and the MSRV is recorded in Cargo.toml instead.
+# edition 2024 requires 1.85+.
+channel = "stable"
+components = ["rustfmt", "clippy"]

@@ -26,10 +26,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # rust-toolchain.toml pins channel + components, so this just needs to
+      # install whatever it says.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2.9.3
 
@@ -102,8 +102,10 @@ jobs:
       - name: Install Rust (musl target)
         run: |
           set -eux
+          # rust-toolchain.toml supplies channel + components; only the target
+          # has to be added here.
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+            | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/rustup" target add x86_64-unknown-linux-musl
 

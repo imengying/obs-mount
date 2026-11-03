@@ -117,8 +117,26 @@ CC_x86_64_unknown_linux_musl=musl-gcc \
 `file` 显示 `static-pie linked`、`ldd` 显示 `statically linked`。
 
 CI（`.github/workflows/ci.yml`）会在 `debian:trixie-slim` 容器里跑这条路，
-所以上面的命令和 GitHub Actions 用的是同一套；推 tag 时两种二进制
-会自动附加到 release。
+所以上面的命令和 GitHub Actions 用的是同一套。
+
+## 发布
+
+**只有推 `v*` tag 才会生成 Release**，分支推送和 PR 只跑检查。发布前：
+
+1. 改 `Cargo.toml` 的 `version`；
+2. 提交，然后打**与版本号一致**的 tag：`git tag v0.1.0 && git push origin v0.1.0`。
+
+tag 与 `Cargo.toml` 版本不一致时 release job 会**直接失败**，避免出现
+「tag 是 v0.2.0 但二进制 `--version` 报 0.1.0」的资产。Release 里附：
+
+| 文件 | 说明 |
+|---|---|
+| `obs-mount-x86_64-linux-gnu` | 动态链接，glibc ≥ 2.39 |
+| `obs-mount-x86_64-linux-musl` | 全静态，任意 x86_64 Linux |
+| `SHA256SUMS` | 校验和 |
+
+工具链由 `rust-toolchain.toml` 指定（`stable` + rustfmt/clippy），
+最低支持的编译器版本写在 `Cargo.toml` 的 `rust-version`。
 
 运行：
 
