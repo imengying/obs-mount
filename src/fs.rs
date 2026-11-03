@@ -23,7 +23,8 @@ use crate::obs::{ObjectMeta, ObsClient, ObsError};
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileType, Filesystem, FopenFlags, Generation, INodeNo,
     LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    WriteFlags,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -34,6 +35,16 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 const TTL: Duration = Duration::from_secs(1);
+/// How long a statfs answer is reused before asking OBS again. `df` is often
+/// polled by monitoring every few seconds and each miss costs two requests.
+const USAGE_TTL: Duration = Duration::from_secs(60);
+/// Capacity reported when the bucket has no quota configured. It is not a
+/// real limit -- it only keeps tools that precheck free space from treating
+/// the mount as full. 1 PiB is far beyond any single OBS bucket quota.
+const SYNTHETIC_TOTAL: u64 = 1 << 50;
+const STATFS_BLOCK_SIZE: u32 = 4096;
+/// OBS keys are limited to 1023 bytes.
+const STATFS_NAME_MAX: u32 = 1023;
 const ROOT_INO: u64 = 1;
 
 #[derive(Clone)]
@@ -60,6 +71,39 @@ struct Inner {
     meta_cache: HashMap<String, CachedMeta>,
     open_files: HashMap<u64, OpenFile>,
     next_fh: u64,
+    /// Cached answer for statfs; `df` is cheap to call and usually polled by
+    /// monitoring, so the bucket is queried at most once per TTL instead of
+    /// once per request.
+    usage_cache: Option<(Instant, UsageSnapshot)>,
+}
+
+/// Pick what to report from what OBS can tell us. Split out from the query
+/// path so the decision (and the 0-means-unlimited rule) is unit-testable.
+fn decide_usage(used: u64, quota: Option<u64>) -> UsageSnapshot {
+    match quota.filter(|q| *q > 0) {
+        Some(total) => UsageSnapshot {
+            // A bucket can exceed its quota (writes start failing rather than
+            // stored data shrinking), so never report used > total.
+            total: total.max(used),
+            used,
+            total_is_synthetic: false,
+        },
+        None => UsageSnapshot {
+            total: SYNTHETIC_TOTAL,
+            used,
+            total_is_synthetic: true,
+        },
+    }
+}
+
+/// What `statfs` reports, in bytes, plus a note on where the numbers came
+/// from so the log can explain `df` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsageSnapshot {
+    total: u64,
+    used: u64,
+    /// True when `total` is not a real limit (no quota configured).
+    total_is_synthetic: bool,
 }
 
 pub struct ObsFs {
@@ -146,6 +190,7 @@ impl ObsFs {
                 meta_cache: HashMap::new(),
                 open_files: HashMap::new(),
                 next_fh: 1,
+                usage_cache: None,
             }),
         }
     }
@@ -352,6 +397,50 @@ impl Inner {
             }
             _ => None,
         }
+    }
+
+    /// Resolve what to report to `statfs`.
+    ///
+    /// OBS does not model a "disk": a bucket has a *used* figure
+    /// (`GET /?storageinfo`) and, optionally, a byte *quota* (`GET /?quota`).
+    /// So:
+    /// * quota > 0: real total, real used, real free. This is the only case
+    ///   where `df` means something.
+    /// * quota == 0: no limit configured. Reporting 0 free would make
+    ///   monitoring scream "disk full" and can make writers bail out on a
+    ///   statvfs() precheck, so report a large synthetic ceiling instead and
+    ///   flag it as synthetic.
+    /// * query fails: keep the last good answer, or fall back to the
+    ///   synthetic ceiling without usage numbers.
+    fn usage_snapshot(&mut self) -> UsageSnapshot {
+        if let Some((at, cached)) = self.usage_cache
+            && at.elapsed() < USAGE_TTL
+        {
+            return cached;
+        }
+        let used = self
+            .client
+            .bucket_storage_info()
+            .ok()
+            .and_then(|u| u.size)
+            .or_else(|| self.usage_cache.map(|(_, c)| c.used))
+            .unwrap_or(0);
+        let quota = self
+            .client
+            .bucket_quota()
+            .ok()
+            .and_then(|q| q.quota)
+            .filter(|q| *q > 0);
+        let snapshot = decide_usage(used, quota);
+        if snapshot.total_is_synthetic {
+            tracing::debug!(
+                used,
+                synthetic_total = SYNTHETIC_TOTAL,
+                "no bucket quota configured; statfs reports a synthetic capacity"
+            );
+        }
+        self.usage_cache = Some((Instant::now(), snapshot));
+        snapshot
     }
 
     fn upload_staging(&self, fh: u64) -> Result<(), ObsError> {
@@ -1108,6 +1197,28 @@ impl Filesystem for ObsFs {
         }
     }
 
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let mut inner = self.inner.lock().unwrap();
+        let usage = inner.usage_snapshot();
+        let bs = STATFS_BLOCK_SIZE as u64;
+        let total_blocks = usage.total / bs;
+        let used_blocks = (usage.used / bs).min(total_blocks);
+        let free_blocks = total_blocks - used_blocks;
+        // No per-file limit is meaningful here, so report the standard
+        // "no limit" pair rather than inventing numbers that `df -i` would
+        // chart.
+        reply.statfs(
+            total_blocks,
+            free_blocks,
+            free_blocks,
+            u64::MAX,
+            u64::MAX,
+            STATFS_BLOCK_SIZE,
+            STATFS_NAME_MAX,
+            STATFS_BLOCK_SIZE,
+        );
+    }
+
     fn setattr(
         &self,
         req: &Request,
@@ -1246,6 +1357,7 @@ mod tests {
             meta_cache: HashMap::new(),
             open_files: HashMap::new(),
             next_fh: 1,
+            usage_cache: None,
         }
     }
 
@@ -1364,5 +1476,41 @@ mod tests {
             !staging.exists(),
             "staging should be removed with the last handle"
         );
+    }
+
+    /// OBS reports a quota of 0 when none is configured, i.e. "unlimited".
+    /// Treating that as a real limit would show `df` a full disk.
+    #[test]
+    fn zero_quota_means_unlimited_not_full() {
+        let s = decide_usage(1234, Some(0));
+        assert!(s.total_is_synthetic);
+        assert_eq!(s.total, SYNTHETIC_TOTAL);
+        assert_eq!(s.used, 1234);
+    }
+
+    #[test]
+    fn no_quota_report_is_also_unlimited() {
+        assert!(decide_usage(0, None).total_is_synthetic);
+    }
+
+    #[test]
+    fn real_quota_is_reported_as_a_real_limit() {
+        let s = decide_usage(10, Some(1000));
+        assert!(!s.total_is_synthetic);
+        assert_eq!(s.total, 1000);
+        assert_eq!(s.used, 10);
+    }
+
+    /// Buckets can be over quota; `df` must not show negative free space.
+    #[test]
+    fn used_never_exceeds_total() {
+        let s = decide_usage(5000, Some(1000));
+        assert_eq!(s.total, 5000);
+        assert_eq!(s.used, 5000);
+
+        let bs = STATFS_BLOCK_SIZE as u64;
+        let total_blocks = s.total / bs;
+        let used_blocks = (s.used / bs).min(total_blocks);
+        assert_eq!(total_blocks - used_blocks, 0);
     }
 }

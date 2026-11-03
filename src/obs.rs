@@ -69,6 +69,7 @@ fn is_subresource(name: &str) -> bool {
             | "delete"
             | "website"
             | "storagePolicy"
+            | "storageinfo"
             | "quota"
             | "encryption"
             | "response-content-type"
@@ -152,6 +153,20 @@ pub struct ListEntry {
     pub key: String,
     pub size: u64,
     pub is_dir_placeholder: bool,
+}
+
+/// Bucket usage as reported by `GET /?storageinfo`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BucketUsage {
+    pub size: Option<u64>,
+    pub object_number: Option<u64>,
+}
+
+/// Bucket quota as reported by `GET /?quota`.
+/// A `quota` of 0 means no quota is configured (unlimited), not "no space".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BucketQuota {
+    pub quota: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -417,6 +432,37 @@ impl ObsClient {
             }
         }
         Ok(keys)
+    }
+
+    /// Bucket-wide usage: `GET /?storageinfo`.
+    ///
+    /// Returns what OBS knows about the bucket as a whole -- total bytes
+    /// stored and the object count. This is the closest thing OBS offers to
+    /// "how full is it", but note it reports *used*, never *capacity*: a
+    /// bucket's limit is a quota the account owns, not a fixed disk size.
+    pub fn bucket_storage_info(&self) -> Result<BucketUsage> {
+        let resp = self.send("GET", "", "storageinfo", None, "", &[], &[])?;
+        let resp = Self::check(resp, "GET", "?storageinfo")?;
+        let text = resp.text()?;
+        Ok(BucketUsage {
+            size: parse_tag(&text, "Size").and_then(|v| v.parse().ok()),
+            object_number: parse_tag(&text, "ObjectNumber").and_then(|v| v.parse().ok()),
+        })
+    }
+
+    /// Bucket storage quota: `GET /?quota`.
+    ///
+    /// `quota` is the configured byte limit. OBS reports 0 when no quota is
+    /// set, which means "unlimited" rather than "no space" -- the opposite
+    /// of what a `df` reader would assume, so callers must not treat 0 as
+    /// "full".
+    pub fn bucket_quota(&self) -> Result<BucketQuota> {
+        let resp = self.send("GET", "", "quota", None, "", &[], &[])?;
+        let resp = Self::check(resp, "GET", "?quota")?;
+        let text = resp.text()?;
+        Ok(BucketQuota {
+            quota: parse_tag(&text, "StorageQuota").and_then(|v| v.parse().ok()),
+        })
     }
 
     /// List one directory level (delimiter="/"), following pagination.

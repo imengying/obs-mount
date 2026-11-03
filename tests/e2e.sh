@@ -146,6 +146,28 @@ eq "space in name" "$(cat 'a b.txt')" "S"
 echo C >'中文.txt'
 eq "non-ascii name" "$(cat '中文.txt')" "C"
 
+echo "== statfs reports usage instead of zeros =="
+# Regression: fuser's default replies 0 for every field, so df showed
+# Size 0 / Avail 0 and anything prechecking free space treated the mount
+# as full. A quota-less bucket must report a large synthetic ceiling, never 0.
+total=$(df -B1 --output=size /mnt/obs | tail -1 | tr -d ' ')
+avail=$(df -B1 --output=avail /mnt/obs | tail -1 | tr -d ' ')
+if [ "${total:-0}" -gt 0 ] && [ "${avail:-0}" -gt 0 ]; then
+  pass "df reports non-zero size (${total}B total, ${avail}B avail)"
+else
+  fail "df reports usable capacity" "total=$total avail=$avail" "both > 0"
+fi
+used=$(df -B1 --output=used /mnt/obs | tail -1 | tr -d ' ')
+if [ "${used:-0}" -gt 0 ]; then
+  pass "df reports non-zero used bytes"
+else
+  fail "df reports used bytes" "$used" "> 0"
+fi
+# The kernel may substitute its own FUSE default for f_namemax, so only
+# assert that statvfs() itself works and reports the block size we set.
+bsize=$(python3 -c "import os;print(os.statvfs('/mnt/obs').f_frsize)")
+eq "statvfs block size" "$bsize" "4096"
+
 echo "== every request must have carried a valid signature =="
 stats=$(curl -sf "http://127.0.0.1:$PORT/__stats")
 sigfail=$(printf '%s' "$stats" | sed -n 's/.*"signature_failures": \([0-9]*\).*/\1/p')

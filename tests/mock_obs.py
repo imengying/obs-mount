@@ -28,13 +28,14 @@ SK = "TESTSK"
 OBJECTS = {}          # key -> bytes
 META = {}             # key -> {'mtime': str}
 UPLOADS = {}          # upload_id -> {'key':..., 'parts': {n: bytes}}
+QUOTA = int(os.environ.get("OBS_MOCK_QUOTA", "0"))  # bytes; 0 = no quota set
 _lock = threading.Lock()
 _seq = [0]
 
 SUBRES = {
     "acl", "cors", "lifecycle", "location", "policy", "tagging", "versioning",
     "uploads", "uploadId", "partNumber", "delete", "website", "storagePolicy",
-    "quota", "encryption", "response-content-type", "response-content-language",
+    "quota", "storageinfo", "encryption", "response-content-type", "response-content-language",
     "response-expires", "response-cache-control", "response-content-disposition",
     "response-content-encoding",
 }
@@ -141,7 +142,10 @@ class Handler(BaseHTTPRequestHandler):
             return False
         want, sts = expected_signature(self, raw_path, raw_query, body)
         if sig != want:
-            FAILURES.append(f"SIGNATURE MISMATCH {self.command} {self.path}\n--- STS ---\n{sts}")
+            FAILURES.append(
+                f"SIGNATURE MISMATCH {self.command} {self.path}\n"
+                f"--- got sig ---\n{sig}\n--- want sig ---\n{want}\n--- STS ---\n{sts}"
+            )
             self.send_error_xml(403, "SignatureDoesNotMatch", "sig mismatch")
             return False
         return True
@@ -204,6 +208,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         key, q, _ = r
         with _lock:
+            if key == "" and "storageinfo" in q:
+                return self.bucket_storageinfo()
+            if key == "" and "quota" in q:
+                return self.bucket_quota()
             if key == "":
                 return self.list_objects(q)
             if key not in OBJECTS:
@@ -413,6 +421,26 @@ class Handler(BaseHTTPRequestHandler):
             parts.append(f"<CommonPrefixes><Prefix>{xml_escape(p)}</Prefix></CommonPrefixes>")
         parts.append("</ListBucketResult>")
         self.send_xml(200, "".join(parts))
+
+    def bucket_storageinfo(self):
+        """GET /?storageinfo -- used size and object count for the bucket."""
+        total = sum(len(v) for v in OBJECTS.values())
+        self.send_xml(
+            200,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<GetBucketStorageInfoResult>"
+            f"<Location>cn-north-4</Location><Bucket>{BUCKET}</Bucket>"
+            f"<Size>{total}</Size><ObjectNumber>{len(OBJECTS)}</ObjectNumber>"
+            "</GetBucketStorageInfoResult>",
+        )
+
+    def bucket_quota(self):
+        """GET /?quota -- configured byte quota; 0 means no quota is set."""
+        self.send_xml(
+            200,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            f"<Quota><StorageQuota>{QUOTA}</StorageQuota></Quota>",
+        )
 
     def date_header(self):
         import email.utils, time
