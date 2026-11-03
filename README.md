@@ -265,7 +265,7 @@ obsfs 有个 `accurate_readdir` 开关，解决的是这个矛盾：`readdir` �
 | 依赖 | 版本 | 备注 |
 |---|---|---|
 | fuser | 0.18.0 | 纯 Rust FUSE，无 libfuse 链接 |
-| reqwest | 0.13.1 | blocking + rustls + webpki-roots + system-proxy |
+| reqwest | 0.13.5 | blocking + rustls + system-proxy |
 | base64 | 0.23.1 | （另有 0.22.1 为传递依赖） |
 | hmac | 0.13.0 | |
 | sha1 | 0.11.0 | |
@@ -349,6 +349,40 @@ stbuf->f_namemax = NAME_MAX;    // 255
 OpenList（原 Alist）的 S3 驱动**没有**实现容量查询——`GetDetails` 属于可选的
 `WithDetails` 接口，S3 驱动只断言了 `driver.Driver`，上层拿到 `errs.NotImplement`，
 等于“不知道”。对 Web UI 够用，对 FUSE 挂载不行：上报 0 会主动引发上面两个故障。
+
+## 与官方 obsfs 的实测对比
+
+同一台机器、同一个模拟 OBS 端点、两个客户端同时挂载（2026-11-03）：
+
+**体积**
+
+| | 大小 | 动态依赖 |
+|---|---|---|
+| obs-mount（glibc 动态） | 9.9 MB | libc / libgcc_s |
+| obs-mount（musl 全静态） | 9.7 MB | 无 |
+| 官方 obsfs | 15.6 MB | libfuse、libcurl、libxml2、libcrypto、libstdc++ 等 **8 个**直接库 |
+
+小 37%，且静态版可以拷到任何 x86_64 Linux 上直接跑。
+
+**吞吐（模拟端点，单机回环）**
+
+| 操作 | obs-mount | obsfs | 说明 |
+|---|---|---|---|
+| 顺序读 20 MiB | 33.1 MiB/s | 97.9 MiB/s | obsfs 有本地磁盘缓存 |
+| 顺序写 20 MiB | 28.9 MiB/s | 32.6 MiB/s | 接近 |
+| 创建 100 个小文件 | 19.7 ops/s | 157 ops/s | 一致性模型不同，见下 |
+| `stat`（已缓存） | 19.6 ops/s | 19.2 ops/s | 持平 |
+| `readdir`（100 条目） | 10.7 ops/s | 17.3 ops/s | |
+| `mkdir` | 18.4 ops/s | 18.5 ops/s | 持平 |
+| `rename` | 6.2 ops/s | 6.1 ops/s | 持平 |
+
+读吞吐差距的根因是架构而非实现缺陷：obsfs 默认把文件内容缓存到本地磁盘
+（`use_cache`），第二遍读完全不联网；本项目每次都回源。对备份挂载来说，
+把整个桶在本地再存一份是不可接受的，所以没有照搬。
+
+> 关于「创建小文件」那 8 倍差距：obsfs 在创建时**不立即上传**，而是攒着延迟写；
+> 本项目在 close 时同步上传整文件（保证「关掉就等于存好了」）。这里比较的是
+> 不同的一致性模型，不是快慢。
 
 ## 已知限制（不是 bug，是对象存储的物理特性）
 
