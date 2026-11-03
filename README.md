@@ -44,7 +44,7 @@ obs-mount/
 | `unlink` | `DELETE /<key>` |
 | `rename` | **Copy + Delete，非原子**（目录递归逐 key；中途失败不回滚，已在日志中明示）。成功后 inode 号不变、只把映射指向新 key，打开中的句柄同样改 key |
 | `setattr` | 仅截断（下载→本地截断→重传）；mode/uid/gid/atime 等忽略（OBS 不存 Unix 权限），以免 `cp -p` 类工具失败。截断不再销毁仍被句柄使用的 staging，`echo x > file` 可重复执行 |
-| `statfs` | `GET /?quota` 取配额（真实上限）+ `GET /?storageinfo` 取已用量，60 秒缓存；无配额时上报 1 PiB 合成容量，见下文“容量显示” |
+| `statfs` | `GET /?quota` 取配额（真实上限）+ `GET /?storageinfo` 取已用量，60 秒缓存；无配额时上报与 obsfs 相同的 16 TiB 合成容量，见下文“容量显示” |
 
 未实现（默认返回 `ENOSYS` 或内核默认）：`symlink` / `hardlink`（OBS 无此语义）、
 `chmod` / `chown` / `xattr`（无存储位置）、`mknod`。`forget` 未重写，
@@ -73,8 +73,22 @@ allow_root 恒开（root 与挂载用户均可见），不支持临时 AK 与 al
 env 文件（`/etc/obs/obs-mount.env`）不再被 systemd 单元加载，旧配置请按
 obs-mount.yaml.example 重写一份。
 
-`OBS_ENDPOINT` 必须是桶虚拟主机域名，不要用裸 service endpoint；
+`endpoint` 两种写法都支持，程序按 host 自动选择寻址方式：
+
+| 写法 | 寻址 | 说明 |
+|---|---|---|
+| `https://<bucket>.obs.<region>.myhuaweicloud.com` | 虚拟主机式 | 推荐，OBS 惯例 |
+| `https://obs.<region>.myhuaweicloud.com` + `bucket:` | 路径式 `/bucket/key` | 与华为 obsfs 的配置习惯一致 |
+| `http://10.0.0.1:9000` 之类 IP 端点 | 路径式 | IP 不能做 `bucket.10.0.0.1` 解析 |
+
+判定逻辑与 obsfs 的 `pathrequeststyle` 一致：host 不以 `<bucket>.` 开头、
+或 host 是 IP 地址时，自动切路径式——否则这类端点根本无法挂载。
 不要跨区域挂载。服务器时钟必须 NTP 对时（签名 Date 偏差超 15 分钟即 403）。
+
+启动时会用 `HEAD /` 检查桶类型（与 obsfs 的 `DetectBucketTypeFromHeaders` 相同）：
+如果返回 `x-obs-bucket-type: POSIX` 或 `x-obs-fs-file-interface: Enabled`，
+说明这是 OBS 的 **POSIX/文件桶**，本程序会直接拒绝——文件桶本身已是 POSIX 语义，
+再套一层 FUSE 翻译只会变错（占位对象当目录、rename 非原子）。
 
 ## 构建
 
@@ -157,8 +171,8 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
     - 20 MiB 文件走分段上传（4 路并行），md5 与本地一致；8 MiB 阈值边界判定正确
     - `unlink`、`rmdir`（含非空返回 `ENOTEMPTY`）、文件与目录 `rename`
     - 空格、中文、`+`/`%` 等特殊字符 key，同一文件多句柄并发
-    - `statfs`：无配额时报 1 PiB 合成容量、有配额时报真实值，`df` 的 `Used`
-      随写入增长
+    - `statfs`：无配额时报 16 TiB（与 obsfs 一致）、有配额时报真实值
+    - 路径式寻址（服务级 endpoint / IP 端点）、POSIX 文件桶被正确拒绝
 - 静态 musl 构建实测 `statically linked`（见“构建”）。
 
 ### 仍未做到的（上生产前务必补）
@@ -169,6 +183,14 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
 - 未做长时间稳定性与断网重连测试；失败重试目前只有 5xx 退避，没有断点续传。
 - `statfs` 已实现（见“容量显示”），但没有在**设了配额**的真实桶上验证过；
   `storageinfo` 的统计延迟量级也只在文档层面了解，未实测。
+
+### 已从 obsfs 对齐的三项
+
+1. **`statfs` 合成容量 16 TiB**，与 obsfs 的 `0xFFFFFFFF × 4096` 逐字节一致。
+2. **路径式寻址**（`pathrequeststyle`）：服务级 endpoint、IP 端点自动走
+   `/bucket/key`，不再要求必须配桶虚拟主机域名。
+3. **桶类型检测**：挂载前 `HEAD /`，识别出 POSIX/文件桶就拒绝，
+   避免用对象桶语义去操作文件桶。
 
 ### 对照官方 obsfs 得到的可改进项（尚未实现）
 
@@ -284,10 +306,10 @@ stbuf->f_namemax = NAME_MAX;    // 255
 
 | | 官方 obsfs | 本项目 |
 |---|---|---|
-| 无配额 | 固定 16 TiB | 固定 1 PiB（16 TiB 对备份来说可能真被填满，届时预检会拒绝写入） |
+| 无配额 | 固定 16 TiB | 固定 16 TiB（与 obsfs 完全一致） |
 | 有配额 | 不区分 | 查 `GET /?quota`，显示真实容量 |
 | 已用量 | 不查询 | 查 `GET /?storageinfo`，`df` 的 `Used` 是真的 |
-| inode | `0xFFFFFFFF` | `u64::MAX`（`df -i` 显示 `-` 而不是虚构计数） |
+| inode | `0xFFFFFFFF` | `0xFFFFFFFF`（同 obsfs） |
 | 文件名长度 | `NAME_MAX`(255) | 1023（OBS 的实际 key 上限） |
 
 ### 与 OpenList 的对照

@@ -67,10 +67,16 @@ impl FileConfig {
 /// sk: YOUR_SECRET_KEY_HERE
 /// ```
 ///
-/// OBS_ENDPOINT must be the *bucket* virtual-host endpoint
-/// (`https://<bucket>.obs.<region>.myhuaweicloud.com`), not the bare
-/// service endpoint. Replace `<region>` with the region your bucket lives
-/// in; do not mount across regions.
+/// The endpoint may be either the *bucket* virtual host
+/// (`https://<bucket>.obs.<region>.myhuaweicloud.com`) or the bare service
+/// endpoint (`https://obs.<region>.myhuaweicloud.com`, bucket taken from
+/// the separate `bucket` setting); the addressing style is derived from the
+/// host, and IP endpoints such as `http://10.0.0.1:9000` fall back to
+/// path-style automatically. Replace `<region>` with the region your bucket
+/// lives in; do not mount across regions.
+///
+/// A POSIX/file-type OBS bucket is refused at startup: this program
+/// implements object-bucket semantics and a file bucket is already POSIX.
 ///
 /// Backup use case: copy a file into the mountpoint and close it — the
 /// upload happens on close. Verify with `ls` / `sha256sum` (a Range GET)
