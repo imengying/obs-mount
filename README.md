@@ -44,7 +44,7 @@ obs-mount/
 | `unlink` | `DELETE /<key>` |
 | `rename` | **Copy + Delete，非原子**（目录递归逐 key；中途失败不回滚，已在日志中明示）。成功后 inode 号不变、只把映射指向新 key，打开中的句柄同样改 key |
 | `setattr` | 仅截断（下载→本地截断→重传）；mode/uid/gid/atime 等忽略（OBS 不存 Unix 权限），以免 `cp -p` 类工具失败。截断不再销毁仍被句柄使用的 staging，`echo x > file` 可重复执行 |
-| `statfs` | 未重写，用 fuser 默认固定值（`df` 数字是假的，以控制台为准） |
+| `statfs` | `GET /?quota` 取配额（真实上限）+ `GET /?storageinfo` 取已用量，60 秒缓存；无配额时上报 1 PiB 合成容量，见下文“容量显示” |
 
 未实现（默认返回 `ENOSYS` 或内核默认）：`symlink` / `hardlink`（OBS 无此语义）、
 `chmod` / `chown` / `xattr`（无存储位置）、`mknod`。`forget` 未重写，
@@ -157,6 +157,8 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
     - 20 MiB 文件走分段上传（4 路并行），md5 与本地一致；8 MiB 阈值边界判定正确
     - `unlink`、`rmdir`（含非空返回 `ENOTEMPTY`）、文件与目录 `rename`
     - 空格、中文、`+`/`%` 等特殊字符 key，同一文件多句柄并发
+    - `statfs`：无配额时报 1 PiB 合成容量、有配额时报真实值，`df` 的 `Used`
+      随写入增长
 - 静态 musl 构建实测 `statically linked`（见“构建”）。
 
 ### 仍未做到的（上生产前务必补）
@@ -165,7 +167,8 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
   模拟服务按文档实现，但不保证覆盖真实服务的所有行为差异。
   上生产前请先在测试桶做一轮只读验证（List / Head / Range Get）。
 - 未做长时间稳定性与断网重连测试；失败重试目前只有 5xx 退避，没有断点续传。
-- `statfs` 仍是 fuser 默认值，`df` 显示的数字无意义。
+- `statfs` 已实现（见“容量显示”），但没有在**设了配额**的真实桶上验证过；
+  `storageinfo` 的统计延迟量级也只在文档层面了解，未实测。
 
 ### 本轮修掉的缺陷
 
@@ -201,6 +204,48 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
 | tracing / tracing-subscriber | 0.1.44 / 0.3.23 | 日志到 stderr；非 TTY 时自动关 ANSI |
 | urlencoding | 2.1.3 | |
 | libc | 0.2.191 | |
+
+## 容量显示（statfs / df）
+
+fuser 的默认 `statfs` 回调把所有字段填 0，于是 `df -h` 显示 `Size 0 / Avail 0 / Use% -`，
+后果比"数字不准"严重：
+
+- 监控脚本的"剩余空间不足"阈值会把这个挂载点判定为**已写满**，天天告警；
+- 一些程序写文件前会用 `statvfs(2)` 预检剩余空间，看到 `f_bavail = 0` 直接报
+  `ENOSPC`/“空间不足”，**根本不尝试写入**。备份脚本最容易踩到。
+
+OBS 确实提供了两个可用于此的原生子资源（见华为云官方 SDK
+`huaweicloud-sdk-go-obs` 的 `obs/type.go`、`obs/const.go`、`obs/model_bucket.go`）：
+
+| 请求 | 返回 | 含义 |
+|---|---|---|
+| `GET /?storageinfo` | `GetBucketStorageInfoResult`：`Size`、`ObjectNumber`，另有 Standard/Warm/Cold 分档 | 桶**已用**字节数与对象数 |
+| `GET /?quota` | `Quota/StorageQuota` | 桶的**字节配额**；为 `0` 表示**未设配额（不限量）**，不是“没有空间” |
+
+两者都是签名子资源（`const.go` 里 `"storageinfo": true`、`"quota": true`），
+必须计入 `CanonicalizedResource`。
+
+因此本项目的 `statfs` 按如下规则回答：
+
+| 情况 | `df` 显示 | 说明 |
+|---|---|---|
+| 桶设了配额 | 真实容量 / 真实已用 / 真实剩余 | 唯一 `df` 有实际意义的场景 |
+| 桶**没设**配额（quota=0） | `Size 1.0P`，`Used` 为真实已用量 | 1 PiB 是**合成上限**，不是真实限制；只为避免被误判为写满 |
+| 查询失败 | 用上次成功的结果；从未成功则用合成上限 + used=0 | 不让 `df` 卡住挂载 |
+
+补充说明：
+
+- 已用量来自 `storageinfo`，**OBS 对它的统计有延迟**（通常几分钟），所以 `df` 的
+  `Used` 不会即时反映刚写入的文件。要精确核对以控制台为准。
+- 结果缓存 60 秒，`df` 被监控高频轮询时不会每次都打两个请求。
+- 用已用 > 配额时（桶可以被写超配额，此后写入开始失败而不是数据缩水），
+  `Used` 会被夹到等于 `Size`，避免 `df` 出现负数剩余。
+- `df -i` 的 inode 数固定上报 `u64::MAX`（表示“无限制”），不虚构可计数的 inode 上限。
+
+> 参考：OpenList（原 Alist）的 S3 驱动**没有**实现容量查询——它的 `GetDetails`
+> 是可选的 `WithDetails` 接口，S3 驱动只断言了 `driver.Driver`，因此上层拿到的是
+> `errs.NotImplement`，等于“不知道”。本项目选择给出可用数字而不是“不知道”，
+> 因为对 FUSE 挂载来说“上报 0”会主动引发上面那两个故障。
 
 ## 已知限制（不是 bug，是对象存储的物理特性）
 
