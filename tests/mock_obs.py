@@ -69,7 +69,7 @@ def canonicalized_resource(path, raw_query):
     return res
 
 
-def expected_signature(handler, raw_path, raw_query, body):
+def expected_signature(handler, raw_path, raw_query, body, scheme="OBS"):
     verb = handler.command
     content_md5 = handler.headers.get("Content-MD5", "") or ""
     content_type = handler.headers.get("Content-Type", "") or ""
@@ -77,9 +77,13 @@ def expected_signature(handler, raw_path, raw_query, body):
     if not date:
         date = handler.headers.get("x-obs-date", "") or ""
     xobs = []
+    # OBS native signing covers x-obs-*; the S3-compatible flavour obsfs uses
+    # covers x-amz-*. Whichever prefix the caller signs with must be the same
+    # one that reaches the canonicalized headers.
+    prefix = "x-obs-" if scheme == "OBS" else "x-amz-"
     for k, v in handler.headers.items():
         lk = k.lower()
-        if lk.startswith("x-obs-"):
+        if lk.startswith(prefix):
             xobs.append(f"{lk}:{v.strip()}")
     xobs.sort()
     canon_headers = "".join(h + "\n" for h in xobs)
@@ -137,12 +141,16 @@ class Handler(BaseHTTPRequestHandler):
             if got != cmd5:
                 FAILURES.append(f"Content-MD5 mismatch for {self.command} {raw_path}")
                 return False
-        if not auth.startswith("OBS "):
+        # "OBS <ak>:<sig>" is native OBS; "AWS <ak>:<sig>" is the S3-compatible
+        # form used by Huawei's own obsfs, needed here so both clients can be
+        # benchmarked against this server.
+        scheme = auth.split(" ", 1)[0] if " " in auth else ""
+        if scheme not in ("OBS", "AWS"):
             FAILURES.append(f"bad auth scheme: {auth!r}")
             self.send_error_xml(403, "AccessDenied", "missing OBS auth")
             return False
         try:
-            ak, sig = auth[4:].split(":", 1)
+            ak, sig = auth[len(scheme) + 1:].split(":", 1)
         except ValueError:
             FAILURES.append(f"malformed auth: {auth!r}")
             self.send_error_xml(403, "AccessDenied", "malformed")
@@ -151,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
             FAILURES.append(f"unknown AK {ak}")
             self.send_error_xml(403, "InvalidAccessKeyId", "unknown ak")
             return False
-        want, sts = expected_signature(self, raw_path, raw_query, body)
+        want, sts = expected_signature(self, raw_path, raw_query, body, scheme)
         if sig != want:
             FAILURES.append(
                 f"SIGNATURE MISMATCH {self.command} {self.path}\n"

@@ -15,7 +15,7 @@ fuser = "0.18"
 hmac = "0.13"
 md-5 = "0.11"
 quick-xml = "0.42"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "webpki-roots", "system-proxy"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.11"
 thiserror = "2"

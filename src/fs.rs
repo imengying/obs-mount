@@ -39,6 +39,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 const TTL: Duration = Duration::from_secs(1);
+/// Extra bytes fetched beyond what a read asked for, so the kernel's next few
+/// 128 KiB reads hit the local window instead of the network. 1 MiB is eight
+/// kernel read chunks: enough to matter, small enough not to waste bandwidth
+/// on a seek-heavy workload.
+const READ_AHEAD_BYTES: u64 = 1024 * 1024;
 /// How long a statfs answer is reused before asking OBS again. `df` is often
 /// polled by monitoring every few seconds and each miss costs two requests.
 const USAGE_TTL: Duration = Duration::from_secs(60);
@@ -76,6 +81,26 @@ struct CachedMeta {
     xattrs: Vec<(String, String)>,
 }
 
+/// A span of an object fetched ahead of demand.
+struct ReadWindow {
+    start: u64,
+    data: Vec<u8>,
+}
+
+impl ReadWindow {
+    /// Bytes of a read at `offset`/`size` that this window can serve.
+    fn slice(&self, offset: u64, size: usize) -> Option<&[u8]> {
+        let start = self.start;
+        let end = start + self.data.len() as u64;
+        if offset < start || offset >= end {
+            return None;
+        }
+        let from = (offset - start) as usize;
+        let to = (from + size).min(self.data.len());
+        Some(&self.data[from..to])
+    }
+}
+
 struct OpenFile {
     key: String,
     staging: Option<PathBuf>,
@@ -84,6 +109,20 @@ struct OpenFile {
     /// create/open time from the requesting process, like a local file's
     /// ownership is, and overridden later if a chmod/chown arrives.
     owner: Option<(u32, u32)>,
+    /// Read-ahead window: the last Range GET result, kept so the following
+    /// reads of the same region are served locally.
+    ///
+    /// The kernel reads FUSE in 128 KiB chunks, so reading a 20 MiB object
+    /// meant 160 sequential HTTP round-trips through a global mutex. Fetching
+    /// a larger window per request cuts that by an order of magnitude at the
+    /// cost of transferring at most one window of extra data.
+    window: Option<ReadWindow>,
+    /// Size of the remote object, resolved once when the handle is opened.
+    ///
+    /// Without this, every `read` did a HEAD before its Range GET: the kernel
+    /// issues 128 KiB reads, so reading a 20 MiB file cost 160 GETs plus 160
+    /// extra HEADs and ran at a fraction of the achievable throughput.
+    size: Option<u64>,
 }
 
 struct Inner {
@@ -133,6 +172,38 @@ struct UsageSnapshot {
 
 pub struct ObsFs {
     inner: Mutex<Inner>,
+    /// Clone of the client for paths that must not hold the global lock
+    /// across a network round-trip (see `read`).
+    client: ObsClient,
+}
+
+/// Serve a read out of a local staging file.
+fn read_staging(staging: &Path, offset: u64, size: u32, reply: ReplyData) {
+    let mut f = match File::open(staging) {
+        Ok(f) => f,
+        Err(e) => {
+            reply.error(io_errno(&e));
+            return;
+        }
+    };
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        reply.error(Errno::EIO);
+        return;
+    }
+    let mut buf = vec![0u8; size as usize];
+    match f.read(&mut buf) {
+        Ok(n) => reply.data(&buf[..n]),
+        Err(e) => reply.error(io_errno(&e)),
+    }
+}
+
+/// Map an OBS error to an errno without needing `&Inner`.
+fn errno_for_obs(e: &ObsError) -> Errno {
+    match e {
+        ObsError::Http { status: 403, .. } => Errno::EACCES,
+        ObsError::Http { status: 404, .. } => Errno::ENOENT,
+        _ => Errno::EIO,
+    }
 }
 
 /// Metadata key for a user xattr. Names may contain characters that are not
@@ -271,6 +342,7 @@ impl ObsFs {
             }
         }
         Self {
+            client: client.clone(),
             inner: Mutex::new(Inner {
                 client,
                 staging_dir,
@@ -871,6 +943,22 @@ impl Filesystem for ObsFs {
         // ENOENT for a file the first handle just created.
         let staging = inner.staging_path(ino.0);
         if !write_mode && !staging.exists() {
+            // Resolve the size once here so `read` never needs its own HEAD.
+            let size = match inner.meta_cache.get(&path) {
+                Some(c) if c.expires > Instant::now() => Some(c.size),
+                _ => match inner.client.head_object(&path) {
+                    Ok(Some(m)) => Some(m.size),
+                    Ok(None) => {
+                        reply.error(Errno::ENOENT);
+                        return;
+                    }
+                    Err(e) => {
+                        let err = inner.upload_error_reply(&e);
+                        reply.error(err);
+                        return;
+                    }
+                },
+            };
             let fh = inner.next_fh;
             inner.next_fh += 1;
             inner.open_files.insert(
@@ -880,6 +968,8 @@ impl Filesystem for ObsFs {
                     staging: None,
                     dirty: false,
                     owner: None,
+                    size,
+                    window: None,
                 },
             );
             reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
@@ -892,9 +982,11 @@ impl Filesystem for ObsFs {
                 fh,
                 OpenFile {
                     key: path,
-                    staging: Some(staging),
+                    staging: Some(staging.clone()),
                     dirty: false,
                     owner: None,
+                    size: fs::metadata(&staging).ok().map(|m| m.len()),
+                    window: None,
                 },
             );
             reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
@@ -936,6 +1028,8 @@ impl Filesystem for ObsFs {
                 staging: Some(staging),
                 dirty: trunc,
                 owner: Some((req.uid(), req.gid())),
+                size: None,
+                window: None,
             },
         );
         reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
@@ -952,59 +1046,73 @@ impl Filesystem for ObsFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let inner = self.inner.lock().unwrap();
-        let open = inner.open_files.get(&fh.0);
-        if let Some(open) = open {
-            if let Some(staging) = &open.staging {
-                let mut f = match File::open(staging) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        reply.error(io_errno(&e));
-                        return;
-                    }
-                };
-                if f.seek(SeekFrom::Start(offset)).is_err() {
-                    reply.error(Errno::EIO);
+        tracing::debug!(offset, size, "read");
+        // Resolve everything needed for the request while holding the lock,
+        // then drop it before the network round-trip. Range GETs are the hot
+        // path for restore/verify and holding the global mutex across the
+        // HTTP call serialised them: a 20 MiB read ran at a fraction of the
+        // link speed purely because reads could not overlap.
+        let (key, file_size, staging) = {
+            let inner = self.inner.lock().unwrap();
+            match inner.open_files.get(&fh.0) {
+                Some(open) => match open.size {
+                    Some(file_size) => (open.key.clone(), file_size, open.staging.clone()),
+                    // Size unknown (write handle): fall back to the locked path.
+                    None => (String::new(), 0, open.staging.clone()),
+                },
+                None => {
+                    reply.error(Errno::EBADF);
                     return;
                 }
-                let mut buf = vec![0u8; size as usize];
-                match f.read(&mut buf) {
-                    Ok(n) => {
-                        reply.data(&buf[..n]);
-                    }
-                    Err(e) => reply.error(io_errno(&e)),
-                }
-                return;
             }
-            let key = open.key.clone();
-            // Remote size first, so a read past EOF returns empty, not an error.
-            let meta = match inner.client.head_object(&key) {
-                Ok(Some(m)) => m,
-                Ok(None) => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-                Err(e) => {
-                    let err = inner.upload_error_reply(&e);
-                    reply.error(err);
-                    return;
-                }
-            };
-            if offset >= meta.size {
-                reply.data(&[]);
-                return;
-            }
-            let want = (size as u64).min(meta.size - offset) as usize;
-            match inner.client.get_range(&key, offset, want) {
-                Ok(data) => reply.data(&data),
-                Err(e) => {
-                    let err = inner.upload_error_reply(&e);
-                    reply.error(err);
-                }
-            }
+        };
+        if let Some(staging) = staging {
+            return read_staging(&staging, offset, size, reply);
+        }
+        if key.is_empty() {
+            reply.error(Errno::EBADF);
             return;
         }
-        reply.error(Errno::EBADF);
+        if offset >= file_size {
+            reply.data(&[]);
+            return;
+        }
+        let want = (size as u64).min(file_size - offset) as usize;
+
+        // Serve from the read-ahead window when it already covers this range.
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(open) = inner.open_files.get_mut(&fh.0)
+                && let Some(w) = &open.window
+                && let Some(bytes) = w.slice(offset, want)
+            {
+                reply.data(bytes);
+                return;
+            }
+        }
+
+        // Fetch this range plus a look-ahead tail so the next few 128 KiB
+        // kernel reads are free. Never read past EOF.
+        let fetch_len = (want as u64 + READ_AHEAD_BYTES).min(file_size - offset) as usize;
+        let client = self.client.clone();
+        let data = match client.get_range(&key, offset, fetch_len) {
+            Ok(d) => d,
+            Err(e) => {
+                reply.error(errno_for_obs(&e));
+                return;
+            }
+        };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(open) = inner.open_files.get_mut(&fh.0) {
+                open.window = Some(ReadWindow {
+                    start: offset,
+                    data: data.clone(),
+                });
+            }
+        }
+        let n = want.min(data.len());
+        reply.data(&data[..n]);
     }
 
     fn write(
@@ -1095,6 +1203,8 @@ impl Filesystem for ObsFs {
                 staging: Some(staging),
                 dirty: true,
                 owner: Some((req.uid(), req.gid())),
+                size: Some(0),
+                window: None,
             },
         );
         // dirty=true so that closing an empty created file still uploads a
@@ -1841,6 +1951,8 @@ mod tests {
                 staging: Some(inner.staging_path(ino)),
                 dirty: true,
                 owner: None,
+                size: None,
+                window: None,
             },
         );
 
@@ -1899,6 +2011,8 @@ mod tests {
                     staging: Some(staging.clone()),
                     dirty: false,
                     owner: None,
+                    size: None,
+                    window: None,
                 },
             );
         }
