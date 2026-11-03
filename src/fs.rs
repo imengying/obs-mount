@@ -48,7 +48,6 @@ struct OpenFile {
     key: String,
     staging: Option<PathBuf>,
     dirty: bool,
-    write_mode: bool,
 }
 
 struct Inner {
@@ -177,6 +176,23 @@ impl Inner {
                 self.ino_to_path.remove(&ino);
             }
             self.meta_cache.remove(&p);
+        }
+    }
+
+    /// How many open handles still reference this staging file. Staging files
+    /// are shared by every handle of one inode (the path is `ino-<n>`), so a
+    /// handle must not unlink one that another handle is still writing to.
+    fn staging_refs(&self, staging: &Path) -> usize {
+        self.open_files
+            .values()
+            .filter(|f| f.staging.as_deref() == Some(staging))
+            .count()
+    }
+
+    /// Drop a staging file only when no handle references it any more.
+    fn release_staging(&mut self, staging: &Path) {
+        if self.staging_refs(staging) == 0 {
+            let _ = fs::remove_file(staging);
         }
     }
 
@@ -570,7 +586,12 @@ impl Filesystem for ObsFs {
             flags.acc_mode(),
             OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
         );
-        if !write_mode {
+        // A file that still has a staging file (created or being written in
+        // this session) is not on OBS yet, or is stale there. Both read and
+        // write handles must look at it, otherwise a second `open` returns
+        // ENOENT for a file the first handle just created.
+        let staging = inner.staging_path(ino.0);
+        if !write_mode && !staging.exists() {
             let fh = inner.next_fh;
             inner.next_fh += 1;
             inner.open_files.insert(
@@ -579,14 +600,26 @@ impl Filesystem for ObsFs {
                     key: path,
                     staging: None,
                     dirty: false,
-                    write_mode: false,
+                },
+            );
+            reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
+            return;
+        }
+        if !write_mode {
+            let fh = inner.next_fh;
+            inner.next_fh += 1;
+            inner.open_files.insert(
+                fh,
+                OpenFile {
+                    key: path,
+                    staging: Some(staging),
+                    dirty: false,
                 },
             );
             reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
             return;
         }
         let trunc = flags.0 & libc::O_TRUNC != 0;
-        let staging = inner.staging_path(ino.0);
         if !staging.exists() {
             // Stage the current remote content (if any) for read-modify-write,
             // unless the caller truncated (then start empty).
@@ -624,7 +657,6 @@ impl Filesystem for ObsFs {
                 key: path,
                 staging: Some(staging),
                 dirty: trunc,
-                write_mode: true,
             },
         );
         reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
@@ -789,7 +821,6 @@ impl Filesystem for ObsFs {
                 key: path.clone(),
                 staging: Some(staging),
                 dirty: true,
-                write_mode: true,
             },
         );
         // dirty=true so that closing an empty created file still uploads a
@@ -857,17 +888,21 @@ impl Filesystem for ObsFs {
             if let Err(e) = inner.upload_staging(fh.0) {
                 tracing::error!(error = %e, "release upload failed");
                 let err = inner.upload_error_reply(&e);
-                // Still drop the handle; the staging file is kept so a
-                // later flush/retry path can find it via the inode file.
+                // Drop the handle anyway but keep the staging file: it may be
+                // the only copy of the data, and leaving it in place keeps it
+                // discoverable via the inode path.
+                inner.open_files.remove(&fh.0);
                 reply.error(err);
                 return;
             }
         }
         if let Some(open) = inner.open_files.remove(&fh.0) {
-            if open.write_mode {
-                if let Some(staging) = open.staging {
-                    let _ = fs::remove_file(&staging);
-                }
+            if let Some(staging) = open.staging {
+                // Several handles can share one staging file (same inode);
+                // only the last one out may unlink it, otherwise a sibling
+                // handle's next write hits ENOENT. Read-only handles also
+                // reference the file, so every handle releases it.
+                inner.release_staging(&staging);
             }
         }
         reply.ok();
@@ -1106,7 +1141,13 @@ impl Filesystem for ObsFs {
         };
         if let Some(size) = size {
             let staging = inner.staging_path(ino.0);
-            if !staging.exists() {
+            // Truncation normally arrives right after `open`, whose staging
+            // file is still referenced by the returned handle. Uploading and
+            // then unlinking it here is what used to break plain
+            // `echo x > existing` (the following `write` hit ENOENT); keep
+            // the file and let `release` unlink it once the last handle goes.
+            let had_staging = staging.exists();
+            if !had_staging {
                 let mut data: Vec<u8> = Vec::new();
                 if let Ok(Some(meta)) = inner.client.head_object(&path) {
                     if meta.size > 0 {
@@ -1143,7 +1184,18 @@ impl Filesystem for ObsFs {
                 reply.error(err);
                 return;
             }
-            let _ = fs::remove_file(&staging);
+            if !had_staging {
+                // Nothing references this file, so it is safe to drop.
+                let _ = fs::remove_file(&staging);
+            } else {
+                // A handle is still using it: it now reflects what was just
+                // uploaded, so mark all its handles clean.
+                for f in inner.open_files.values_mut() {
+                    if f.staging.as_deref() == Some(staging.as_path()) {
+                        f.dirty = false;
+                    }
+                }
+            }
             inner.meta_cache.insert(
                 path.clone(),
                 CachedMeta {
@@ -1273,7 +1325,6 @@ mod tests {
                 key: "a.txt".into(),
                 staging: Some(inner.staging_path(ino)),
                 dirty: true,
-                write_mode: true,
             },
         );
 
@@ -1282,6 +1333,42 @@ mod tests {
         assert_eq!(
             inner.open_files.get(&7).map(|f| f.key.as_str()),
             Some("b.txt")
+        );
+    }
+
+    /// Regression for `echo x > existing` failing from the second run on:
+    /// truncation used to unlink the staging file that the open handle was
+    /// still writing to. Only the last handle may remove it.
+    #[test]
+    fn only_the_last_handle_unlinks_staging() {
+        let dir = std::env::temp_dir().join("obs-mount-test-staging");
+        std::fs::create_dir_all(&dir).unwrap();
+        let staging = dir.join("ino-99");
+        std::fs::write(&staging, b"data").unwrap();
+
+        let mut inner = inner_for_test();
+        inner.staging_dir = dir.clone();
+        for fh in 1..=2 {
+            inner.open_files.insert(
+                fh,
+                OpenFile {
+                    key: "k".into(),
+                    staging: Some(staging.clone()),
+                    dirty: false,
+                },
+            );
+        }
+
+        // First handle leaving must keep the file for the second one.
+        inner.open_files.remove(&1);
+        inner.release_staging(&staging);
+        assert!(staging.exists(), "staging removed while still referenced");
+
+        inner.open_files.remove(&2);
+        inner.release_staging(&staging);
+        assert!(
+            !staging.exists(),
+            "staging should be removed with the last handle"
         );
     }
 }
