@@ -121,13 +121,13 @@ echo "== range read =="
 printf 'ABCDEFGHIJ' >rg.txt
 eq "read from offset 3" "$(dd if=rg.txt bs=1 skip=3 count=4 2>/dev/null)" "DEFG"
 
-echo "== multipart upload (regression: used to fail on the XML declaration) =="
-head -c 20971520 /dev/urandom >big.bin
-eq "20 MiB md5" "$(md5sum big.bin | cut -d' ' -f1)" "$(md5sum <big.bin | cut -d' ' -f1)"
+echo "== multipart upload >= 25 MB (obsfs threshold) =="
+head -c 31457280 /dev/urandom >big.bin
+eq "30 MiB md5" "$(md5sum big.bin | cut -d' ' -f1)" "$(md5sum <big.bin | cut -d' ' -f1)"
 
-echo "== exact threshold boundary =="
-head -c 8388608 /dev/urandom >exact.bin
-eq "8 MiB md5" "$(md5sum exact.bin | cut -d' ' -f1)" "$(md5sum <exact.bin | cut -d' ' -f1)"
+echo "== exact threshold boundary (26214400 = 25 MB) =="
+head -c 26214400 /dev/urandom >exact.bin
+eq "25 MiB threshold boundary md5" "$(md5sum exact.bin | cut -d' ' -f1)" "$(md5sum <exact.bin | cut -d' ' -f1)"
 
 echo "== delete =="
 rm rf2.txt
@@ -204,6 +204,16 @@ echo "== extended attributes =="
 if setfattr -n user.colour -v blue meta.txt 2>/dev/null; then
   eq "getfattr" "$(getfattr --only-values -n user.colour meta.txt 2>/dev/null)" "blue"
   eq "listxattr contains name" "$(getfattr -d meta.txt 2>/dev/null | grep -c user.colour)" "1"
+  # A second attribute must not clobber the first.
+  setfattr -n user.owner -v alice meta.txt 2>/dev/null
+  eq "two xattrs coexist" "$(getfattr -d meta.txt 2>/dev/null | grep -c 'user\.')" "2"
+  # Base64 padding must never reach a header name (regression).
+  eq "xattr key is header-safe" \
+    "$(getfattr -d meta.txt 2>/dev/null | grep -c 'xdg\.')" "0"
+  setfattr -x user.colour meta.txt 2>/dev/null
+  eq "removexattr" "$(getfattr -d meta.txt 2>/dev/null | grep -c user.colour)" "0"
+  eq "missing xattr reports ENODATA" \
+    "$(getfattr -n user.nope meta.txt 2>&1 >/dev/null | grep -c 'No such attribute')" "1"
 else
   echo "  skip xattr (attr package missing)"
 fi

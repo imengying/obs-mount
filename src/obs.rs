@@ -890,7 +890,7 @@ impl ObsClient {
     /// a large backup is bound by bandwidth, not by per-part round-trips.
     /// Parts are sorted by part number before Complete, and on any failure
     /// every in-flight part is still joined before abort, so abort cannot
-    /// race an unfinished part upload. The part size is 8 MiB by default
+    /// race an unfinished part upload. The part size is 10 MB by default
     /// (AWS CLI/boto3 chunk size) but grows when the file would otherwise
     /// need more than 10000 parts (the multipart limit) — same adaptation
     /// OpenList's S3 driver relies on via the AWS SDK — so a file above
@@ -1173,7 +1173,7 @@ pub fn canonical_resource(bucket: &str, key: &str, query: &str) -> String {
     resource
 }
 
-/// Part size for a multipart upload: 8 MiB normally, growing just enough
+/// Part size for a multipart upload: 10 MB normally, growing just enough
 /// that the file never needs more than 10000 parts.
 /// Part size, honouring a configured base size but still growing it so a
 /// huge file never needs more than 10000 parts (the per-upload limit).
@@ -1183,17 +1183,18 @@ pub fn multipart_part_size_with(file_len: usize, base: usize) -> usize {
     base.max(file_len.div_ceil(MAX_PARTS))
 }
 
-/// obsfs uses 10 MB parts and a 25 MB threshold; 8 MiB is kept as the
-/// default because it matches the AWS CLI and keeps the first retry cheap,
-/// but the part size is now configurable through `multipart_part_size`.
-pub const DEFAULT_PART_SIZE: usize = 8 * 1024 * 1024;
+/// Part size for multipart uploads: 10 MB, matching Huawei's obsfs
+/// (MULTIPART_PART_SIZE in its s3fs_operations.cpp).
+pub const DEFAULT_PART_SIZE: usize = 10 * 1024 * 1024;
+
+/// Files at or above this size use multipart upload: 25 MB, matching obsfs's
+/// MULTIPART_THRESHOLD.
+pub const DEFAULT_MULTIPART_THRESHOLD: u64 = 25 * 1024 * 1024;
 
 /// How large files are split for upload.
 ///
 /// `threshold` decides single PUT vs multipart; `part_size` is the chunk size.
-/// obsfs mounts with 25 MB / 10 MB; the defaults here stay at 8 MiB / 8 MiB
-/// (AWS CLI) but both are configurable, which matters for links where a
-/// 10 MB part is noticeably better than 8 MiB.
+/// Both default to obsfs's 25 MB / 10 MB and stay configurable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UploadTuning {
     pub threshold: u64,
@@ -1203,7 +1204,7 @@ pub struct UploadTuning {
 impl Default for UploadTuning {
     fn default() -> Self {
         Self {
-            threshold: DEFAULT_PART_SIZE as u64,
+            threshold: DEFAULT_MULTIPART_THRESHOLD,
             part_size: DEFAULT_PART_SIZE,
         }
     }
@@ -1214,12 +1215,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn part_size_stays_8mib_below_limit_and_grows_above() {
+    fn part_size_stays_10mb_below_limit_and_grows_above() {
         assert_eq!(
-            multipart_part_size_with(8 * 1024 * 1024, DEFAULT_PART_SIZE),
-            8 * 1024 * 1024
+            multipart_part_size_with(30 * 1024 * 1024, DEFAULT_PART_SIZE),
+            10 * 1024 * 1024
         );
-        // 100 GiB would need 12800 parts at 8 MiB; grown size keeps it at 10000.
+        // 100 GiB would need more than 10000 10 MB parts; the size grows.
         let grown = multipart_part_size_with(100 * 1024 * 1024 * 1024, DEFAULT_PART_SIZE);
         assert!(grown > 8 * 1024 * 1024);
         assert_eq!((100usize * 1024 * 1024 * 1024).div_ceil(grown), 10_000);

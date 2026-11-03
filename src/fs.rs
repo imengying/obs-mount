@@ -20,7 +20,10 @@
 //! deliberate v1 trade-off for a backup mount, not a high-concurrency disk.
 
 use crate::obs::{ObsClient, ObsError, UnixMeta};
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL_NOPAD},
+};
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileType, Filesystem, FopenFlags, Generation, INodeNo,
     LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
@@ -134,19 +137,29 @@ pub struct ObsFs {
 
 /// Metadata key for a user xattr. Names may contain characters that are not
 /// legal in an HTTP header, so they are base64-encoded.
+/// Xattr name -> metadata key.
+///
+/// Base64url **without padding**: `=` is not a legal character in an HTTP
+/// header name, so padded base64 makes reqwest refuse to send the request at
+/// all (the symptom is a hang or an empty error, not a clear failure).
 fn xattr_key(name: &str) -> String {
     format!(
         "{}{}",
         crate::obs::meta_keys::XATTR_PREFIX,
-        B64.encode(name.as_bytes())
+        B64URL_NOPAD.encode(name.as_bytes())
     )
 }
 
-/// Inverse of [`xattr_key`]: the encoded name, or `None` for keys that are not
-/// xattrs.
-fn xattr_name(key: &str) -> Option<String> {
-    key.strip_prefix(crate::obs::meta_keys::XATTR_PREFIX)
-        .map(|s| s.to_string())
+/// Inverse of the encoding used in [`xattr_key`].
+fn xattr_name_from_key(key: &str) -> Option<Vec<u8>> {
+    let encoded = key.strip_prefix(crate::obs::meta_keys::XATTR_PREFIX)?;
+    B64URL_NOPAD.decode(encoded.as_bytes()).ok()
+}
+
+/// Cache stores xattr keys without the header prefix (that is how HEAD returns
+/// them, minus `x-obs-meta-`); outgoing metadata needs the full header name.
+fn xattr_header_key(key: &str) -> String {
+    format!("x-obs-meta-{key}")
 }
 
 fn parent_path(path: &str) -> String {
@@ -589,7 +602,8 @@ impl Inner {
                 .unwrap_or(base.mtime),
         };
         let mut headers = crate::obs::unix_meta_headers(updated);
-        headers.extend(attrs);
+        // Cache keeps xattr keys bare; outgoing metadata needs the header name.
+        headers.extend(attrs.into_iter().map(|(k, v)| (xattr_header_key(&k), v)));
         self.client.set_object_meta(path, &headers)?;
         if let Some(entry) = self.meta_cache.get_mut(path) {
             entry.unix = Some(updated);
@@ -1469,9 +1483,7 @@ impl Filesystem for ObsFs {
         let mut names = Vec::new();
         if let Some(c) = inner.meta_cache.get(&path) {
             for (k, _) in &c.xattrs {
-                if let Some(name) = xattr_name(k)
-                    && let Ok(raw) = B64.decode(name.as_bytes())
-                {
+                if let Some(raw) = xattr_name_from_key(k) {
                     names.extend_from_slice(&raw);
                     names.push(0);
                 }
@@ -1525,7 +1537,11 @@ impl Filesystem for ObsFs {
                 }),
         );
         let mut all = headers;
-        all.extend(remaining);
+        all.extend(
+            remaining
+                .into_iter()
+                .map(|(k, v)| (xattr_header_key(&k), v)),
+        );
         if let Err(e) = inner.client.set_object_meta(&path, &all) {
             let err = inner.upload_error_reply(&e);
             reply.error(err);
@@ -1839,6 +1855,33 @@ mod tests {
     /// Regression for `echo x > existing` failing from the second run on:
     /// truncation used to unlink the staging file that the open handle was
     /// still writing to. Only the last handle may remove it.
+    /// Regression: base64 padding ('=') is not a legal character in an HTTP
+    /// header name, so a padded key made reqwest drop the whole request --
+    /// setxattr appeared to hang and the xattr was never stored.
+    #[test]
+    fn xattr_keys_are_header_safe() {
+        for name in [
+            "user.colour",
+            "user.owner",
+            "security.selinux",
+            "a",
+            "user.x.y",
+        ] {
+            let key = xattr_key(name);
+            let suffix = key
+                .strip_prefix(crate::obs::meta_keys::XATTR_PREFIX)
+                .expect("prefix present");
+            assert!(
+                suffix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "key {key} is not HTTP-header safe"
+            );
+            // And it must round-trip back to the original name.
+            assert_eq!(xattr_name_from_key(&key), Some(name.as_bytes().to_vec()));
+        }
+    }
+
     #[test]
     fn only_the_last_handle_unlinks_staging() {
         let dir = std::env::temp_dir().join("obs-mount-test-staging");

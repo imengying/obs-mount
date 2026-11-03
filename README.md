@@ -16,7 +16,7 @@ obs-mount/
   .github/workflows/ci.yml  # 格式/静态检查/测试 + glibc & musl 双构建，tag 发版
   src/
     main.rs   # CLI（clap）：mountpoint、bucket/endpoint/AK/SK（环境变量）、
-              #   分段阈值（可选，默认 8 MiB，学 AWS CLI/boto3）；staging 固定在系统临时目录，
+              #   分段阈值（可选，默认 25 MB / 10 MB，与华为 obsfs 一致）；staging 固定在系统临时目录，
               #   allow_root 恒开；启动先做桶可达自检，不过不挂载；
               #   检测 fusermount，缺失时降级挂载（无 auto_unmount）并提示装 fuse3；
               #   日志到 stderr（systemd journal 直接收）
@@ -39,7 +39,7 @@ obs-mount/
 | `readdir` | `GET ?prefix=<dir/>&delimiter=/` 翻页聚合（`CommonPrefixes` + `Contents`），含 `.` / `..` |
 | `open` / `read` | 读模式直接 Range GET（先 HEAD 定长，越过 EOF 返回空）；写模式把远端内容（如有）下载到 staging 做 read-modify-write。会话内已有 staging 时读写句柄都用它，避免读到尚未上传的旧内容 |
 | `create` / `write` | 只写本地 staging 文件，不逐次 PUT |
-| `flush` / `fsync` / `release` | 关闭/刷盘时上传：小于阈值单 PUT，大于等于阈值分段上传。阈值与分片可配（默认 8 MiB，obsfs 是 25 MB/10 MB），分片低于 5 MiB 会被抬到 OBS 下限，超过 10000 片时自动放大分片；4 路并行，失败先等齐在途分片再 abort |
+| `flush` / `fsync` / `release` | 关闭/刷盘时上传：小于阈值单 PUT，大于等于阈值分段上传。阈值与分片可配（默认 25 MB / 10 MB，与 obsfs 一致），分片低于 5 MiB 会被抬到 OBS 下限，超过 10000 片时自动放大分片；4 路并行，失败先等齐在途分片再 abort |
 | `mkdir` / `rmdir` | PUT `<dir>/` 零字节占位对象 / 非空检查后删占位对象 |
 | `unlink` | `DELETE /<key>` |
 | `rename` | **Copy + Delete，非原子**（目录递归逐 key；中途失败不回滚，已在日志中明示）。成功后 inode 号不变、只把映射指向新 key，打开中的句柄同样改 key |
@@ -63,7 +63,7 @@ OBS_AK=...                    # 访问密钥（不要用主账号，建议 IAM �
 OBS_SK=...                    # 密钥（0600 的 YAML 配置文件）
 OBS_BUCKET=my-bucket
 OBS_ENDPOINT=https://my-bucket.obs.cn-north-4.myhuaweicloud.com
-OBS_MULTIPART_THRESHOLD=8388608               # 可选，不配就默认 8 MiB（AWS CLI/boto3 默认）
+OBS_MULTIPART_THRESHOLD=26214400              # 可选，不配就默认 25 MB（与华为 obsfs 一致）
 OBS_MULTIPART_PART_SIZE=10485760              # 可选，分片大小；obsfs 用 10 MiB，OBS 下限 5 MiB
 ```
 
@@ -171,13 +171,14 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
   挂上 `/mnt/obs` 后实测通过：
     - 建目录（含多级）、`readdir`/`lookup`/`getattr`，`find` 与 `os.walk` 结果一致
     - 小文件写读、重复覆盖同名文件、追加写、`truncate`、Range 读
-    - 20 MiB 文件走分段上传（4 路并行），md5 与本地一致；8 MiB 阈值边界判定正确
+    - 30 MiB 文件走分段上传（4 路并行），md5 与本地一致；25 MB 阈值边界判定正确
     - `unlink`、`rmdir`（含非空返回 `ENOTEMPTY`）、文件与目录 `rename`
     - 空格、中文、`+`/`%` 等特殊字符 key，同一文件多句柄并发
     - `statfs`：无配额时报 16 TiB（与 obsfs 一致）、有配额时报真实值
     - 路径式寻址（服务级 endpoint / IP 端点）、POSIX 文件桶被正确拒绝
     - `chmod` / `chown` / `touch -d` 落进对象元数据并跨进程可见
-    - `ln -s` + `readlink`、20 MiB 分段上传带上元数据
+    - `ln -s` + `readlink`、30 MiB 分段上传带上元数据
+    - 扩展属性：写入 / 读取 / 列举 / 删除 / 多属性共存 / 跨进程可见
 - 静态 musl 构建实测 `statically linked`（见“构建”）。
 
 ### 仍未做到的（上生产前务必补）
@@ -188,8 +189,8 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
 - 未做长时间稳定性与断网重连测试；失败重试目前只有 5xx 退避，没有断点续传。
 - `statfs` 已实现（见“容量显示”），但没有在**设了配额**的真实桶上验证过；
   `storageinfo` 的统计延迟量级也只在文档层面了解，未实测。
-- 扩展属性只在装了 `attr` 工具的环境中测过（`setfattr`/`getfattr`），
-  未在本容器验证（缺该包，e2e 会自动跳过这两条）。
+- 扩展属性已实测（`setfattr` / `getfattr`：写入、读取、列举、删除、
+  多属性共存、ENODATA），需要 `attr` 包，e2e 缺该包时会自动跳过。
 
 ### 已从 obsfs 对齐的三项
 
@@ -212,7 +213,7 @@ OBS 没有原生权限，但对象元数据是自由格式的，obsfs 就是靠�
 | 属主 | `x-obs-meta-uid` / `x-obs-meta-gid` | |
 | 修改时间 | `x-obs-meta-mtime` | Unix 秒 |
 | 符号链接 | `x-obs-meta-symlink-target` | 对象为 0 字节，mode 标记 `S_IFLNK` |
-| 扩展属性 | `x-obs-meta-xdg.<base64(名字)>` | 值同样 base64，因为 header 必须是 ASCII |
+| 扩展属性 | `x-obs-meta-xdg.<base64url(名字)>` | 名字用 **base64url 无 padding**：`=` 不是合法的 HTTP header 名字符，带 `=` 会让请求根本发不出去 |
 
 改属性**不重传数据**：用 `PUT` + `x-obs-copy-source: /<bucket>/<key>` +
 `x-obs-metadata-directive: REPLACE` 把对象拷回自己，只换元数据。改一个
@@ -238,7 +239,7 @@ obsfs 有个 `accurate_readdir` 开关，解决的是这个矛盾：`readdir` �
 | 项 | obsfs | 本项目 |
 |---|---|---|
 | 重试 | 固定 3 次 | 5 次，指数退避 0.5→1→2→4s（上限 8s），403 不重试 |
-| 分段阈值/分片 | 25 MB / 10 MB（写死） | 默认 8 MiB / 8 MiB，两者都可配；分片低于 5 MiB 抬到 OBS 下限，超 10000 片自动放大 |
+| 分段阈值/分片 | 25 MB / 10 MB（写死） | 默认 **25 MB / 10 MB（同 obsfs）**，仍可配；分片低于 5 MiB 抬到 OBS 下限，超 10000 片自动放大 |
 | 并发上传 | 顺序 | 4 路并行 |
 | 临时文件 | `use_cache`/`stat_cache` 落地到本地 | staging 在 `$TMPDIR`，退出时清理 |
 
@@ -249,7 +250,7 @@ obsfs 有个 `accurate_readdir` 开关，解决的是这个矛盾：`readdir` �
 以下都是上面那套端到端测试暴露出来的，此前单元测试无法发现：
 
 1. **分段上传失败**（P0）：XML 解析遇到 `<?xml ?>` 声明就提前退出，
-   `UploadId` 永远解析不到 → 所有 ≥8 MiB 的上传报 `no UploadId in response`。
+   `UploadId` 永远解析不到 → 所有走分段上传的文件都报 `no UploadId in response`。
 2. **覆盖已有文件失败**（P0）：`setattr(size=0)` 在上传后删掉 staging 文件，
    但同一句柄仍在用它，后续 `write` 报 ENOENT；表现为 `echo x > file` 第二次起失败。
 3. **`rename` 后新名字不可见**（P0）：成功路径把新路径的 inode 映射一起删了，

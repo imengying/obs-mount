@@ -26,7 +26,7 @@ struct FileConfig {
     sk: Option<String>,
     multipart_threshold: Option<u64>,
     /// Multipart chunk size in bytes. Optional; obsfs mounts with 10 MB,
-    /// the default here is 8 MiB. Raised automatically for files big enough
+    /// the default here is 10 MB. Raised automatically for files big enough
     /// to exceed the 10000-part limit.
     multipart_part_size: Option<usize>,
 }
@@ -121,12 +121,12 @@ struct Args {
 
     /// Files at or above this size use multipart upload (bytes).
     /// Optional: defaults to $OBS_MULTIPART_THRESHOLD, else config file,
-    /// else 8388608 (8 MiB, AWS CLI/boto3 default) when not configured anywhere.
+    /// else 26214400 (25 MB) when not configured anywhere.
     #[arg(long, env = "OBS_MULTIPART_THRESHOLD")]
     multipart_threshold: Option<u64>,
 
-    /// Multipart chunk size in bytes (default 8 MiB, i.e. 8388608).
-    /// Huawei's obsfs uses 10485760 (10 MB). OBS requires at least 5 MiB.
+    /// Multipart chunk size in bytes (default 10485760, i.e. 10 MB, matching
+    /// Huawei's obsfs). OBS requires at least 5 MiB.
     #[arg(long, env = "OBS_MULTIPART_PART_SIZE")]
     multipart_part_size: Option<usize>,
 }
@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
     let multipart_threshold = args
         .multipart_threshold
         .or(cfg.multipart_threshold)
-        .unwrap_or(8_388_608);
+        .unwrap_or(obs::DEFAULT_MULTIPART_THRESHOLD);
     if multipart_threshold == 0 {
         anyhow::bail!(
             "multipart_threshold must not be 0 (a 0-byte threshold would send even empty files as multipart)"
@@ -330,8 +330,8 @@ mod tests {
         // Any unknown field fails, no special-casing.
         let bad = "mountpoint: /mnt/obs\nbucket: b\nfoo: bar\n";
         assert!(serde_yaml::from_str::<FileConfig>(bad).is_err());
-        let ok = "mountpoint: /mnt/obs\nbucket: b\nmultipart_threshold: 8388608\n";
+        let ok = "mountpoint: /mnt/obs\nbucket: b\nmultipart_threshold: 26214400\n";
         let cfg = serde_yaml::from_str::<FileConfig>(ok).unwrap();
-        assert_eq!(cfg.multipart_threshold, Some(8_388_608));
+        assert_eq!(cfg.multipart_threshold, Some(26_214_400));
     }
 }

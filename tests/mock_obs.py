@@ -115,6 +115,9 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def logreq(self, status):
+        if os.environ.get("OBS_MOCK_VERBOSE"):
+            sys.stderr.write(f"{self.command} {self.path} -> {status}\n")
+            sys.stderr.flush()
         # Optional request log for debugging a failing run:
         #   OBS_MOCK_ACCESS_LOG=/tmp/access.log python3 tests/mock_obs.py
         path = os.environ.get("OBS_MOCK_ACCESS_LOG")
@@ -184,8 +187,32 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def read_body(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        te = self.headers.get("Transfer-Encoding")
+        if te and "chunked" in te.lower():
+            return self.read_chunked()
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
         return self.rfile.read(n) if n else b""
+
+    def read_chunked(self):
+        """Minimal chunked-body reader; reqwest may stream without a length."""
+        body = b""
+        while True:
+            line = self.rfile.readline().strip()
+            if not line:
+                break
+            try:
+                size = int(line, 16)
+            except ValueError:
+                break
+            if size == 0:
+                self.rfile.readline()
+                break
+            body += self.rfile.read(size)
+            self.rfile.read(2)  # CRLF
+        return body
 
     def route(self):
         raw_path, raw_query = self.path.split("?", 1) if "?" in self.path else (self.path, "")
@@ -313,6 +340,9 @@ class Handler(BaseHTTPRequestHandler):
             src = self.headers.get("x-obs-copy-source")
             if src:
                 src_key = unquote(src.lstrip("/").split("/", 1)[1])
+                if os.environ.get("OBS_MOCK_VERBOSE"):
+                    sys.stderr.write(f"COPY src={src_key!r} dst={key!r} present={src_key in OBJECTS}\n")
+                    sys.stderr.flush()
                 if src_key not in OBJECTS:
                     self.send_error_xml(404, "NoSuchKey", src_key)
                     return
