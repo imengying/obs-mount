@@ -187,21 +187,74 @@ fn main() -> anyhow::Result<()> {
     let fs = ObsFs::new(client, staging_dir, multipart_threshold);
     // fuser 0.18: allow-root moved from MountOption to the session ACL.
     // allow_root is always on (the mount is normally run as root anyway):
-    // root plus the mounting user can see the mount, and AutoUnmount is
-    // set with it. There is no allow_other option — other users do not
-    // get access.
-    let mount_options = vec![
+    // root plus the mounting user can see the mount. There is no
+    // allow_other option — other users do not get access.
+    //
+    // AutoUnmount is only possible through the setuid `fusermount` helper:
+    // fuser refuses to take the direct /dev/fuse path when that option is
+    // present, and if the helper is missing the mount dies with a bare
+    // `ENOENT` that says nothing about a missing package. So probe for the
+    // helper first and fall back to a plain mount (unmounted by the kernel
+    // when the process dies, only not lazily detached) instead of failing.
+    let mut mount_options = vec![
         MountOption::FSName("obs-mount".to_string()),
         MountOption::DefaultPermissions,
-        MountOption::AutoUnmount,
     ];
+    match fusermount_bin() {
+        Some(bin) => {
+            tracing::debug!(helper = %bin, "using fusermount helper (auto_unmount enabled)");
+            mount_options.push(MountOption::AutoUnmount);
+        }
+        None => tracing::warn!(
+            "fusermount/fusermount3 not found: mounting without auto_unmount. \
+             Install the fuse3 package (Debian/Ubuntu: apt-get install fuse3) to get \
+             automatic lazy unmount on exit."
+        ),
+    }
     let acl = fuser::SessionACL::RootAndOwner;
     // Config is #[non_exhaustive], so build it from Default and mutate.
     let mut config = fuser::Config::default();
     config.mount_options = mount_options;
     config.acl = acl;
-    fuser::mount(fs, &mountpoint, &config)?;
+    fuser::mount(fs, &mountpoint, &config).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot mount {}: {e}\n\
+             If this says 'No such file or directory' while /dev/fuse exists, the \
+             fusermount helper is missing: apt-get install fuse3.",
+            mountpoint.display()
+        )
+    })?;
     Ok(())
+}
+
+/// Locate the setuid FUSE mount helper, mirroring fuser's own lookup order
+/// (`$FUSERMOUNT_PATH`, then fusermount3, then fusermount).
+fn fusermount_bin() -> Option<String> {
+    if let Some(p) = std::env::var_os("FUSERMOUNT_PATH") {
+        let p = p.to_string_lossy().into_owned();
+        if is_executable(&p) {
+            return Some(p);
+        }
+    }
+    ["fusermount3", "fusermount"]
+        .into_iter()
+        .find(|name| search_path(name).is_some())
+        .map(|name| search_path(name).unwrap_or_else(|| name.to_string()))
+}
+
+fn search_path(name: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| is_executable(&p.to_string_lossy()))
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+fn is_executable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
