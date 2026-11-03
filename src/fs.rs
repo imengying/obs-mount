@@ -180,6 +180,47 @@ impl Inner {
         }
     }
 
+    /// Move every inode/meta entry under `old` to `new`, keeping the inode
+    /// numbers stable.
+    ///
+    /// A successful rename must NOT drop the inode mapping for the new path:
+    /// the kernel keeps using the inode numbers it already handed out, and a
+    /// forgotten inode makes the next `open`/`getattr` fail with ENOENT
+    /// without a single request reaching the backend (the classic
+    /// `mv a b && cat b` breakage). The inode follows the object instead.
+    fn remap_subtree(&mut self, old: &str, new: &str) {
+        let old_prefix = format!("{old}/");
+        let successors: Vec<String> = self
+            .path_to_ino
+            .keys()
+            .filter(|p| *p == old || p.starts_with(&old_prefix))
+            .cloned()
+            .collect();
+        for old_path in successors {
+            let Some(ino) = self.path_to_ino.remove(&old_path) else {
+                continue;
+            };
+            let new_path = if old_path == old {
+                new.to_string()
+            } else {
+                format!("{new}{}", &old_path[old.len()..])
+            };
+            self.ino_to_path.insert(ino, new_path.clone());
+            self.path_to_ino.insert(new_path.clone(), ino);
+            if let Some(c) = self.meta_cache.remove(&old_path) {
+                self.meta_cache.insert(new_path.clone(), c);
+            }
+            // Open handles carry the key they upload to: retarget them so a
+            // file renamed while open still lands on the new key.
+            for f in self.open_files.values_mut() {
+                if f.key == old_path {
+                    f.key = new_path.clone();
+                }
+            }
+        }
+        self.meta_cache.remove(old);
+    }
+
     fn staging_path(&self, ino: u64) -> PathBuf {
         self.staging_dir.join(format!("ino-{ino}"))
     }
@@ -993,14 +1034,26 @@ impl Filesystem for ObsFs {
                             format!("{}/{}", dir_prefix(&new_path).trim_end_matches('/'), suffix)
                         };
                         if let Err(e) = inner.client.copy_object(&key, &dst) {
+                            // Copy+Delete is not atomic: keys already moved
+                            // stay moved. Say so instead of pretending only
+                            // the failed key was affected.
+                            tracing::error!(
+                                old = %old_path,
+                                new = %new_path,
+                                failed_key = %key,
+                                "directory rename aborted mid-way; already-copied keys were left at the destination"
+                            );
                             let err = inner.upload_error_reply(&e);
                             reply.error(err);
                             return;
                         }
                         let _ = inner.client.delete_object(&key);
                     }
-                    inner.forget_subtree(&old_path);
-                    inner.forget_subtree(&new_path);
+                    // Keep the inode mapping, just re-point it at the new
+                    // path: dropping it made the kernel's cached dentry point
+                    // at an inode we no longer know, so `mv a b && cat b`
+                    // failed with ENOENT until the TTL expired.
+                    inner.remap_subtree(&old_path, &new_path);
                     reply.ok();
                 }
                 Err(e) => {
@@ -1012,8 +1065,9 @@ impl Filesystem for ObsFs {
             match inner.client.copy_object(&old_path, &new_path) {
                 Ok(()) => {
                     let _ = inner.client.delete_object(&old_path);
-                    inner.forget_subtree(&old_path);
-                    inner.forget_subtree(&new_path);
+                    // Same as the directory branch: re-point the inode, do
+                    // not forget it (the kernel still holds that inode).
+                    inner.remap_subtree(&old_path, &new_path);
                     reply.ok();
                 }
                 Err(e) => {
@@ -1124,4 +1178,110 @@ pub fn _unused(_: &Path) {
         last_modified: None,
         etag: None,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inner_for_test() -> Inner {
+        Inner {
+            client: ObsClient::new(
+                "ak".into(),
+                "sk".into(),
+                "bucket".into(),
+                "http://127.0.0.1:1".into(),
+            ),
+            staging_dir: std::env::temp_dir().join("obs-mount-test-staging"),
+            multipart_threshold: 8 * 1024 * 1024,
+            next_ino: 2,
+            ino_to_path: HashMap::new(),
+            path_to_ino: HashMap::new(),
+            meta_cache: HashMap::new(),
+            open_files: HashMap::new(),
+            next_fh: 1,
+        }
+    }
+
+    #[test]
+    fn path_helpers() {
+        assert_eq!(parent_path("a/b/c"), "a/b");
+        assert_eq!(parent_path("a"), "");
+        assert_eq!(file_name("a/b/c"), "c");
+        assert_eq!(file_name("c"), "c");
+        assert_eq!(join_path("", "x"), "x");
+        assert_eq!(join_path("d", "x"), "d/x");
+        assert_eq!(dir_prefix(""), "");
+        assert_eq!(dir_prefix("d/e"), "d/e/");
+    }
+
+    /// Regression for `mv a b && cat b` returning ENOENT: a rename must keep
+    /// the inode number and move it to the new path, not forget it.
+    #[test]
+    fn rename_keeps_inode_number() {
+        let mut inner = inner_for_test();
+        let ino = inner.alloc_ino("old.txt");
+        inner.meta_cache.insert(
+            "old.txt".into(),
+            CachedMeta {
+                size: 3,
+                is_dir: false,
+                mtime: SystemTime::now(),
+                expires: Instant::now() + Duration::from_secs(5),
+            },
+        );
+
+        inner.remap_subtree("old.txt", "new.txt");
+
+        assert_eq!(inner.ino_to_path.get(&ino), Some(&"new.txt".to_string()));
+        assert_eq!(inner.path_to_ino.get("new.txt"), Some(&ino));
+        assert!(!inner.path_to_ino.contains_key("old.txt"));
+        assert_eq!(
+            inner.meta_cache.get("new.txt").map(|c| c.size),
+            Some(3),
+            "cached metadata must follow the object"
+        );
+        assert!(!inner.meta_cache.contains_key("old.txt"));
+    }
+
+    #[test]
+    fn rename_remaps_whole_directory_subtree() {
+        let mut inner = inner_for_test();
+        let dir_ino = inner.alloc_ino("d");
+        let file_ino = inner.alloc_ino("d/f");
+        let nested_ino = inner.alloc_ino("d/s/g");
+
+        inner.remap_subtree("d", "e");
+
+        assert_eq!(inner.ino_to_path.get(&dir_ino), Some(&"e".to_string()));
+        assert_eq!(inner.ino_to_path.get(&file_ino), Some(&"e/f".to_string()));
+        assert_eq!(
+            inner.ino_to_path.get(&nested_ino),
+            Some(&"e/s/g".to_string())
+        );
+        assert!(!inner.path_to_ino.contains_key("d/f"));
+    }
+
+    /// An open handle must upload to the new key after its file is renamed.
+    #[test]
+    fn rename_retargets_open_handles() {
+        let mut inner = inner_for_test();
+        let ino = inner.alloc_ino("a.txt");
+        inner.open_files.insert(
+            7,
+            OpenFile {
+                key: "a.txt".into(),
+                staging: Some(inner.staging_path(ino)),
+                dirty: true,
+                write_mode: true,
+            },
+        );
+
+        inner.remap_subtree("a.txt", "b.txt");
+
+        assert_eq!(
+            inner.open_files.get(&7).map(|f| f.key.as_str()),
+            Some("b.txt")
+        );
+    }
 }
