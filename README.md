@@ -359,7 +359,7 @@ OpenList（原 Alist）的 S3 驱动**没有**实现容量查询——`GetDetail
 | | 大小 | 动态依赖 |
 |---|---|---|
 | obs-mount（glibc 动态） | 9.9 MB | libc / libgcc_s |
-| obs-mount（musl 全静态） | 9.7 MB | 无 |
+| obs-mount（musl 全静态） | 9.8 MB | 无 |
 | 官方 obsfs | 15.6 MB | libfuse、libcurl、libxml2、libcrypto、libstdc++ 等 **8 个**直接库 |
 
 小 37%，且静态版可以拷到任何 x86_64 Linux 上直接跑。
