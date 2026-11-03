@@ -23,8 +23,7 @@ use crate::obs::{ObjectMeta, ObsClient, ObsError};
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileType, Filesystem, FopenFlags, Generation, INodeNo,
     LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
-    WriteFlags,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -185,7 +184,14 @@ impl Inner {
         self.staging_dir.join(format!("ino-{ino}"))
     }
 
-    fn attr(&self, req: &Request, ino: u64, kind: FileType, size: u64, mtime: SystemTime) -> FileAttr {
+    fn attr(
+        &self,
+        req: &Request,
+        ino: u64,
+        kind: FileType,
+        size: u64,
+        mtime: SystemTime,
+    ) -> FileAttr {
         FileAttr {
             ino: INodeNo(ino),
             size,
@@ -195,7 +201,11 @@ impl Inner {
             ctime: mtime,
             crtime: mtime,
             kind,
-            perm: if kind == FileType::Directory { 0o755 } else { 0o644 },
+            perm: if kind == FileType::Directory {
+                0o755
+            } else {
+                0o644
+            },
             nlink: if kind == FileType::Directory { 2 } else { 1 },
             uid: req.uid(),
             gid: req.gid(),
@@ -238,7 +248,12 @@ impl Inner {
                 let mtime = system_time_from(meta.last_modified.as_deref());
                 self.meta_cache.insert(
                     path.to_string(),
-                    CachedMeta { size: meta.size, is_dir: false, mtime, expires: Instant::now() + Duration::from_secs(5) },
+                    CachedMeta {
+                        size: meta.size,
+                        is_dir: false,
+                        mtime,
+                        expires: Instant::now() + Duration::from_secs(5),
+                    },
                 );
                 let ino = self.alloc_ino(path);
                 return Some((ino, false, meta.size, mtime));
@@ -253,7 +268,12 @@ impl Inner {
         if let Ok(Some(_)) = self.client.head_object(&placeholder) {
             self.meta_cache.insert(
                 path.to_string(),
-                CachedMeta { size: 4096, is_dir: true, mtime: SystemTime::now(), expires: Instant::now() + Duration::from_secs(5) },
+                CachedMeta {
+                    size: 4096,
+                    is_dir: true,
+                    mtime: SystemTime::now(),
+                    expires: Instant::now() + Duration::from_secs(5),
+                },
             );
             let ino = self.alloc_ino(path);
             return Some((ino, true, 4096, SystemTime::now()));
@@ -263,7 +283,12 @@ impl Inner {
             Ok(page) if !page.objects.is_empty() || !page.prefixes.is_empty() => {
                 self.meta_cache.insert(
                     path.to_string(),
-                    CachedMeta { size: 4096, is_dir: true, mtime: SystemTime::now(), expires: Instant::now() + Duration::from_secs(5) },
+                    CachedMeta {
+                        size: 4096,
+                        is_dir: true,
+                        mtime: SystemTime::now(),
+                        expires: Instant::now() + Duration::from_secs(5),
+                    },
                 );
                 let ino = self.alloc_ino(path);
                 Some((ino, true, 4096, SystemTime::now()))
@@ -312,7 +337,12 @@ impl Inner {
                         if let Ok(m) = fs::metadata(&staging) {
                             self.meta_cache.insert(
                                 key,
-                                CachedMeta { size: m.len(), is_dir: false, mtime: SystemTime::now(), expires: Instant::now() + Duration::from_secs(5) },
+                                CachedMeta {
+                                    size: m.len(),
+                                    is_dir: false,
+                                    mtime: SystemTime::now(),
+                                    expires: Instant::now() + Duration::from_secs(5),
+                                },
                             );
                         }
                     }
@@ -342,7 +372,11 @@ impl Filesystem for ObsFs {
         let path = join_path(&parent_path, &name);
         match inner.resolve(&path) {
             Some((ino, is_dir, size, mtime)) => {
-                let kind = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                let kind = if is_dir {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                };
                 let attr = inner.attr(req, ino, kind, size, mtime);
                 reply.entry(&TTL, &attr, Generation(0));
             }
@@ -350,7 +384,13 @@ impl Filesystem for ObsFs {
         }
     }
 
-    fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<fuser::FileHandle>, reply: ReplyAttr) {
+    fn getattr(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        _fh: Option<fuser::FileHandle>,
+        reply: ReplyAttr,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         if ino == INodeNo::ROOT {
             let attr = inner.attr(req, ROOT_INO, FileType::Directory, 4096, SystemTime::now());
@@ -363,7 +403,11 @@ impl Filesystem for ObsFs {
         };
         match inner.resolve(&path) {
             Some((_, is_dir, size, mtime)) => {
-                let kind = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                let kind = if is_dir {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                };
                 let attr = inner.attr(req, ino.0, kind, size, mtime);
                 reply.attr(&TTL, &attr);
             }
@@ -371,7 +415,14 @@ impl Filesystem for ObsFs {
         }
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: fuser::FileHandle, offset: u64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         let Some(path) = (if ino == INodeNo::ROOT {
             Some(String::new())
@@ -474,13 +525,21 @@ impl Filesystem for ObsFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        let write_mode = matches!(flags.acc_mode(), OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR);
+        let write_mode = matches!(
+            flags.acc_mode(),
+            OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
+        );
         if !write_mode {
             let fh = inner.next_fh;
             inner.next_fh += 1;
             inner.open_files.insert(
                 fh,
-                OpenFile { key: path, staging: None, dirty: false, write_mode: false },
+                OpenFile {
+                    key: path,
+                    staging: None,
+                    dirty: false,
+                    write_mode: false,
+                },
             );
             reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
             return;
@@ -520,7 +579,12 @@ impl Filesystem for ObsFs {
         inner.next_fh += 1;
         inner.open_files.insert(
             fh,
-            OpenFile { key: path, staging: Some(staging), dirty: trunc, write_mode: true },
+            OpenFile {
+                key: path,
+                staging: Some(staging),
+                dirty: trunc,
+                write_mode: true,
+            },
         );
         reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
     }
@@ -669,21 +733,44 @@ impl Filesystem for ObsFs {
         }
         inner.meta_cache.insert(
             path.clone(),
-            CachedMeta { size: 0, is_dir: false, mtime: SystemTime::now(), expires: Instant::now() + Duration::from_secs(5) },
+            CachedMeta {
+                size: 0,
+                is_dir: false,
+                mtime: SystemTime::now(),
+                expires: Instant::now() + Duration::from_secs(5),
+            },
         );
         let fh = inner.next_fh;
         inner.next_fh += 1;
         inner.open_files.insert(
             fh,
-            OpenFile { key: path.clone(), staging: Some(staging), dirty: true, write_mode: true },
+            OpenFile {
+                key: path.clone(),
+                staging: Some(staging),
+                dirty: true,
+                write_mode: true,
+            },
         );
         // dirty=true so that closing an empty created file still uploads a
         // zero-byte object (a backup tool's `touch` must be visible in OBS).
         let attr = inner.attr(req, ino, FileType::RegularFile, 0, SystemTime::now());
-        reply.created(&TTL, &attr, Generation(0), fuser::FileHandle(fh), FopenFlags::empty());
+        reply.created(
+            &TTL,
+            &attr,
+            Generation(0),
+            fuser::FileHandle(fh),
+            FopenFlags::empty(),
+        );
     }
 
-    fn flush(&self, _req: &Request, _ino: INodeNo, fh: fuser::FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: fuser::FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         match inner.flush_handle(fh.0) {
             Some(err) => reply.error(err),
@@ -691,7 +778,14 @@ impl Filesystem for ObsFs {
         }
     }
 
-    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: fuser::FileHandle, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: fuser::FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         // Same as flush: OBS objects are immutable, so an fsync is a full
         // re-upload of the staged file. Apps that fsync often (databases,
         // VM images) must not run on this mount.
@@ -713,7 +807,11 @@ impl Filesystem for ObsFs {
         reply: ReplyEmpty,
     ) {
         let mut inner = self.inner.lock().unwrap();
-        let dirty = inner.open_files.get(&fh.0).map(|f| f.dirty).unwrap_or(false);
+        let dirty = inner
+            .open_files
+            .get(&fh.0)
+            .map(|f| f.dirty)
+            .unwrap_or(false);
         if dirty {
             if let Err(e) = inner.upload_staging(fh.0) {
                 tracing::error!(error = %e, "release upload failed");
@@ -734,7 +832,15 @@ impl Filesystem for ObsFs {
         reply.ok();
     }
 
-    fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         let Some(parent_path) = (if parent == INodeNo::ROOT {
             Some(String::new())
@@ -756,7 +862,12 @@ impl Filesystem for ObsFs {
         let ino = inner.alloc_ino(&path);
         inner.meta_cache.insert(
             path.clone(),
-            CachedMeta { size: 4096, is_dir: true, mtime: SystemTime::now(), expires: Instant::now() + Duration::from_secs(5) },
+            CachedMeta {
+                size: 4096,
+                is_dir: true,
+                mtime: SystemTime::now(),
+                expires: Instant::now() + Duration::from_secs(5),
+            },
         );
         let attr = inner.attr(req, ino, FileType::Directory, 4096, SystemTime::now());
         reply.entry(&TTL, &attr, Generation(0));
@@ -777,12 +888,8 @@ impl Filesystem for ObsFs {
         match inner.client.list_dir(&prefix) {
             Ok(page) => {
                 // The directory's own placeholder object does not count.
-                let others = page
-                    .objects
-                    .iter()
-                    .filter(|o| o.key != prefix)
-                    .count()
-                    + page.prefixes.len();
+                let others =
+                    page.objects.iter().filter(|o| o.key != prefix).count() + page.prefixes.len();
                 if others > 0 {
                     reply.error(Errno::ENOTEMPTY);
                     return;
@@ -974,7 +1081,10 @@ impl Filesystem for ObsFs {
                     return;
                 }
             };
-            if let Err(e) = inner.client.upload_file(&path, &data, inner.multipart_threshold) {
+            if let Err(e) = inner
+                .client
+                .upload_file(&path, &data, inner.multipart_threshold)
+            {
                 let err = inner.upload_error_reply(&e);
                 reply.error(err);
                 return;
@@ -982,7 +1092,12 @@ impl Filesystem for ObsFs {
             let _ = fs::remove_file(&staging);
             inner.meta_cache.insert(
                 path.clone(),
-                CachedMeta { size, is_dir: false, mtime: SystemTime::now(), expires: Instant::now() + Duration::from_secs(5) },
+                CachedMeta {
+                    size,
+                    is_dir: false,
+                    mtime: SystemTime::now(),
+                    expires: Instant::now() + Duration::from_secs(5),
+                },
             );
             let attr = inner.attr(req, ino.0, FileType::RegularFile, size, SystemTime::now());
             reply.attr(&TTL, &attr);
@@ -990,7 +1105,11 @@ impl Filesystem for ObsFs {
         }
         match inner.resolve(&path) {
             Some((_, is_dir, size, mtime)) => {
-                let kind = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                let kind = if is_dir {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                };
                 let attr = inner.attr(req, ino.0, kind, size, mtime);
                 reply.attr(&TTL, &attr);
             }
@@ -1000,5 +1119,9 @@ impl Filesystem for ObsFs {
 }
 
 pub fn _unused(_: &Path) {
-    let _ = ObjectMeta { size: 0, last_modified: None, etag: None };
+    let _ = ObjectMeta {
+        size: 0,
+        last_modified: None,
+        etag: None,
+    };
 }

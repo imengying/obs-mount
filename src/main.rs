@@ -137,7 +137,9 @@ fn main() -> anyhow::Result<()> {
         None => FileConfig::default(),
     };
     let missing = |name: &str| {
-        anyhow::anyhow!("{name} is not set: pass the flag, set the env var, or put it in the config file")
+        anyhow::anyhow!(
+            "{name} is not set: pass the flag, set the env var, or put it in the config file"
+        )
     };
     let mountpoint = args
         .mountpoint
@@ -146,7 +148,10 @@ fn main() -> anyhow::Result<()> {
     if !mountpoint.is_dir() {
         anyhow::bail!("mountpoint {} is not a directory", mountpoint.display());
     }
-    let bucket = args.bucket.or(cfg.bucket).ok_or_else(|| missing("bucket"))?;
+    let bucket = args
+        .bucket
+        .or(cfg.bucket)
+        .ok_or_else(|| missing("bucket"))?;
     let endpoint = args
         .endpoint
         .or(cfg.endpoint)
@@ -158,7 +163,9 @@ fn main() -> anyhow::Result<()> {
         .or(cfg.multipart_threshold)
         .unwrap_or(8_388_608);
     if multipart_threshold == 0 {
-        anyhow::bail!("multipart_threshold must not be 0 (a 0-byte threshold would send even empty files as multipart)");
+        anyhow::bail!(
+            "multipart_threshold must not be 0 (a 0-byte threshold would send even empty files as multipart)"
+        );
     }
     // Staging is not configurable: always under the system temp dir
     // (std::env::temp_dir(), i.e. $TMPDIR or /tmp on Linux), so a
@@ -169,7 +176,9 @@ fn main() -> anyhow::Result<()> {
     // Startup self-check: the bucket must be listable before we mount,
     // otherwise a bad AK/SK or region shows up as an empty-looking mount.
     match client.list_dir("") {
-        Ok(_) => tracing::info!(bucket = %bucket, mountpoint = %mountpoint.display(), "OBS bucket reachable, mounting"),
+        Ok(_) => {
+            tracing::info!(bucket = %bucket, mountpoint = %mountpoint.display(), "OBS bucket reachable, mounting")
+        }
         Err(e) => {
             tracing::error!(error = %e, "OBS bucket check failed; refusing to mount (check AK/SK, bucket, region/endpoint, and clock/NTP)");
             anyhow::bail!("OBS bucket check failed: {e}");

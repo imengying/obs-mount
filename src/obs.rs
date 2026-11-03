@@ -17,13 +17,13 @@
 //! `prefix`, `delimiter`, `marker`, `max-keys` are sent in the URL but do
 //! NOT enter the signature.
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest as _, Md5};
+use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
-use quick_xml::Reader;
 use reqwest::blocking::Client;
 use sha1::Sha1;
 use std::time::Duration;
@@ -34,7 +34,12 @@ type HmacSha1 = Hmac<Sha1>;
 #[derive(Debug, Error)]
 pub enum ObsError {
     #[error("HTTP {status} for {method} {path}: {body}")]
-    Http { status: u16, method: String, path: String, body: String },
+    Http {
+        status: u16,
+        method: String,
+        path: String,
+        body: String,
+    },
     #[error("network: {0}")]
     Network(#[from] reqwest::Error),
     #[error("io: {0}")]
@@ -254,10 +259,7 @@ impl ObsClient {
         extra_x_obs: &[(String, String)],
         extra_headers: &[(String, String)],
     ) -> Result<reqwest::blocking::Response> {
-        let content_md5 = body
-            .as_ref()
-            .map(|b| md5_base64(b))
-            .unwrap_or_default();
+        let content_md5 = body.as_ref().map(|b| md5_base64(b)).unwrap_or_default();
         // Only send Content-MD5 when there is a body; otherwise the signed
         // value must stay empty or the signature will not match.
         let (url, auth, date, x_obs) = self.sign(
@@ -272,7 +274,10 @@ impl ObsClient {
         for attempt in 0..4 {
             let mut req = self
                 .http
-                .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), &url)
+                .request(
+                    reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                    &url,
+                )
                 .header("Authorization", &auth)
                 .header("Date", &date);
             for (k, v) in &x_obs {
@@ -318,7 +323,11 @@ impl ObsClient {
         Err(last_err.unwrap_or_else(|| ObsError::Other("request failed".into())))
     }
 
-    fn check(resp: reqwest::blocking::Response, method: &str, key: &str) -> Result<reqwest::blocking::Response> {
+    fn check(
+        resp: reqwest::blocking::Response,
+        method: &str,
+        key: &str,
+    ) -> Result<reqwest::blocking::Response> {
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
             Ok(resp)
@@ -386,10 +395,7 @@ impl ObsClient {
         let mut keys = Vec::new();
         let mut marker: Option<String> = None;
         loop {
-            let mut query = format!(
-                "prefix={}&max-keys=1000",
-                urlencoding::encode(prefix)
-            );
+            let mut query = format!("prefix={}&max-keys=1000", urlencoding::encode(prefix));
             if let Some(m) = &marker {
                 query.push_str(&format!("&marker={}", urlencoding::encode(m)));
             }
@@ -433,7 +439,15 @@ impl ObsClient {
     pub fn get_range(&self, key: &str, start: u64, len: usize) -> Result<Vec<u8>> {
         let end = start + len as u64 - 1;
         let range = format!("bytes={start}-{end}");
-        let resp = self.send("GET", key, "", None, "", &[], &[("Range".to_string(), range)])?;
+        let resp = self.send(
+            "GET",
+            key,
+            "",
+            None,
+            "",
+            &[],
+            &[("Range".to_string(), range)],
+        )?;
         let resp = Self::check(resp, "GET", key)?;
         Ok(resp.bytes()?.to_vec())
     }
@@ -481,10 +495,17 @@ impl ObsClient {
         let resp = self.send("POST", key, "uploads", None, "", &[], &[])?;
         let resp = Self::check(resp, "POST", key)?;
         let text = resp.text()?;
-        parse_tag(&text, "UploadId").ok_or_else(|| ObsError::Other("no UploadId in response".into()))
+        parse_tag(&text, "UploadId")
+            .ok_or_else(|| ObsError::Other("no UploadId in response".into()))
     }
 
-    pub fn upload_part(&self, key: &str, upload_id: &str, part_number: u32, data: &[u8]) -> Result<String> {
+    pub fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+    ) -> Result<String> {
         let query = format!(
             "partNumber={part_number}&uploadId={}",
             urlencoding::encode(upload_id)
@@ -509,7 +530,12 @@ impl ObsClient {
         Ok(etag)
     }
 
-    pub fn complete_multipart(&self, key: &str, upload_id: &str, parts: &[(u32, String)]) -> Result<()> {
+    pub fn complete_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<()> {
         let mut body = String::from("<CompleteMultipartUpload>");
         for (n, etag) in parts {
             body.push_str(&format!(
@@ -562,10 +588,7 @@ impl ObsClient {
         // Join one batch of in-flight parts before starting the next, so
         // at most CONCURRENCY requests (and part * CONCURRENCY bytes of
         // copied chunk data) are live at once.
-        let mut handles: Vec<(
-            u32,
-            std::thread::JoinHandle<Result<String>>,
-        )> = Vec::new();
+        let mut handles: Vec<(u32, std::thread::JoinHandle<Result<String>>)> = Vec::new();
         let mut part_no: u32 = 1;
         for chunk in data.chunks(part) {
             let client = self.clone();
@@ -594,9 +617,7 @@ impl ObsClient {
                         }
                         Err(_) => {
                             if result.is_ok() {
-                                result = Err(ObsError::Other(
-                                    "part upload thread panicked".into(),
-                                ));
+                                result = Err(ObsError::Other("part upload thread panicked".into()));
                             }
                         }
                     }
@@ -696,7 +717,9 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
             }
             Ok(Event::Text(e)) => {
                 if let Some(elem) = &cur_text_elem {
-                    let text = unescape(&e.xml10_content()).unwrap_or_default().into_owned();
+                    let text = unescape(&e.xml10_content())
+                        .unwrap_or_default()
+                        .into_owned();
                     let in_contents = stack.iter().any(|s| s == "Contents");
                     let in_prefix = stack.iter().any(|s| s == "CommonPrefixes");
                     match elem.as_str() {
@@ -798,8 +821,24 @@ mod tests {
 
     #[test]
     fn signature_is_deterministic() {
-        let a = obs_signature("sk", "GET", "", "", "Tue, 03 Nov 2026 06:26:00 GMT", &[], "/b/a.txt");
-        let b = obs_signature("sk", "GET", "", "", "Tue, 03 Nov 2026 06:26:00 GMT", &[], "/b/a.txt");
+        let a = obs_signature(
+            "sk",
+            "GET",
+            "",
+            "",
+            "Tue, 03 Nov 2026 06:26:00 GMT",
+            &[],
+            "/b/a.txt",
+        );
+        let b = obs_signature(
+            "sk",
+            "GET",
+            "",
+            "",
+            "Tue, 03 Nov 2026 06:26:00 GMT",
+            &[],
+            "/b/a.txt",
+        );
         assert_eq!(a, b);
         assert!(!a.is_empty());
     }
