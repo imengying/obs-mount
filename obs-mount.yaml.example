@@ -1,0 +1,12 @@
+# obs-mount 配置文件模板（唯一格式：YAML）：复制到 /etc/obs/obs-mount.yaml（权限 0600）后填入真实值。
+# 二进制同样放在 /etc/obs/ 目录：/etc/obs/obs-mount，systemd 单元见 obs-mount.service。
+# 不要把真实 AK/SK 提交进仓库。
+# 建议用 IAM 子账号 + 仅该桶的最小权限，不要用主账号 AK/SK 跑挂载。
+# 优先级：命令行参数 > 环境变量 > 本文件。systemd 单元默认读 /etc/obs/obs-mount.yaml。
+# 配置只含以下字段，未知字段启动时直接报错（不静默忽略）。
+mountpoint: /mnt/obs
+bucket: your-bucket-name
+endpoint: https://your-bucket-name.obs.cn-north-4.myhuaweicloud.com
+ak: YOUR_ACCESS_KEY_HERE
+sk: YOUR_SECRET_KEY_HERE
+# multipart_threshold: 8388608   # 可选，不配就默认 8 MiB（AWS 默认），达到该大小用分段上传

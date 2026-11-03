@@ -1,0 +1,29 @@
+[Unit]
+Description=Mount a Huawei Cloud OBS bucket as a local directory (FUSE, native OBS REST signing)
+Documentation=file:///usr/local/share/doc/obs-mount/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Install the binary and config first, e.g.:
+#   mkdir -p /etc/obs
+#   install -m 0755 target/release/obs-mount /etc/obs/obs-mount
+#   install -m 0600 obs-mount.yaml.example /etc/obs/obs-mount.yaml  # 填入真实值
+ExecStart=/etc/obs/obs-mount --config /etc/obs/obs-mount.yaml
+ExecStop=/bin/fusermount -u /mnt/obs
+Restart=on-failure
+RestartSec=10
+# Config lives only in /etc/obs/obs-mount.yaml (YAML, 0600).
+# Precedence: CLI flag > environment variable > config file.
+# Mounting needs /dev/fuse; the process itself does not need root if the
+# mountpoint is owned by the service user and /dev/fuse is accessible.
+# Uncomment and adjust if you run it as a non-root user:
+# User=obs-mount
+# Group=obs-mount
+# DeviceAllow=/dev/fuse rw
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
