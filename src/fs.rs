@@ -40,8 +40,14 @@ const TTL: Duration = Duration::from_secs(1);
 const USAGE_TTL: Duration = Duration::from_secs(60);
 /// Capacity reported when the bucket has no quota configured. It is not a
 /// real limit -- it only keeps tools that precheck free space from treating
-/// the mount as full. 1 PiB is far beyond any single OBS bucket quota.
-const SYNTHETIC_TOTAL: u64 = 1 << 50;
+/// the mount as full.
+///
+/// Matches Huawei's own obsfs, which fills `f_blocks`/`f_bavail` with
+/// `0xFFFFFFFF` block of 4096 bytes (16 TiB) and comments "S3 doesn't have a
+/// real concept of filesystem size/limits". Same idea, larger ceiling: 16 TiB
+/// is small enough that a backup could plausibly fill it, which would make a
+/// statvfs() precheck refuse to write.
+const SYNTHETIC_TOTAL: u64 = 1 << 50; // 1 PiB
 const STATFS_BLOCK_SIZE: u32 = 4096;
 /// OBS keys are limited to 1023 bytes.
 const STATFS_NAME_MAX: u32 = 1023;

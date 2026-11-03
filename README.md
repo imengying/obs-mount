@@ -170,6 +170,27 @@ staging 目录在系统临时目录下自动创建，无需手动建；allow_roo
 - `statfs` 已实现（见“容量显示”），但没有在**设了配额**的真实桶上验证过；
   `storageinfo` 的统计延迟量级也只在文档层面了解，未实测。
 
+### 对照官方 obsfs 得到的可改进项（尚未实现）
+
+读 [`huaweicloud-obs-obsfs`](https://github.com/huaweicloud/huaweicloud-obs-obsfs)
+源码后记下的差距，按价值排序：
+
+1. **Unix 元数据没有持久化**。obsfs 把 `mtime` / `uid` / `gid` / `mode` / xattr
+   写进对象元数据（它用 S3 风格 `x-amz-meta-*`，OBS 原生前缀应是
+   `x-obs-meta-*`，见官方 SDK 的 `HEADER_PREFIX_META_OBS = "x-obs-meta-"`），
+   所以 `chmod`、`chown`、`touch -d`、xattr 在它那里是真能存下来的。
+   本项目目前直接忽略这些属性（只保证 `cp -p` 不报错），取舍见上表。
+   要做的话：`PUT` 时带 `x-obs-meta-*`，`HEAD` 时读回来。
+2. **没有 symlink**。obsfs 用元数据存 target 来实现 `symlink`/`readlink`；
+   本项目返回 `ENOSYS`。
+3. **重试策略更保守**。obsfs 对写操作重试 8 次、间隔 4 秒；本项目只对 5xx 退避
+   重试 4 次、最长 2 秒，且没有断点续传。
+4. **分段阈值不同**。obsfs 用 25 MB 阈值 / 10 MB 分片；本项目默认 8 MiB 阈值 /
+   8 MiB 分片（学 AWS CLI），大文件会自动放大分片以不超 10000 片上限。
+5. obsfs 有一个“读目录时不做合成元数据、而是对每个条目单独 HEAD”的开关
+   （`accurate_readdir`），换取 `ls` 的准确性但代价是 N 次请求。本项目的
+   `readdir` 用 `CommonPrefixes` 合成属性，没有这个开关。
+
 ### 本轮修掉的缺陷
 
 以下都是上面那套端到端测试暴露出来的，此前单元测试无法发现：
@@ -242,10 +263,38 @@ OBS 确实提供了两个可用于此的原生子资源（见华为云官方 SDK
   `Used` 会被夹到等于 `Size`，避免 `df` 出现负数剩余。
 - `df -i` 的 inode 数固定上报 `u64::MAX`（表示“无限制”），不虚构可计数的 inode 上限。
 
-> 参考：OpenList（原 Alist）的 S3 驱动**没有**实现容量查询——它的 `GetDetails`
-> 是可选的 `WithDetails` 接口，S3 驱动只断言了 `driver.Driver`，因此上层拿到的是
-> `errs.NotImplement`，等于“不知道”。本项目选择给出可用数字而不是“不知道”，
-> 因为对 FUSE 挂载来说“上报 0”会主动引发上面那两个故障。
+### 与华为官方 obsfs 的对照
+
+华为官方开源了 FUSE 客户端 [`huaweicloud/huaweicloud-obs-obsfs`](https://github.com/huaweicloud/huaweicloud-obs-obsfs)（C++）。
+它的 `statfs` 实现（`src/s3fs_operations.cpp:3109`）完全不查询服务端：
+
+```c
+// Return fake filesystem stats for S3
+// S3 doesn't have a real concept of filesystem size/limits
+stbuf->f_bsize  = 4096;
+stbuf->f_blocks = 0xFFFFFFFF;   // ≈16 TiB
+stbuf->f_bfree  = 0xFFFFFFFF;
+stbuf->f_bavail = 0xFFFFFFFF;
+stbuf->f_files  = 0xFFFFFFFF;
+stbuf->f_ffree  = 0xFFFFFFFF;
+stbuf->f_namemax = NAME_MAX;    // 255
+```
+
+结论一致：**必须给大值，不能给 0**。本项目的差异是：
+
+| | 官方 obsfs | 本项目 |
+|---|---|---|
+| 无配额 | 固定 16 TiB | 固定 1 PiB（16 TiB 对备份来说可能真被填满，届时预检会拒绝写入） |
+| 有配额 | 不区分 | 查 `GET /?quota`，显示真实容量 |
+| 已用量 | 不查询 | 查 `GET /?storageinfo`，`df` 的 `Used` 是真的 |
+| inode | `0xFFFFFFFF` | `u64::MAX`（`df -i` 显示 `-` 而不是虚构计数） |
+| 文件名长度 | `NAME_MAX`(255) | 1023（OBS 的实际 key 上限） |
+
+### 与 OpenList 的对照
+
+OpenList（原 Alist）的 S3 驱动**没有**实现容量查询——`GetDetails` 属于可选的
+`WithDetails` 接口，S3 驱动只断言了 `driver.Driver`，上层拿到 `errs.NotImplement`，
+等于“不知道”。对 Web UI 够用，对 FUSE 挂载不行：上报 0 会主动引发上面两个故障。
 
 ## 已知限制（不是 bug，是对象存储的物理特性）
 
