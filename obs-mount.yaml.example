@@ -1,25 +1,17 @@
-# obs-mount 配置文件模板（唯一格式：YAML）：复制到 /etc/obs/obs-mount.yaml（权限 0600）后填入真实值。
-# 二进制同样放在 /etc/obs/ 目录：/etc/obs/obs-mount，systemd 单元见 obs-mount.service。
-# 不要把真实 AK/SK 提交进仓库。
-# 建议用 IAM 子账号 + 仅该桶的最小权限，不要用主账号 AK/SK 跑挂载。
-# 优先级：命令行参数 > 环境变量 > 本文件。systemd 单元默认读 /etc/obs/obs-mount.yaml。
-# 配置只含以下字段，未知字段启动时直接报错（不静默忽略）。
+# 复制到 /etc/obs/obs-mount.yaml 并 chmod 600，填入真实值。
+# 用 IAM 子账号 + 仅该桶权限，不要用主账号 AK/SK。
 mountpoint: /mnt/obs
 bucket: your-bucket-name
 
-# endpoint 支持两种写法，程序会从 host 自动判断用虚拟主机式还是路径式：
-#
-# 1) 桶虚拟主机式（推荐，少一层路径，符合 OBS 惯例）
+# endpoint 两种写法，程序按 host 自动选择寻址方式：
+#   桶虚拟主机式 https://<bucket>.obs.<region>.myhuaweicloud.com
+#   服务级       https://obs.<region>.myhuaweicloud.com （自动走 /<bucket>/<key>）
+# IP 或自定义域名同样走路径式。
 endpoint: https://your-bucket-name.obs.cn-north-4.myhuaweicloud.com
-#
-# 2) 服务级 endpoint + 单独的 bucket（与华为 obsfs 的配置习惯一致；
-#    host 里不含桶名时自动改用 /<bucket>/<key> 路径式请求）
-# endpoint: https://obs.cn-north-4.myhuaweicloud.com
-#
-# 用 IP 或自定义域名（VPN、内网穿透、CNAME）时也会自动走路径式。
 
 ak: YOUR_ACCESS_KEY_HERE
 sk: YOUR_SECRET_KEY_HERE
-# 默认值沿用华为 obsfs：达到 25 MB 改用分段上传，每片 10 MB。一般不需要改。
-# multipart_threshold: 26214400     # 可选，分段阈值（字节）
-# multipart_part_size: 10485760     # 可选，分片大小（字节），OBS 下限 5 MiB
+
+# 默认 25 MB 起用分段上传，每片 10 MB（与华为 obsfs 一致）。一般不用改。
+# multipart_threshold: 26214400
+# multipart_part_size: 10485760
