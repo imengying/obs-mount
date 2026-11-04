@@ -25,6 +25,9 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::blocking::Client;
 use sha1::Sha1;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -200,7 +203,7 @@ pub mod meta_keys {
     pub const MTIME: &str = "mtime";
     /// Symlink target, stored on a zero-byte object whose mode says S_IFLNK.
     pub const SYMLINK_TARGET: &str = "symlink-target";
-    /// Prefix for user extended attributes: `xdg.<base64(name)>`.
+    /// Prefix for user extended attributes: `xdg.<lowercase hex(name)>`.
     pub const XATTR_PREFIX: &str = "xdg.";
 }
 
@@ -359,6 +362,40 @@ fn is_ip_address(host: &str) -> bool {
     host.contains(':')
 }
 
+/// Re-open files for every retry; memory use is independent of object size.
+enum RequestBody {
+    Bytes(Vec<u8>),
+    File { path: PathBuf, len: u64 },
+}
+
+impl RequestBody {
+    fn md5(&self) -> Result<String> {
+        match self {
+            Self::Bytes(bytes) => Ok(md5_base64(bytes)),
+            Self::File { path, .. } => {
+                let mut file = File::open(path)?;
+                let mut hash = Md5::new();
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hash.update(&buf[..n]);
+                }
+                Ok(B64.encode(hash.finalize()))
+            }
+        }
+    }
+
+    fn body(&self) -> Result<reqwest::blocking::Body> {
+        Ok(match self {
+            Self::Bytes(bytes) => bytes.clone().into(),
+            Self::File { path, len } => reqwest::blocking::Body::sized(File::open(path)?, *len),
+        })
+    }
+}
+
 impl ObsClient {
     pub fn new(ak: String, sk: String, bucket: String, endpoint: String) -> Self {
         let http = Client::builder()
@@ -457,12 +494,16 @@ impl ObsClient {
         method: &str,
         key: &str,
         query: &str,
-        body: Option<Vec<u8>>,
+        body: Option<RequestBody>,
         content_type: &str,
         extra_x_obs: &[(String, String)],
         extra_headers: &[(String, String)],
     ) -> Result<reqwest::blocking::Response> {
-        let content_md5 = body.as_ref().map(|b| md5_base64(b)).unwrap_or_default();
+        let content_md5 = body
+            .as_ref()
+            .map(RequestBody::md5)
+            .transpose()?
+            .unwrap_or_default();
         // Only send Content-MD5 when there is a body; otherwise the signed
         // value must stay empty or the signature will not match.
         let (url, auth, date, x_obs) = self.sign(
@@ -496,7 +537,7 @@ impl ObsClient {
                 req = req.header("Content-Type", content_type);
             }
             if let Some(b) = &body {
-                req = req.header("Content-MD5", &content_md5).body(b.clone());
+                req = req.header("Content-MD5", &content_md5).body(b.body()?);
             }
             match req.send() {
                 Ok(resp) => {
@@ -748,7 +789,7 @@ impl ObsClient {
             "PUT",
             key,
             "",
-            Some(data.to_vec()),
+            Some(RequestBody::Bytes(data.to_vec())),
             "application/octet-stream",
             meta,
             &[],
@@ -833,7 +874,7 @@ impl ObsClient {
             "PUT",
             key,
             &query,
-            Some(data.to_vec()),
+            Some(RequestBody::Bytes(data.to_vec())),
             "application/octet-stream",
             &[],
             &[],
@@ -867,7 +908,7 @@ impl ObsClient {
             "POST",
             key,
             &query,
-            Some(body.into_bytes()),
+            Some(RequestBody::Bytes(body.into_bytes())),
             "application/xml",
             &[],
             &[],
@@ -883,104 +924,108 @@ impl ObsClient {
         Ok(())
     }
 
-    /// Upload, choosing single PUT below `multipart_threshold` (and always
-    /// for empty files, which have no parts to complete) and multipart
-    /// above it. Parts are uploaded in parallel (4 at a time, one blocking
-    /// thread per part; no new dependency) instead of one after another, so
-    /// a large backup is bound by bandwidth, not by per-part round-trips.
-    /// Parts are sorted by part number before Complete, and on any failure
-    /// every in-flight part is still joined before abort, so abort cannot
-    /// race an unfinished part upload. The part size is 10 MB by default
-    /// (AWS CLI/boto3 chunk size) but grows when the file would otherwise
-    /// need more than 10000 parts (the multipart limit) — same adaptation
-    /// OpenList's S3 driver relies on via the AWS SDK — so a file above
-    /// ~80 GiB does not fail at CompleteMultipartUpload.
-    pub fn upload_file(&self, key: &str, data: &[u8], tuning: UploadTuning) -> Result<()> {
-        self.upload_file_with_meta(key, data, tuning, &[])
+    /// Download to a temporary file and publish it only after a complete GET.
+    /// An unsuccessful or short response must never become writable staging.
+    pub fn download_to(&self, key: &str, path: &Path, meta: &ObjectMeta) -> Result<()> {
+        let partial = path.with_extension("download");
+        let result = (|| {
+            let headers = meta
+                .etag
+                .as_ref()
+                .map(|tag| vec![("If-Match".into(), format!("\"{tag}\""))])
+                .unwrap_or_default();
+            let resp = self.send("GET", key, "", None, "", &[], &headers)?;
+            let mut resp = Self::check(resp, "GET", key)?;
+            let mut file = File::create(&partial)?;
+            let copied = std::io::copy(&mut resp, &mut file)?;
+            if copied != meta.size {
+                return Err(ObsError::Other(format!(
+                    "incomplete download: expected {}, received {copied}",
+                    meta.size
+                )));
+            }
+            file.flush()?;
+            std::fs::rename(&partial, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(partial);
+        }
+        result
     }
 
-    /// As [`upload_file`](Self::upload_file), attaching `x-obs-meta-*`.
+    /// Upload a staging file with bounded buffers. Small PUTs also stream from
+    /// disk, even when the configured multipart threshold is very large.
     pub fn upload_file_with_meta(
         &self,
         key: &str,
-        data: &[u8],
+        path: &Path,
         tuning: UploadTuning,
         meta: &[(String, String)],
     ) -> Result<()> {
-        if data.is_empty() || (data.len() as u64) < tuning.threshold {
-            return self.put_object_with_meta(key, data, meta);
+        let mut file = File::open(path)?;
+        let len = file.metadata()?.len();
+        if len == 0 || len < tuning.threshold {
+            let resp = self.send(
+                "PUT",
+                key,
+                "",
+                Some(RequestBody::File {
+                    path: path.to_owned(),
+                    len,
+                }),
+                "application/octet-stream",
+                meta,
+                &[],
+            )?;
+            Self::check(resp, "PUT", key)?;
+            return Ok(());
         }
+        let file_len = usize::try_from(len)
+            .map_err(|_| ObsError::Other("file too large for this platform".into()))?;
+        let part = multipart_part_size_with(file_len, tuning.part_size);
         let upload_id = self.initiate_multipart_with_meta(key, meta)?;
-        let part: usize = multipart_part_size_with(data.len(), tuning.part_size);
-        const CONCURRENCY: usize = 4;
-        let mut parts: Vec<(u32, String)> = Vec::new();
-        let mut result: Result<()> = Ok(());
-        // Join one batch of in-flight parts before starting the next, so
-        // at most CONCURRENCY requests (and part * CONCURRENCY bytes of
-        // copied chunk data) are live at once.
-        let mut handles: Vec<(u32, std::thread::JoinHandle<Result<String>>)> = Vec::new();
-        for (idx, chunk) in data.chunks(part).enumerate() {
-            // OBS numbers parts from 1.
-            let part_no = idx as u32 + 1;
-            let client = self.clone();
-            let key = key.to_owned();
-            let upload_id = upload_id.clone();
-            let chunk = chunk.to_vec();
-            handles.push((
-                part_no,
-                std::thread::spawn(move || client.upload_part(&key, &upload_id, part_no, &chunk)),
-            ));
-            if handles.len() == CONCURRENCY {
-                // Join the whole batch even after a failure, so abort
-                // below cannot race an in-flight part upload.
-                for (n, h) in handles.drain(..) {
-                    match h.join() {
-                        Ok(Ok(etag)) => {
-                            if result.is_ok() {
-                                parts.push((n, etag));
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            if result.is_ok() {
-                                result = Err(e);
-                            }
-                        }
-                        Err(_) => {
-                            if result.is_ok() {
-                                result = Err(ObsError::Other("part upload thread panicked".into()));
-                            }
-                        }
-                    }
-                }
-                if result.is_err() {
+        let mut parts = Vec::new();
+        let mut remaining = file_len;
+        let mut part_no = 1;
+        let mut result = Ok(());
+        while remaining > 0 && result.is_ok() {
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                if remaining == 0 {
                     break;
                 }
+                let mut chunk = vec![0; remaining.min(part)];
+                if let Err(e) = file.read_exact(&mut chunk) {
+                    result = Err(ObsError::Io(e));
+                    break;
+                }
+                remaining -= chunk.len();
+                let client = self.clone();
+                let key = key.to_owned();
+                let upload_id = upload_id.clone();
+                let number = part_no;
+                handles.push((
+                    number,
+                    std::thread::spawn(move || {
+                        client.upload_part(&key, &upload_id, number, &chunk)
+                    }),
+                ));
+                part_no += 1;
             }
-        }
-        // Drain the tail batch too, joining every handle even after a
-        // failure: breaking early here used to drop unjoined handles, so
-        // abort below could race a still-running part upload.
-        for (n, h) in handles.drain(..) {
-            match h.join() {
-                Ok(Ok(etag)) => {
-                    if result.is_ok() {
-                        parts.push((n, etag));
+            // Always join all workers before aborting, including read failures.
+            for (number, handle) in handles {
+                match handle.join() {
+                    Ok(Ok(etag)) => parts.push((number, etag)),
+                    Ok(Err(e)) if result.is_ok() => result = Err(e),
+                    Err(_) if result.is_ok() => {
+                        result = Err(ObsError::Other("part upload thread panicked".into()))
                     }
-                }
-                Ok(Err(e)) => {
-                    if result.is_ok() {
-                        result = Err(e);
-                    }
-                }
-                Err(_) => {
-                    if result.is_ok() {
-                        result = Err(ObsError::Other("part upload thread panicked".into()));
-                    }
+                    _ => {}
                 }
             }
         }
         if result.is_ok() {
-            parts.sort_by_key(|(n, _)| *n);
             result = self.complete_multipart(key, &upload_id, &parts);
         }
         if result.is_err() {
@@ -1460,5 +1505,96 @@ mod tests {
         assert_eq!(r.objects.len(), 1);
         assert_eq!(r.objects[0].key, "a&b/中文.txt");
         assert_eq!(r.objects[0].size, 7);
+    }
+
+    #[test]
+    fn disk_uploads_match_independent_source_for_put_and_multipart() {
+        // First streamed PUT is retried: a retry must reopen the file at zero.
+        let mock =
+            crate::test_support::MockObs::new(r#"[{"method":"PUT","key":"single","status":500}]"#);
+        let client = mock.client();
+        let source = mock.staging.join("source");
+        let expected: Vec<u8> = (0..(26 * 1024 * 1024 + 7))
+            .map(|n| (n % 251) as u8)
+            .collect();
+        std::fs::write(&source, &expected).unwrap();
+        for (key, threshold) in [("single", u64::MAX), ("multipart", 1)] {
+            client
+                .upload_file_with_meta(
+                    key,
+                    &source,
+                    UploadTuning {
+                        threshold,
+                        part_size: 5 * 1024 * 1024,
+                    },
+                    &[],
+                )
+                .unwrap();
+            let meta = client.head_object(key).unwrap().unwrap();
+            assert_eq!(meta.size, expected.len() as u64);
+            let downloaded = mock.staging.join(format!("download-{key}"));
+            client.download_to(key, &downloaded, &meta).unwrap();
+            assert_eq!(
+                md5_base64(&std::fs::read(downloaded).unwrap()),
+                md5_base64(&expected)
+            );
+        }
+        // Empty files must use a valid zero-length PUT even at threshold 1.
+        std::fs::write(&source, []).unwrap();
+        client
+            .upload_file_with_meta(
+                "empty",
+                &source,
+                UploadTuning {
+                    threshold: 1,
+                    part_size: DEFAULT_PART_SIZE,
+                },
+                &[],
+            )
+            .unwrap();
+        assert_eq!(client.head_object("empty").unwrap().unwrap().size, 0);
+        assert!(mock.stats().contains("\"signature_failures\": 0"));
+    }
+
+    #[test]
+    fn multipart_failure_aborts_all_parts_and_keeps_source() {
+        let mock = crate::test_support::MockObs::new(
+            r#"[{"method":"PUT","key":"backup","query":"partNumber","status":403}]"#,
+        );
+        let source = mock.staging.join("source");
+        File::create(&source)
+            .unwrap()
+            .set_len(26 * 1024 * 1024)
+            .unwrap();
+        let client = mock.client();
+        assert!(
+            client
+                .upload_file_with_meta("backup", &source, UploadTuning::default(), &[])
+                .is_err()
+        );
+        assert!(source.exists());
+        assert!(client.head_object("backup").unwrap().is_none());
+        assert!(mock.stats().contains("\"uploads\": 0"));
+    }
+
+    #[test]
+    fn changed_or_short_download_is_not_published() {
+        let mock = crate::test_support::MockObs::new("[]");
+        let client = mock.client();
+        client
+            .put_object_with_meta("backup", b"original", &[])
+            .unwrap();
+        let meta = client.head_object("backup").unwrap().unwrap();
+        client
+            .put_object_with_meta("backup", b"changed", &[])
+            .unwrap();
+        let target = mock.staging.join("staged");
+        assert!(client.download_to("backup", &target, &meta).is_err());
+        assert!(!target.exists());
+        let mut meta = client.head_object("backup").unwrap().unwrap();
+        meta.size += 1;
+        assert!(client.download_to("backup", &target, &meta).is_err());
+        assert!(!target.exists());
+        assert!(!target.with_extension("download").exists());
     }
 }

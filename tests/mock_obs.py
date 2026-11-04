@@ -17,7 +17,7 @@ Signature verification follows the documented rules:
   StringToSign = VERB\nContent-MD5\nContent-Type\nDate\nCanonicalizedHeaders\nCanonicalizedResource
 Any mismatch -> 403 SignatureDoesNotMatch (exactly what real OBS does).
 """
-import base64, hashlib, hmac, html, os, sys, threading
+import base64, hashlib, hmac, html, json, os, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, quote, unquote
 
@@ -43,6 +43,8 @@ SUBRES = {
     "response-expires", "response-cache-control", "response-content-disposition",
     "response-content-encoding",
 }
+
+FAULTS = json.loads(os.environ.get("OBS_MOCK_FAULTS", "[]"))
 
 FAILURES = []         # list of strings, dumped at exit / on /__stats
 
@@ -132,6 +134,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- auth ----------
     def check_auth(self, body):
+        key, query, _ = self.route()
+        with _lock:
+            for fault in FAULTS:
+                if (fault["method"] == self.command and fault["key"] == key
+                        and fault.get("count", 1) > 0
+                        and ("query" not in fault or fault["query"] in query)):
+                    fault["count"] = fault.get("count", 1) - 1
+                    self.send_empty(fault["status"])
+                    return False
         auth = self.headers.get("Authorization", "")
         raw_path, raw_query = self.path.split("?", 1) if "?" in self.path else (self.path, "")
         # Content-MD5 must match body when present
@@ -268,6 +279,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             data = OBJECTS[key]
             etag = hashlib.md5(data).hexdigest()
+            if self.headers.get("If-Match") not in (None, f'"{etag}"'):
+                self.send_empty(412)
+                return
             rng = self.headers.get("Range")
             if rng and rng.startswith("bytes="):
                 a, _, b = rng[6:].partition("-")
@@ -535,7 +549,7 @@ def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8899
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     srv.daemon_threads = True
-    print(f"mock obs on 127.0.0.1:{port}", flush=True)
+    print(f"mock obs on 127.0.0.1:{srv.server_port}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

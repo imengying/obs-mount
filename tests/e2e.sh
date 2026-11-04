@@ -154,12 +154,14 @@ printf 'ABCDEFGHIJ' >rg.txt
 eq "read from offset 3" "$(dd if=rg.txt bs=1 skip=3 count=4 2>/dev/null)" "DEFG"
 
 echo "== multipart upload >= 25 MB (obsfs threshold) =="
-head -c 31457280 /dev/urandom >big.bin
-eq "30 MiB md5" "$(md5sum big.bin | cut -d' ' -f1)" "$(md5sum <big.bin | cut -d' ' -f1)"
+head -c 31457280 /dev/urandom >"$WORK/big-source.bin"
+cp "$WORK/big-source.bin" big.bin
+eq "30 MiB md5 matches original" "$(md5sum big.bin | cut -d' ' -f1)" "$(md5sum "$WORK/big-source.bin" | cut -d' ' -f1)"
 
 echo "== exact threshold boundary (26214400 = 25 MB) =="
-head -c 26214400 /dev/urandom >exact.bin
-eq "25 MiB threshold boundary md5" "$(md5sum exact.bin | cut -d' ' -f1)" "$(md5sum <exact.bin | cut -d' ' -f1)"
+head -c 26214400 /dev/urandom >"$WORK/exact-source.bin"
+cp "$WORK/exact-source.bin" exact.bin
+eq "25 MiB md5 matches original" "$(md5sum exact.bin | cut -d' ' -f1)" "$(md5sum "$WORK/exact-source.bin" | cut -d' ' -f1)"
 
 echo "== delete =="
 rm rf2.txt
@@ -192,16 +194,8 @@ if [ "${total:-0}" -gt 0 ] && [ "${avail:-0}" -gt 0 ]; then
 else
   fail "df reports usable capacity" "total=$total avail=$avail" "both > 0"
 fi
-# `used` comes from OBS's bucket-wide figure, which is cached for 60 s, so it
-# reflects whatever was uploaded before the first statfs call in this mount.
-# Assert it is a sane number rather than a specific one.
-used=$(stat -f -c %b "$MNT")
-used=$(( used * blocksize ))
-if [ "${used:-0}" -gt 0 ]; then
-  pass "df reports non-zero used bytes"
-else
-  fail "df reports used bytes" "$used" "> 0"
-fi
+# cp can query statfs before uploading and cache an empty bucket for 60 s.
+# Check used bytes on the fresh path-style mount below, after data exists.
 # The kernel may substitute its own FUSE default for f_namemax, so only
 # assert that statvfs() itself works and reports the block size we set.
 bsize=$(python3 -c "import os;print(os.statvfs('$MNT').f_frsize)")
@@ -247,6 +241,16 @@ if [ "${OBS_E2E_REQUIRE_XATTR:-0}" = "1" ] && [ "$have_xattr" = "0" ]; then
 elif setfattr -n user.colour -v blue meta.txt 2>/dev/null; then
   eq "getfattr" "$(getfattr --only-values -n user.colour meta.txt 2>/dev/null)" "blue"
   eq "listxattr contains name" "$(getfattr -d meta.txt 2>/dev/null | grep -c user.colour)" "1"
+  # Expire userspace metadata and kernel attr caches, forcing a HEAD.
+  sleep 6
+  eq "xattr survives fresh HEAD" "$(getfattr --only-values -n user.colour meta.txt 2>/dev/null)" "blue"
+  before_owner=$(stat -c '%u:%g' meta.txt)
+  printf 'more' >>meta.txt
+  truncate -s 3 meta.txt
+  sleep 6
+  eq "rewrite keeps mode" "$(stat -c %a meta.txt)" "640"
+  eq "rewrite keeps owner" "$(stat -c '%u:%g' meta.txt)" "$before_owner"
+  eq "rewrite keeps xattr" "$(getfattr --only-values -n user.colour meta.txt 2>/dev/null)" "blue"
   # A second attribute must not clobber the first.
   setfattr -n user.owner -v alice meta.txt 2>/dev/null
   eq "two xattrs coexist" "$(getfattr -d meta.txt 2>/dev/null | grep -c 'user\.')" "2"
@@ -257,6 +261,8 @@ elif setfattr -n user.colour -v blue meta.txt 2>/dev/null; then
   eq "removexattr" "$(getfattr -d meta.txt 2>/dev/null | grep -c user.colour)" "0"
   eq "missing xattr reports ENODATA" \
     "$(getfattr -n user.nope meta.txt 2>&1 >/dev/null | grep -c 'No such attribute')" "1"
+elif [ "$have_xattr" = "1" ]; then
+  fail "setxattr succeeds" "setfattr failed" "success"
 else
   echo "  skip xattr (attr package missing)"
 fi
@@ -289,6 +295,15 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 if is_mounted "$PATH_MNT"; then
+  used_blocks=$(stat -f -c %b "$PATH_MNT")
+  free_blocks=$(stat -f -c %f "$PATH_MNT")
+  used=$(( (used_blocks - free_blocks) * blocksize ))
+  if [ "${used:-0}" -gt 0 ]; then
+    pass "fresh mount reports non-zero used bytes"
+  else
+    fail "fresh mount reports used bytes" "$used" "> 0"
+  fi
+  eq "fresh mount 30 MiB md5 matches original" "$(md5sum "$PATH_MNT/big.bin" | cut -d' ' -f1)" "$(md5sum "$WORK/big-source.bin" | cut -d' ' -f1)"
   echo hello-path >"$PATH_MNT/p.txt"
   eq "path-style write/read" "$(cat "$PATH_MNT/p.txt")" "hello-path"
   fusermount3 -u "$PATH_MNT" 2>/dev/null || fusermount -u "$PATH_MNT" 2>/dev/null || umount -l "$PATH_MNT" 2>/dev/null

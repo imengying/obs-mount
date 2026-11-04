@@ -1,5 +1,7 @@
 mod fs;
 mod obs;
+#[cfg(test)]
+mod test_support;
 
 use clap::Parser;
 use fs::ObsFs;
@@ -205,13 +207,6 @@ fn main() -> anyhow::Result<()> {
             "multipart_threshold must not be 0 (a 0-byte threshold would send even empty files as multipart)"
         );
     }
-    // Staging is not configurable: always under the system temp dir
-    // (std::env::temp_dir(), i.e. $TMPDIR or /tmp on Linux), so a
-    // half-written file never needs a hand-picked directory.
-    // Per-uid directory in the system temp dir. A single shared name would be
-    // owned by whoever mounted first, and a second user could then neither
-    // create nor clean staging files in it.
-    let staging_dir = staging_dir_for(&std::env::temp_dir(), current_uid());
     let client = ObsClient::new(ak, sk, bucket.clone(), endpoint.clone());
     tracing::info!(
         endpoint = %endpoint,
@@ -273,6 +268,17 @@ fn main() -> anyhow::Result<()> {
         part_size = upload.part_size,
         "upload tuning"
     );
+    let temp_dir = std::env::temp_dir();
+    match existing_staging_dirs(&temp_dir, current_uid()) {
+        Ok(dirs) => {
+            for dir in dirs {
+                tracing::warn!(path = %dir.display(), "existing staging directory; may belong to a running mount or contain recovery data; inspect before manual cleanup");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not check existing staging directories"),
+    }
+    let staging_dir = staging_dir_for(&temp_dir, current_uid())?;
+    tracing::info!(path = %staging_dir.display(), "private staging directory; failed uploads are retained here");
     let fs = ObsFs::new(client, staging_dir, upload);
     // Access control matches obsfs: unless the user explicitly asks to share
     // the mount, only the mounting user may touch it.
@@ -329,18 +335,52 @@ fn current_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Staging directory for this user, created with 0700.
-///
-/// `/tmp/obs-mount-staging-<uid>` rather than one shared path: temp dirs are
-/// world-writable, so a fixed name would let one user's leftover files (or a
-/// file planted by someone else) sit in another user's staging area.
-fn staging_dir_for(base: &std::path::Path, uid: u32) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = base.join(format!("obs-mount-staging-{uid}"));
-    let _ = std::fs::create_dir_all(&dir);
-    // Best effort: tighten the mode even if the directory already existed.
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    dir
+/// Discover this user's sessions without touching their contents. Even an
+/// empty directory can belong to a live mount, so startup only reports it.
+fn existing_staging_dirs(base: &std::path::Path, uid: u32) -> std::io::Result<Vec<PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+    let prefix = format!("obs-mount-staging-{uid}-");
+    let mut dirs = Vec::new();
+    for entry in std::fs::read_dir(base)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if metadata.is_dir() && metadata.uid() == uid {
+            dirs.push(entry.path());
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+/// Allocate a private directory atomically for each mount. Never reuse or
+/// remove earlier sessions: they may contain the only copy of an upload.
+fn staging_dir_for(base: &std::path::Path, uid: u32) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    loop {
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = base.join(format!(
+            "obs-mount-staging-{uid}-{}-{stamp}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -371,5 +411,48 @@ mod tests {
         let ok = "mountpoint: /mnt/obs\nbucket: b\nmultipart_threshold: 26214400\n";
         let cfg = serde_yaml::from_str::<FileConfig>(ok).unwrap();
         assert_eq!(cfg.multipart_threshold, Some(26_214_400));
+    }
+
+    #[test]
+    fn staging_sessions_are_private_and_do_not_reuse_old_data() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir();
+        let first = staging_dir_for(&base, current_uid()).unwrap();
+        std::fs::write(first.join("ino-2"), b"unsent backup").unwrap();
+        let second = staging_dir_for(&base, current_uid()).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(base.as_path()));
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::read(first.join("ino-2")).unwrap(),
+            b"unsent backup"
+        );
+        std::fs::remove_dir_all(first).unwrap();
+        std::fs::remove_dir_all(second).unwrap();
+    }
+
+    #[test]
+    fn startup_reports_sessions_without_deleting_data_or_live_directories() {
+        let uid = current_uid();
+        let base = staging_dir_for(&std::env::temp_dir(), uid).unwrap();
+        let empty = staging_dir_for(&base, uid).unwrap();
+        let pending = staging_dir_for(&base, uid).unwrap();
+        std::fs::write(pending.join("ino-2"), b"unsent backup").unwrap();
+        std::os::unix::fs::symlink(&pending, base.join(format!("obs-mount-staging-{uid}-link")))
+            .unwrap();
+        std::fs::create_dir(base.join("unrelated")).unwrap();
+        std::fs::create_dir(base.join(format!("obs-mount-staging-{}-other", uid + 1))).unwrap();
+        let mut expected = vec![empty.clone(), pending.clone()];
+        expected.sort();
+        assert_eq!(existing_staging_dirs(&base, uid).unwrap(), expected);
+        assert!(empty.is_dir());
+        assert_eq!(
+            std::fs::read(pending.join("ino-2")).unwrap(),
+            b"unsent backup"
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
