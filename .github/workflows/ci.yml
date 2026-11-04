@@ -89,14 +89,15 @@ jobs:
           OBS_MOUNT_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/obs-mount
         run: OBS_E2E_REQUIRE_XATTR=1 ./tests/e2e.sh
 
-      # Ship a tarball with `obs` at its root, so unpacking it and pointing
-      # ExecStart= at the result needs no renaming step.
+      # Everything needed at the archive root: the binary, so ExecStart= needs
+      # no rename, and a config template, so there is no separate download.
       - name: Package as tar.gz
         run: |
           set -eux
           mkdir -p pkg
           install -m 0755 target/x86_64-unknown-linux-musl/release/obs-mount pkg/obs
-          tar -C pkg -czf obs-mount-x86_64-linux-musl.tar.gz obs
+          install -m 0644 obs-mount.yaml.example pkg/obs-mount.yaml.example
+          tar -C pkg -czf obs-mount-x86_64-linux-musl.tar.gz obs obs-mount.yaml.example
           tar -tzvf obs-mount-x86_64-linux-musl.tar.gz
 
       - name: Upload tarball
@@ -130,7 +131,8 @@ jobs:
           tar -xzf dist/obs-mount-x86_64-linux-musl.tar.gz -C dist
           test -x dist/obs
           ./dist/obs --version
-          rm dist/obs
+          test -f dist/obs-mount.yaml.example
+          rm dist/obs dist/obs-mount.yaml.example
           ls -l dist
 
       # GitHub attaches checksums for release assets itself, so no

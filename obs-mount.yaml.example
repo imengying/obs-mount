@@ -1,13 +1,12 @@
-# 复制到 /etc/obs/obs-mount.yaml 并 chmod 600，填入真实值。
-# 用 IAM 子账号 + 仅该桶权限，不要用主账号 AK/SK。
+# 复制一份，填好 AK/SK、桶和 endpoint，然后 chmod 600 再使用。
+# 建议用 IAM 子账号，只授予该桶的权限，不要用主账号 AK/SK。
 mountpoint: /mnt/obs
 bucket: your-bucket-name
 
-# endpoint 两种写法，程序按 host 自动选择寻址方式：
-#   桶虚拟主机式 https://<bucket>.obs.<region>.myhuaweicloud.com
-#   服务级       https://obs.<region>.myhuaweicloud.com （自动走 /<bucket>/<key>）
-# IP 或自定义域名同样走路径式。
-endpoint: https://your-bucket-name.obs.cn-north-4.myhuaweicloud.com
+# 服务级端点即可，程序会自动补成 <bucket>.obs.<region>.myhuaweicloud.com：
+#   https://obs.cn-north-4.myhuaweicloud.com
+# 也可以直接写带桶的虚拟主机式地址。IP 端点（自建网关、MinIO 等）自动用路径式。
+endpoint: https://obs.cn-north-4.myhuaweicloud.com
 
 ak: YOUR_ACCESS_KEY_HERE
 sk: YOUR_SECRET_KEY_HERE

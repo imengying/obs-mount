@@ -7,7 +7,7 @@
 [OBS API 参考](https://support.huaweicloud.com/api-obs/obs_04_0011.html)。
 
 ```sh
-# 从 release 下载，包内根目录就是 obs
+# 包内是 obs 和 obs-mount.yaml.example，解压即可执行
 tar -xzf obs-mount-x86_64-linux-musl.tar.gz
 sudo install -m 0755 obs /etc/obs/obs
 sudo install -m 0600 obs-mount.yaml.example /etc/obs/obs.yaml   # 填 AK/SK、桶、endpoint
@@ -15,7 +15,8 @@ sudo apt-get install -y fuse3                                   # fusermount
 /etc/obs/obs -c /etc/obs/obs.yaml
 ```
 
-源码构建：`cargo build --release`，产物是 `target/release/obs-mount`。
+源码构建：`cargo build --release`，产物是 `target/release/obs-mount`（这个需要 `chmod +x`，
+tar 包里的 `obs` 已经是 0755）。
 
 ## 配置
 
@@ -194,7 +195,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now obs
 卸载：`systemctl stop obs-mount`。进程退出时由 fusermount 自动摘除挂载，
 所以 unit 文件里不需要写挂载点，`systemctl stop` 对任何配置路径都成立。
 
-**访问权限**：只有挂载者本人能访问，与 obsfs 一致（它的 `allow_other` 也默认关闭）。
+**访问权限**：挂载对所有本地用户开放（`allow_other`），便于 OpenList、nginx、rsync
+这类以别的用户运行的服务读取同一个桶。以 root 挂载不需要额外配置；普通用户挂载需要
+在 `/etc/fuse.conf` 里加一行 `user_allow_other`，否则 fusermount 会拒绝。
 
 ## 验证状态
 

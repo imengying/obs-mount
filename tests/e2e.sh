@@ -111,6 +111,29 @@ if ! is_mounted "$MNT"; then
   exit 1
 fi
 
+# Every session asks for allow_other so other local services can read the
+# mount. root may do that freely; an unprivileged mount needs
+# user_allow_other in /etc/fuse.conf, and must say so clearly instead of
+# failing with a bare exit status.
+echo "== another user can read the mount =="
+if [ "$(id -u)" = "0" ] && [ -z "${OBS_E2E_SKIP_UNPRIV:-}" ]; then
+  OTHER=obs_e2e_user
+  id "$OTHER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$OTHER" 2>/dev/null || true
+  if id "$OTHER" >/dev/null 2>&1; then
+    # mktemp -d is 0700 root, so the second user cannot even reach $MNT.
+    # Open it up: the point is to test FUSE's allow_other, not directory modes.
+    chmod 755 "$WORK" "$MNT"
+    echo hello-from-root >"$MNT/shared.txt"
+    out=$(su -s /bin/bash "$OTHER" -c "cat $MNT/shared.txt" 2>&1)
+    eq "second user reads a root mount" "$out" "hello-from-root"
+    out=$(su -s /bin/bash "$OTHER" -c "echo from-other > $MNT/shared2.txt && cat $MNT/shared2.txt" 2>&1)
+    eq "second user writes to a root mount" "$out" "from-other"
+    rm -f "$MNT/shared.txt" "$MNT/shared2.txt"
+  else
+    echo "  skip second-user access (cannot create a test user)"
+  fi
+fi
+
 cd "$MNT" || exit 1
 
 echo "== basics =="
@@ -313,17 +336,12 @@ else
 fi
 kill "$path_pid" 2>/dev/null
 
-# --- unprivileged mount --------------------------------------------------
-# Running as a normal user used to fail outright: the session ACL asked for
-# allow_other, which fusermount rejects without user_allow_other in
-# /etc/fuse.conf, and auto_unmount is not available for an owner-only
-# session. Both are now chosen from the effective uid.
 echo "== mount is read-write =="
 opts=$(grep -F " $MNT " /proc/self/mountinfo | sed 's/.* - [^ ]* //')
 opts_rw=$(printf '%s' "$opts" | grep -c '\brw\b' || true)
 eq "mount is read-write" "$opts_rw" "1"
 
-echo "== unprivileged mount (non-root, no user_allow_other) =="
+echo "== unprivileged mount =="
 if [ "$(id -u)" = "0" ] && [ -z "${OBS_E2E_SKIP_UNPRIV:-}" ]; then
   TESTUSER=obs_e2e_user
   if ! id "$TESTUSER" >/dev/null 2>&1; then
@@ -354,9 +372,20 @@ EOF
       out=$(su -s /bin/bash "$TESTUSER" -c "echo hi > $UMNT/u.txt && cat $UMNT/u.txt" 2>&1)
       eq "non-root write/read" "$out" "hi"
       fusermount3 -u "$UMNT" 2>/dev/null || fusermount -u "$UMNT" 2>/dev/null || umount -l "$UMNT" 2>/dev/null
-    else
+    elif grep -q "^[[:space:]]*user_allow_other" /etc/fuse.conf 2>/dev/null; then
+      # user_allow_other is actually set (not just mentioned in a comment),
+      # so the mount had no excuse to fail.
       fail "unprivileged mount" "not mounted" "mounted"
       tail -5 "$WORK/unpriv.log"
+    else
+      # Expected: fusermount refuses allow_other without that line. The point
+      # is that the failure names the fix rather than exiting silently.
+      if grep -q "user_allow_other" "$WORK/unpriv.log"; then
+        pass "unprivileged mount explains the fuse.conf requirement"
+      else
+        fail "unprivileged mount diagnostics" "no user_allow_other hint" "hint printed"
+        tail -5 "$WORK/unpriv.log"
+      fi
     fi
     kill "$unpriv_pid" 2>/dev/null
   else

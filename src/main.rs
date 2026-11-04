@@ -272,6 +272,14 @@ fn main() -> anyhow::Result<()> {
     match existing_staging_dirs(&temp_dir, current_uid()) {
         Ok(dirs) => {
             for dir in dirs {
+                // A session that exited cleanly leaves an empty directory
+                // behind, because SIGTERM kills the process before ObsFs can
+                // run its Drop. Those carry nothing, so removing them keeps
+                // the warning meaningful for sessions that did keep data.
+                if is_empty_dir(&dir) {
+                    let _ = std::fs::remove_dir(&dir);
+                    continue;
+                }
                 tracing::warn!(path = %dir.display(), "existing staging directory; may belong to a running mount or contain recovery data; inspect before manual cleanup");
             }
         }
@@ -280,37 +288,20 @@ fn main() -> anyhow::Result<()> {
     let staging_dir = staging_dir_for(&temp_dir, current_uid())?;
     tracing::info!(path = %staging_dir.display(), "private staging directory; failed uploads are retained here");
     let fs = ObsFs::new(client, staging_dir, upload);
-    // Access control matches obsfs: unless the user explicitly asks to share
-    // the mount, only the mounting user may touch it.
+    // Every local user may use the mount. This is a personal backup mount
+    // shared with other services on the same box (OpenList, nginx, rsync),
+    // and an owner-only session silently locks them out with EACCES.
     //
-    // fuser renders both `All` and `RootAndOwner` as the kernel's
-    // `allow_other`, which fusermount rejects for a non-root user unless
-    // /etc/fuse.conf says user_allow_other -- so asking for it by default
-    // made every unprivileged mount fail. obsfs keeps allow_other off unless
-    // `-o allow_other` is passed (hws_s3fs.cpp:210, `static bool allow_other
-    // = false`), and this does the same.
-    // Access control: allow only the mounting user, like obsfs (whose
-    // allow_other defaults to off, hws_s3fs.cpp:210). fuser maps both `All`
-    // and `RootAndOwner` onto the kernel's allow_other, which fusermount
-    // rejects for a non-root user unless /etc/fuse.conf opts in -- but it is
-    // fine as root, and root only is also what makes auto_unmount available.
-    let is_root = current_uid() == 0;
-    let acl = if is_root {
-        fuser::SessionACL::RootAndOwner
-    } else {
-        fuser::SessionACL::Owner
-    };
-    let mut mount_options = vec![MountOption::FSName("obs-mount".to_string())];
-    // auto_unmount needs a session other than Owner: fusermount holds the
-    // mount open and detaches it when this process dies, including on
-    // SIGTERM/SIGKILL. Without it a `systemctl stop` would leave a stale
-    // mountpoint behind, and cleaning that up would require knowing the
-    // mountpoint -- which only the config knows, not the unit file.
-    if acl == fuser::SessionACL::Owner {
-        tracing::debug!("unprivileged mount: auto_unmount unavailable with an owner-only session");
-    } else {
-        mount_options.push(MountOption::AutoUnmount);
-    }
+    // auto_unmount needs a session other than Owner, so All gives both. It
+    // makes fusermount hold the mount and detach it when this process dies,
+    // including on SIGTERM/SIGKILL -- without it a `systemctl stop` leaves a
+    // stale mountpoint behind, and cleaning that up would need the mountpoint,
+    // which only the config knows, not the unit file.
+    let acl = fuser::SessionACL::All;
+    let mount_options = vec![
+        MountOption::FSName("obs-mount".to_string()),
+        MountOption::AutoUnmount,
+    ];
     // Config is #[non_exhaustive], so build it from Default and mutate.
     let mut config = fuser::Config::default();
     config.mount_options = mount_options;
@@ -321,8 +312,10 @@ fn main() -> anyhow::Result<()> {
             "  If /dev/fuse exists, the fusermount helper is missing: \
              apt-get install fuse3."
         } else if msg.contains("allow_other") {
+            // Only an unprivileged mount can hit this: fusermount refuses
+            // allow_other for non-root unless /etc/fuse.conf opts in.
             "  fusermount refused allow_other: add `user_allow_other` to \
-             /etc/fuse.conf, or run as root."
+             /etc/fuse.conf, or mount as root."
         } else {
             ""
         };
@@ -357,6 +350,11 @@ fn existing_staging_dirs(base: &std::path::Path, uid: u32) -> std::io::Result<Ve
     }
     dirs.sort();
     Ok(dirs)
+}
+
+/// Whether a directory has no entries at all.
+fn is_empty_dir(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// Allocate a private directory atomically for each mount. Never reuse or
