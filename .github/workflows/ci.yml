@@ -18,20 +18,41 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Fast feedback: formatting, lint, tests, and the release build everyone
-  # actually deploys (dynamically linked glibc, matching `cargo build --release`).
-  check:
-    name: fmt / clippy / test / build (glibc)
+  # One build, one artifact: a fully static musl binary built on Debian 13.
+  # Nothing links against the host's glibc, so there is no glibc version to
+  # track and the result runs on any x86_64 Linux.
+  build:
+    name: build & test (Debian 13, static)
     runs-on: ubuntu-latest
+    container: debian:trixie-slim
     steps:
+      - name: Install build dependencies
+        run: |
+          set -eux
+          apt-get update
+          # fuse3/attr: the e2e test mounts a real FUSE filesystem and sets
+          # xattrs. curl: the rustup installer. file/binutils: verify the
+          # binary really is static.
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential cmake musl-tools perl \
+            pkg-config file binutils fuse3 attr
+          rm -rf /var/lib/apt/lists/*
+
       - uses: actions/checkout@v7
 
-      # rust-toolchain.toml pins channel + components, so this just needs to
-      # install whatever it says.
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (musl target)
+        run: |
+          set -eux
+          # rust-toolchain.toml supplies the channel and components; only the
+          # musl target has to be added here.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: musl
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -42,32 +63,31 @@ jobs:
       - name: cargo test
         run: cargo test --all-features
 
-      - name: cargo build --release
+      - name: Build static binary
         env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           # A tag build stamps its version into the binary so `--version`
           # matches the release name; branch builds fall back to Cargo.toml.
           OBS_MOUNT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-        run: cargo build --release
+        run: cargo build --release --target x86_64-unknown-linux-musl
 
-      - name: Binary sanity check
+      - name: Verify the binary
         run: |
           set -eux
-          ./target/release/obs-mount --version
-          ./target/release/obs-mount --help > /dev/null
-          # Mounting is impossible on a CI runner; make sure the failure is a
-          # clear configuration error, not a crash or a panic.
-          ./target/release/obs-mount 2>&1 | grep -qi "not set" || {
+          bin=target/x86_64-unknown-linux-musl/release/obs-mount
+          file "$bin"
+          ldd "$bin" 2>&1 | grep -q "statically linked"
+          "$bin" --version
+          "$bin" --help > /dev/null
+          # A missing configuration must be a clear error, not a panic.
+          "$bin" 2>&1 | grep -qi "not set" || {
             echo "expected a missing-configuration error"; exit 1; }
 
-      # GitHub's ubuntu runners expose /dev/fuse and allow unprivileged FUSE
-      # mounts, so the mock-server end-to-end test can run here. It skips
-      # itself when /dev/fuse is missing.
       - name: End-to-end test against mock OBS
+        env:
+          OBS_MOUNT_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/obs-mount
         run: |
-          sudo apt-get update
-          # fuse3 provides fusermount; attr provides setfattr/getfattr so the
-          # xattr assertions actually run instead of silently skipping.
-          sudo apt-get install -y --no-install-recommends fuse3 attr
           set +e
           OBS_E2E_REQUIRE_XATTR=1 ./tests/e2e.sh >"$RUNNER_TEMP/e2e.log" 2>&1
           status=$?
@@ -82,71 +102,6 @@ jobs:
           path: ${{ runner.temp }}/e2e.log
           if-no-files-found: ignore
 
-      - name: Upload glibc binary
-        if: success()
-        uses: actions/upload-artifact@v7
-        with:
-          name: obs-mount-x86_64-linux-gnu
-          path: target/release/obs-mount
-          if-no-files-found: error
-
-  # Fully static binary. Debian 13 (trixie) already ships musl-tools, so the
-  # zig cross-compiler dance the README used to describe is unnecessary: the
-  # only C dependency in the tree is aws-lc-sys (via rustls), and musl-gcc is
-  # enough for it. Proven locally on trixie with musl-tools 1.2.5.
-  static:
-    name: static build (musl)
-    runs-on: ubuntu-latest
-    container: debian:trixie-slim
-    steps:
-      - name: Install build dependencies
-        run: |
-          set -eux
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates \
-            curl \
-            build-essential \
-            cmake \
-            musl-tools \
-            perl \
-            pkg-config \
-            git \
-            file \
-            binutils
-          rm -rf /var/lib/apt/lists/*
-
-      - uses: actions/checkout@v7
-
-      - name: Install Rust (musl target)
-        run: |
-          set -eux
-          # rust-toolchain.toml supplies channel + components; only the target
-          # has to be added here.
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustup" target add x86_64-unknown-linux-musl
-
-      - uses: Swatinem/rust-cache@v2.9.3
-        with:
-          key: musl
-
-      - name: Build static binary
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          OBS_MOUNT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-        run: cargo build --release --target x86_64-unknown-linux-musl
-
-      - name: Verify it is really static
-        run: |
-          set -eux
-          bin=target/x86_64-unknown-linux-musl/release/obs-mount
-          file "$bin"
-          ldd "$bin" 2>&1 | grep -q "statically linked"
-          "$bin" --version
-
       - name: Upload static binary
         uses: actions/upload-artifact@v7
         with:
@@ -154,12 +109,11 @@ jobs:
           path: target/x86_64-unknown-linux-musl/release/obs-mount
           if-no-files-found: error
 
-  # Publishing happens only for a v* tag. The binaries were stamped with that
-  # tag name during the build, so their `--version` always matches the release
-  # no matter what Cargo.toml says.
+  # Publishing happens only for a v* tag. The binary was stamped with that tag
+  # name during the build, so `--version` always matches the release.
   release:
     name: publish release
-    needs: [check, static]
+    needs: [build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -169,12 +123,10 @@ jobs:
         with:
           path: artifacts
 
-      - name: Collect binaries
+      - name: Collect binary
         run: |
           set -eux
           mkdir -p dist
-          install -m 0755 artifacts/obs-mount-x86_64-linux-gnu/obs-mount \
-            dist/obs-mount-x86_64-linux-gnu
           install -m 0755 artifacts/obs-mount-x86_64-linux-musl/obs-mount \
             dist/obs-mount-x86_64-linux-musl
           ls -l dist
@@ -183,8 +135,6 @@ jobs:
       # hand-rolled SHA256SUMS file is published here.
       - uses: softprops/action-gh-release@v3
         with:
-          files: |
-            dist/obs-mount-x86_64-linux-gnu
-            dist/obs-mount-x86_64-linux-musl
+          files: dist/obs-mount-x86_64-linux-musl
           generate_release_notes: true
           fail_on_unmatched_files: true

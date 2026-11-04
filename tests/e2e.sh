@@ -303,6 +303,16 @@ kill "$path_pid" 2>/dev/null
 # allow_other, which fusermount rejects without user_allow_other in
 # /etc/fuse.conf, and auto_unmount is not available for an owner-only
 # session. Both are now chosen from the effective uid.
+echo "== mount is owner-only (no allow_other by default, like obsfs) =="
+opts=$(grep -F " $MNT " /proc/self/mountinfo | sed 's/.* - [^ ]* //')
+if printf '%s' "$opts" | grep -q "allow_other"; then
+  fail "mount options carry allow_other" "$opts" "owner-only"
+else
+  pass "mount options are owner-only"
+fi
+opts_rw=$(printf '%s' "$opts" | grep -c '\brw\b' || true)
+eq "mount is read-write" "$opts_rw" "1"
+
 echo "== unprivileged mount (non-root, no user_allow_other) =="
 if [ "$(id -u)" = "0" ] && [ -z "${OBS_E2E_SKIP_UNPRIV:-}" ]; then
   TESTUSER=obs_e2e_user

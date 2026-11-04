@@ -11,10 +11,9 @@ Type=simple
 #   install -m 0755 target/release/obs-mount /etc/obs/obs-mount
 #   install -m 0600 obs-mount.yaml.example /etc/obs/obs-mount.yaml  # 填入真实值
 ExecStart=/etc/obs/obs-mount --config /etc/obs/obs-mount.yaml
-# Requires the fuse3 package (fusermount helper). Debian installs it as
-# /usr/bin/fusermount3; older releases use /bin/fusermount. Adjust if needed;
-# with auto_unmount enabled the helper also detaches the mount on exit, so
-# a failure here is not fatal.
+# Debian installs the helper as /usr/bin/fusermount3; older releases use
+# /bin/fusermount. Adjust if needed. The process unmounts on a clean exit, so
+# this only matters for a stuck or killed service.
 ExecStop=-/usr/bin/fusermount3 -u /mnt/obs
 Restart=on-failure
 RestartSec=10

@@ -127,20 +127,21 @@ obsfs 把文件内容缓存到本地磁盘，第二遍读完全不联网；备�
 
 ## 构建
 
-需要 Rust stable（edition 2024，MSRV 1.85）。CI 在 `debian:trixie-slim` 里跑静态构建。
+需要 Rust stable（edition 2024，MSRV 1.85）。发布产物是全静态 musl 构建，
+不依赖目标机的 glibc：
 
 ```sh
-cargo build --release                              # 动态链接
-
-sudo apt-get install -y musl-tools                 # 全静态
+sudo apt-get install -y musl-tools
 rustup target add x86_64-unknown-linux-musl
 CC_x86_64_unknown_linux_musl=musl-gcc \
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
   cargo build --release --target x86_64-unknown-linux-musl
+# 产物：target/x86_64-unknown-linux-musl/release/obs-mount
 ```
 
 fuser 不链接 libfuse（直接读写 `/dev/fuse`），树里唯一的 C 依赖是 rustls 的
-`aws-lc-sys`，`musl-tools` 足够，不需要 zig。
+`aws-lc-sys`，`musl-tools` 足够，不需要 zig。`cargo build --release` 的动态
+版本仅供开发调试，不发布。
 
 ## 发布
 
@@ -150,8 +151,10 @@ fuser 不链接 libfuse（直接读写 `/dev/fuse`），树里唯一的 C 依赖
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-产物：`obs-mount-x86_64-linux-gnu`（需 glibc ≥ 2.39）、
-`obs-mount-x86_64-linux-musl`（全静态）。
+产物：`obs-mount-x86_64-linux-musl`，全静态，拷到任意 x86_64 Linux 即可运行。
+
+CI 在 `debian:trixie-slim` 里完成构建、单元测试和端到端测试，
+发布的就是这一个静态二进制。
 
 ## 部署
 
@@ -165,7 +168,11 @@ sudo systemctl daemon-reload && sudo systemctl enable --now obs-mount
 ```
 
 卸载：`systemctl stop obs-mount` 或 `fusermount -u /mnt/obs`。
-缺 `fusermount` 时仍可挂载，只是没有 `auto_unmount` 且需手动 `umount`。
+
+**访问权限**：默认只有挂载者本人能访问，与 obsfs 一致（它也是 `allow_other`
+默认关闭）。这是 FUSE 的 owner-only 模式，不需要 `/etc/fuse.conf` 里配
+`user_allow_other`，所以普通用户也能直接挂载。进程正常退出时 fuser 会自动卸载；
+被 `SIGKILL` 杀掉则需手动 `umount`。
 
 ## 验证状态
 
