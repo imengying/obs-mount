@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/etc/obs/obs-mount -c /etc/obs/obs-mount.yaml
+ExecStart=/etc/obs/obs -c /etc/obs/obs.yaml
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

@@ -7,16 +7,19 @@
 [OBS API 参考](https://support.huaweicloud.com/api-obs/obs_04_0011.html)。
 
 ```sh
-sudo apt-get install -y fuse3 attr        # fusermount、setfattr/getfattr
-cargo build --release
-sudo install -m 0755 target/release/obs-mount /etc/obs/obs-mount
-sudo install -m 0600 obs-mount.yaml.example /etc/obs/obs-mount.yaml   # 填 AK/SK、桶、endpoint
-obs-mount -c /etc/obs/obs-mount.yaml
+# 从 release 下载，包内根目录就是 obs
+tar -xzf obs-mount-x86_64-linux-musl.tar.gz
+sudo install -m 0755 obs /etc/obs/obs
+sudo install -m 0600 obs-mount.yaml.example /etc/obs/obs.yaml   # 填 AK/SK、桶、endpoint
+sudo apt-get install -y fuse3                                   # fusermount
+/etc/obs/obs -c /etc/obs/obs.yaml
 ```
+
+源码构建：`cargo build --release`，产物是 `target/release/obs-mount`。
 
 ## 配置
 
-YAML，默认 `/etc/obs/obs-mount.yaml`，可用 `-c` 指定。优先级：命令行 > 环境变量 > 文件。
+YAML，默认 `/etc/obs/obs.yaml`，可用 `-c` 指定。优先级：命令行 > 环境变量 > 文件。
 未知字段启动即报错。模板见 `obs-mount.yaml.example`，含凭据的文件用 0600。
 
 | 字段 | 环境变量 | 说明 |
@@ -177,11 +180,12 @@ CI 在 `debian:trixie-slim` 里完成构建、单元测试和端到端测试，
 
 ```sh
 sudo apt-get install -y fuse3
-sudo install -m 0755 target/release/obs-mount /etc/obs/obs-mount
-sudo install -m 0644 obs-mount.service /etc/systemd/system/obs-mount.service
-sudo install -m 0600 obs-mount.yaml.example /etc/obs/obs-mount.yaml
+tar -xzf obs-mount-x86_64-linux-musl.tar.gz
+sudo install -m 0755 obs /etc/obs/obs
+sudo install -m 0600 obs-mount.yaml.example /etc/obs/obs.yaml
+sudo install -m 0644 obs-mount.service /etc/systemd/system/obs.service
 sudo mkdir -p /mnt/obs
-sudo systemctl daemon-reload && sudo systemctl enable --now obs-mount
+sudo systemctl daemon-reload && sudo systemctl enable --now obs
 ```
 
 卸载：`systemctl stop obs-mount`。进程退出时由 fusermount 自动摘除挂载，

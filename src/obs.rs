@@ -443,7 +443,7 @@ impl ObsClient {
         content_md5: &str,
         content_type: &str,
         extra_x_obs: &[(String, String)],
-    ) -> (String, String, String, Vec<(String, String)>) {
+    ) -> (String, String, Vec<(String, String)>) {
         let date = rfc1123_now();
         let mut x_obs: Vec<(String, String)> = vec![("x-obs-date".to_string(), date.clone())];
         for (k, v) in extra_x_obs {
@@ -471,7 +471,13 @@ impl ObsClient {
             method,
             content_md5,
             content_type,
-            &date,
+            // Empty on purpose: the date travels in `x-obs-date` instead.
+            // OBS fills the StringToSign Date slot only when that header is
+            // absent; sending both leaves the server signing an empty slot
+            // while we signed a populated one, and every request comes back
+            // SignatureDoesNotMatch. The error body shows what the server
+            // used: "GET\n\n\n\nx-obs-date:..." -- four newlines, no date.
+            "",
             &x_obs,
             &resource,
         );
@@ -483,7 +489,7 @@ impl ObsClient {
         };
         // The canonical resource above is always /<bucket>/<key>; only the
         // URL shape differs between virtual-hosted and path-style requests.
-        (url, auth, date, x_obs)
+        (url, auth, x_obs)
     }
 
     // One call = one signed request; grouping these fields into a struct
@@ -506,7 +512,7 @@ impl ObsClient {
             .unwrap_or_default();
         // Only send Content-MD5 when there is a body; otherwise the signed
         // value must stay empty or the signature will not match.
-        let (url, auth, date, x_obs) = self.sign(
+        let (url, auth, x_obs) = self.sign(
             method,
             key,
             query,
@@ -525,8 +531,10 @@ impl ObsClient {
                     reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
                     &url,
                 )
-                .header("Authorization", &auth)
-                .header("Date", &date);
+                .header("Authorization", &auth);
+            // No `Date` header: `x-obs-date` below carries it, and sending
+            // both makes reqwest and OBS disagree about which one is
+            // canonical.
             for (k, v) in &x_obs {
                 req = req.header(k.as_str(), v.as_str());
             }
@@ -1306,6 +1314,35 @@ mod tests {
         );
         assert_eq!(a, b);
         assert!(!a.is_empty());
+    }
+
+    /// Production OBS rejected every request with a signature that signed a
+    /// populated Date slot while also sending x-obs-date. Nothing caught it
+    /// because the mock preferred `Date` too. Pin the rule here.
+    #[test]
+    fn request_never_signs_a_date_when_x_obs_date_is_sent() {
+        let client = ObsClient::new(
+            "AK".into(),
+            "SK".into(),
+            "hkobs".into(),
+            "https://obs.ap-southeast-1.myhuaweicloud.com".into(),
+        );
+        let (_, auth, x_obs) = client.sign("GET", "", "", "", "", &[]);
+        let date = x_obs
+            .iter()
+            .find(|(k, _)| k == "x-obs-date")
+            .map(|(_, v)| v.clone())
+            .expect("x-obs-date is always sent");
+        // What the client actually signed, rebuilt the way OBS rebuilds it.
+        let signed_date_slot_is_empty = obs_signature("SK", "GET", "", "", "", &x_obs, "/hkobs/");
+        assert_eq!(auth, format!("OBS AK:{signed_date_slot_is_empty}"));
+        // Signing the date into the slot instead must produce something else,
+        // otherwise this test would pass no matter what the code does.
+        assert_ne!(
+            obs_signature("SK", "GET", "", "", &date, &x_obs, "/hkobs/"),
+            signed_date_slot_is_empty,
+            "a populated Date slot must not match what OBS expects"
+        );
     }
 
     #[test]

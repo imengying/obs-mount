@@ -75,9 +75,13 @@ def expected_signature(handler, raw_path, raw_query, body, scheme="OBS"):
     verb = handler.command
     content_md5 = handler.headers.get("Content-MD5", "") or ""
     content_type = handler.headers.get("Content-Type", "") or ""
-    date = handler.headers.get("Date", "") or ""
-    if not date:
-        date = handler.headers.get("x-obs-date", "") or ""
+    # Real OBS leaves the Date slot empty whenever x-obs-date is present, and
+    # dates only through the header. Preferring `Date` here (as this fixture
+    # used to) hides a client that signs a populated Date slot: the fixture
+    # agrees with it while production OBS rejects every request.
+    date = ""
+    if not handler.headers.get("x-obs-date"):
+        date = handler.headers.get("Date", "") or ""
     xobs = []
     # OBS native signing covers x-obs-*; the S3-compatible flavour obsfs uses
     # covers x-amz-*. Whichever prefix the caller signs with must be the same

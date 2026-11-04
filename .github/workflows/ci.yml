@@ -89,11 +89,21 @@ jobs:
           OBS_MOUNT_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/obs-mount
         run: OBS_E2E_REQUIRE_XATTR=1 ./tests/e2e.sh
 
-      - name: Upload static binary
+      # Ship a tarball with `obs` at its root, so unpacking it and pointing
+      # ExecStart= at the result needs no renaming step.
+      - name: Package as tar.gz
+        run: |
+          set -eux
+          mkdir -p pkg
+          install -m 0755 target/x86_64-unknown-linux-musl/release/obs-mount pkg/obs
+          tar -C pkg -czf obs-mount-x86_64-linux-musl.tar.gz obs
+          tar -tzvf obs-mount-x86_64-linux-musl.tar.gz
+
+      - name: Upload tarball
         uses: actions/upload-artifact@v7
         with:
           name: obs-mount-x86_64-linux-musl
-          path: target/x86_64-unknown-linux-musl/release/obs-mount
+          path: obs-mount-x86_64-linux-musl.tar.gz
           if-no-files-found: error
 
   # Publishing happens only for a v* tag. The binary was stamped with that tag
@@ -111,18 +121,22 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Collect binary
+      - name: Collect tarball
         run: |
           set -eux
           mkdir -p dist
-          install -m 0755 artifacts/obs-mount dist/obs-mount-x86_64-linux-musl
-          ./dist/obs-mount-x86_64-linux-musl --version
+          cp artifacts/obs-mount-x86_64-linux-musl.tar.gz dist/
+          # Prove the archive unpacks to a runnable `obs` before publishing it.
+          tar -xzf dist/obs-mount-x86_64-linux-musl.tar.gz -C dist
+          test -x dist/obs
+          ./dist/obs --version
+          rm dist/obs
           ls -l dist
 
       # GitHub attaches checksums for release assets itself, so no
       # hand-rolled SHA256SUMS file is published here.
       - uses: softprops/action-gh-release@v3
         with:
-          files: dist/obs-mount-x86_64-linux-musl
+          files: dist/obs-mount-x86_64-linux-musl.tar.gz
           generate_release_notes: true
           fail_on_unmatched_files: true
