@@ -8,6 +8,7 @@ use fs::ObsFs;
 use fuser::MountOption;
 use obs::{BucketKind, ObsClient};
 use serde::Deserialize;
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
 /// Configuration file contents (YAML only). Every field is optional:
@@ -172,7 +173,7 @@ fn main() -> anyhow::Result<()> {
     // first default location that exists; no file at all is fine as long
     // as every required value comes from a flag or the environment.
     let config_path = args.config.clone().or_else(|| {
-        let p = PathBuf::from("/etc/obs/obs-mount.yaml");
+        let p = PathBuf::from("/etc/obs/obs.yaml");
         p.is_file().then_some(p)
     });
     let cfg = match &config_path {
@@ -273,12 +274,18 @@ fn main() -> anyhow::Result<()> {
     match existing_staging_dirs(&temp_dir, current_uid()) {
         Ok(dirs) => {
             for dir in dirs {
-                // A session that exited cleanly leaves an empty directory
-                // behind, because SIGTERM kills the process before ObsFs can
-                // run its Drop. Those carry nothing, so removing them keeps
-                // the warning meaningful for sessions that did keep data.
-                if is_empty_dir(&dir) {
+                // Only reclaim a directory whose lock nobody holds. Testing
+                // emptiness alone is wrong: a second mount that has not
+                // written anything yet also looks empty, and deleting its
+                // directory makes that mount fail on its next write.
+                if holds_no_data(&dir) && staging_dir_is_abandoned(&dir) {
+                    let _ = std::fs::remove_file(dir.join(STAGING_LOCK));
                     let _ = std::fs::remove_dir(&dir);
+                    continue;
+                }
+                if holds_no_data(&dir) {
+                    // Locked and empty: another mount is running, nothing to
+                    // report.
                     continue;
                 }
                 tracing::warn!(path = %dir.display(), "existing staging directory; may belong to a running mount or contain recovery data; inspect before manual cleanup");
@@ -287,6 +294,9 @@ fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "could not check existing staging directories"),
     }
     let staging_dir = staging_dir_for(&temp_dir, current_uid())?;
+    // Held for the whole run: startup in another process uses this lock to
+    // decide the directory is in use rather than abandoned.
+    let _staging_lock = lock_staging_dir(&staging_dir)?;
     tracing::debug!(path = %staging_dir.display(), "staging directory");
     let fs = ObsFs::new(client, staging_dir, upload);
     // Every local user may use the mount. This is a personal backup mount
@@ -299,6 +309,12 @@ fn main() -> anyhow::Result<()> {
     // stale mountpoint behind, and cleaning that up would need the mountpoint,
     // which only the config knows, not the unit file.
     let acl = fuser::SessionACL::All;
+    // No DefaultPermissions on purpose. With it, the kernel would enforce the
+    // mode stored in object metadata, and since every object is owned by the
+    // mounting user, the very services this mount exists to serve (OpenList,
+    // nginx) would be denied. Until object metadata carries a real owner,
+    // mode bits are reported by `ls -l` but do not restrict access; the mount
+    // is shared by everyone who can reach the mountpoint.
     let mount_options = vec![
         MountOption::FSName("obs-mount".to_string()),
         MountOption::AutoUnmount,
@@ -359,9 +375,64 @@ fn existing_staging_dirs(base: &std::path::Path, uid: u32) -> std::io::Result<Ve
     Ok(dirs)
 }
 
-/// Whether a directory has no entries at all.
-fn is_empty_dir(path: &std::path::Path) -> bool {
-    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+/// Name of the lock file marking a staging directory as belonging to a live
+/// mount. Its presence is what lets startup tell "left behind by a crash"
+/// apart from "in use by a mount that simply has not written yet".
+const STAGING_LOCK: &str = ".lock";
+
+/// Take this session's lock on `dir` for as long as the returned file lives.
+///
+/// The directory must outlive the process, so the lock is advisory: it is
+/// dropped when the process dies, including on SIGKILL, which is exactly the
+/// signal startup needs to decide whether a directory is safe to remove.
+fn lock_staging_dir(dir: &std::path::Path) -> std::io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(STAGING_LOCK))?;
+    flock_exclusive(&file)?;
+    Ok(file)
+}
+
+/// Try to lock a staging directory someone else may hold. Returns true when
+/// the lock was acquired, which means no live session owns it.
+fn staging_dir_is_abandoned(dir: &std::path::Path) -> bool {
+    match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(STAGING_LOCK))
+    {
+        Ok(file) => flock_exclusive(&file).is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn flock_exclusive(file: &File) -> std::io::Result<()> {
+    let ret = unsafe {
+        libc::flock(
+            std::os::unix::io::AsRawFd::as_raw_fd(file),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Whether a directory holds nothing but the lock file.
+fn holds_no_data(path: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().all(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n == STAGING_LOCK || n == ".")
+    })
 }
 
 /// Allocate a private directory atomically for each mount. Never reuse or
@@ -437,6 +508,33 @@ mod tests {
         );
         std::fs::remove_dir_all(first).unwrap();
         std::fs::remove_dir_all(second).unwrap();
+    }
+
+    /// A live mount that has not written yet has an empty staging directory.
+    /// Startup must not treat it as abandoned: deleting it would make every
+    /// later write in that mount fail, and only the second mount would look
+    /// healthy.
+    #[test]
+    fn live_session_directory_is_not_reclaimed_by_another_startup() {
+        let base = staging_dir_for(&std::env::temp_dir(), current_uid()).unwrap();
+        let live = staging_dir_for(&base, current_uid()).unwrap();
+        let lock = lock_staging_dir(&live).unwrap();
+
+        assert!(holds_no_data(&live), "a fresh session holds no data");
+        assert!(
+            !staging_dir_is_abandoned(&live),
+            "a directory whose lock is held must not look abandoned"
+        );
+
+        // Dropping the lock is what a crash does, and then it is reclaimable.
+        drop(lock);
+        assert!(
+            staging_dir_is_abandoned(&live),
+            "after the lock is released the directory is reclaimable"
+        );
+
+        std::fs::remove_dir_all(live).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

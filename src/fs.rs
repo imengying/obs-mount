@@ -1625,7 +1625,19 @@ impl Filesystem for ObsFs {
                             reply.error(err);
                             return;
                         }
-                        let _ = inner.client.delete_object(&key);
+                        if let Err(e) = inner.client.delete_object(&key) {
+                            // The copy landed, so reporting failure would
+                            // invite a retry that duplicates keys. Leaving the
+                            // source behind is the lesser evil, but it must be
+                            // visible: otherwise the tree silently doubles.
+                            tracing::error!(
+                                old = %old_path,
+                                new = %new_path,
+                                stranded_key = %key,
+                                error = %e,
+                                "rename copied but could not delete the source; both now exist"
+                            );
+                        }
                     }
                     // Keep the inode mapping, just re-point it at the new
                     // path: dropping it made the kernel's cached dentry point
@@ -1642,7 +1654,18 @@ impl Filesystem for ObsFs {
         } else {
             match inner.client.copy_object(&old_path, &new_path) {
                 Ok(()) => {
-                    let _ = inner.client.delete_object(&old_path);
+                    if let Err(e) = inner.client.delete_object(&old_path) {
+                        // Same reasoning as the directory branch: the new key
+                        // exists, so the rename itself succeeded. Report the
+                        // leftover loudly rather than failing a rename the
+                        // caller would then retry.
+                        tracing::error!(
+                            old = %old_path,
+                            new = %new_path,
+                            error = %e,
+                            "rename copied but could not delete the source; both now exist"
+                        );
+                    }
                     // Same as the directory branch: re-point the inode, do
                     // not forget it (the kernel still holds that inode).
                     inner.remap_subtree(&old_path, &new_path);

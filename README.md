@@ -195,12 +195,17 @@ sudo mkdir -p /mnt/obs
 sudo systemctl daemon-reload && sudo systemctl enable --now obs
 ```
 
-卸载：`systemctl stop obs-mount`。进程退出时由 fusermount 自动摘除挂载，
+卸载：`systemctl stop obs`。进程退出时由 fusermount 自动摘除挂载，
 所以 unit 文件里不需要写挂载点，`systemctl stop` 对任何配置路径都成立。
 
 **访问权限**：挂载对所有本地用户开放（`allow_other`），便于 OpenList、nginx、rsync
 这类以别的用户运行的服务读取同一个桶。以 root 挂载不需要额外配置；普通用户挂载需要
 在 `/etc/fuse.conf` 里加一行 `user_allow_other`，否则 fusermount 会拒绝。
+
+因为所有对象都归挂载用户所有，内核级的权限检查被有意关闭（未启用
+`DefaultPermissions`）。`chmod` 属性能保存、`ls -l` 也会显示，但**不用于限制访问**——
+能到达挂载点的用户都能读写。需要访问控制请用文件系统外的机制（如给服务单独建用户并
+限制挂载点父目录权限）。
 
 ## 验证状态
 
