@@ -87,20 +87,7 @@ jobs:
       - name: End-to-end test against mock OBS
         env:
           OBS_MOUNT_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/obs-mount
-        run: |
-          set +e
-          OBS_E2E_REQUIRE_XATTR=1 ./tests/e2e.sh >"$RUNNER_TEMP/e2e.log" 2>&1
-          status=$?
-          cat "$RUNNER_TEMP/e2e.log"
-          exit $status
-
-      - name: Upload e2e log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: e2e-log
-          path: ${{ runner.temp }}/e2e.log
-          if-no-files-found: ignore
+        run: OBS_E2E_REQUIRE_XATTR=1 ./tests/e2e.sh
 
       - name: Upload static binary
         uses: actions/upload-artifact@v7
