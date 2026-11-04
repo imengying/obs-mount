@@ -109,13 +109,20 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
+          # Flatten to artifacts/obs-mount rather than keeping one directory
+          # per artifact name: v8 changed how it lays out downloads.
+          merge-multiple: true
 
       - name: Collect binary
         run: |
           set -eux
+          echo "--- downloaded tree ---"
+          find artifacts -maxdepth 3
+          bin=$(find artifacts -name obs-mount -type f | head -1)
+          test -n "$bin" || { echo "::error::no obs-mount binary in artifacts"; exit 1; }
           mkdir -p dist
-          install -m 0755 artifacts/obs-mount-x86_64-linux-musl/obs-mount \
-            dist/obs-mount-x86_64-linux-musl
+          install -m 0755 "$bin" dist/obs-mount-x86_64-linux-musl
+          ./dist/obs-mount-x86_64-linux-musl --version
           ls -l dist
 
       # GitHub attaches checksums for release assets itself, so no
