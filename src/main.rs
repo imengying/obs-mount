@@ -160,8 +160,11 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_env_filter(
+            // Errors only unless RUST_LOG says otherwise: a mount is expected
+            // to sit there quietly, and the two info lines it used to print on
+            // startup told nobody anything actionable.
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error")),
         )
         .init();
     let args = Args::parse();
