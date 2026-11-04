@@ -23,7 +23,7 @@ jobs:
   # track and the result runs on any x86_64 Linux.
   build:
     name: build & test (Debian 13, static)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: debian:trixie-slim
       # FUSE needs both its device and permission to mount inside the container.
@@ -133,7 +133,7 @@ jobs:
     name: publish release
     needs: [build]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
