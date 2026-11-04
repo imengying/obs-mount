@@ -20,8 +20,8 @@
 use crate::obs::{ObsClient, ObsError, UnixMeta};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use fuser::{
-    BsdFileFlags, Errno, FileAttr, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    AccessFlags, BsdFileFlags, Errno, FileAttr, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, TimeOrNow, WriteFlags,
 };
@@ -122,6 +122,10 @@ struct Inner {
     next_fh: u64,
     /// File-level dirty state survives a failed close and sibling releases.
     pending: HashSet<PathBuf>,
+    /// Staging files whose failure has already been logged, so a caller that
+    /// retries on every flush/release does not repeat the same error. Cleared
+    /// when an upload finally succeeds.
+    reported_failure: HashSet<PathBuf>,
     /// Cached answer for statfs; `df` is cheap to call and usually polled by
     /// monitoring, so the bucket is queried at most once per TTL instead of
     /// once per request.
@@ -329,6 +333,7 @@ impl ObsFs {
                 open_files: HashMap::new(),
                 next_fh: 1,
                 pending: HashSet::new(),
+                reported_failure: HashSet::new(),
                 usage_cache: None,
             }),
         }
@@ -826,7 +831,10 @@ impl Inner {
         self.save_recovery(key, staging)?;
         File::open(staging)?.sync_all()?;
         let meta = self.metadata_headers(key)?;
-        tracing::info!(key, path = %staging.display(), "uploading staged file to OBS");
+        // Debug, not info: a backup writes thousands of files, and the staging
+        // path is a local detail nobody needs in a journal.
+        let size = fs::metadata(staging).map(|m| m.len()).unwrap_or(0);
+        tracing::debug!(key, size, "uploading to OBS");
         self.client
             .upload_file_with_meta(key, staging, self.upload, &meta)?;
         self.pending.remove(staging);
@@ -849,9 +857,23 @@ impl Inner {
         }
         let key = open.key.clone();
         match self.upload_staged_path(&key, &staging) {
-            Ok(()) => None,
+            Ok(()) => {
+                self.reported_failure.remove(&staging);
+                None
+            }
             Err(e) => {
-                tracing::error!(error = %e, path = %staging.display(), "upload failed; data and recovery metadata retained");
+                // flush, fsync and release all land here, so one bad upload
+                // would otherwise log the same error several times in a row.
+                if self.reported_failure.insert(staging.clone()) {
+                    tracing::error!(
+                        key = %key,
+                        error = %e,
+                        path = %staging.display(),
+                        "upload failed; data and recovery metadata kept, retried on next close"
+                    );
+                } else {
+                    tracing::debug!(key = %key, error = %e, "upload still failing");
+                }
                 Some(self.upload_error_reply(&e))
             }
         }
@@ -1022,6 +1044,32 @@ impl Filesystem for ObsFs {
             }
         }
         reply.ok();
+    }
+
+    /// Answer permission checks without a round trip.
+    ///
+    /// The kernel calls this for every `ls`, and leaving it unimplemented made
+    /// fuser log `[Not Implemented] access(...)` on each one -- noise that says
+    /// nothing about the mount. Access is already decided by the session ACL
+    /// and by the POSIX modes stored in object metadata, so reporting success
+    /// for a path that resolves is the honest answer; a missing path still has
+    /// to fail or `ls` of a deleted entry would look fine.
+    fn access(&self, _req: &Request, ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+            // The root inode is not in the map; it always exists.
+            if ino.0 == ROOT_INO {
+                reply.ok();
+            } else {
+                reply.error(Errno::ENOENT);
+            }
+            return;
+        };
+        match inner.resolve(&path) {
+            Ok(Some(_)) => reply.ok(),
+            Ok(None) => reply.error(Errno::ENOENT),
+            Err(e) => reply.error(errno_for_obs(&e)),
+        }
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
@@ -1538,7 +1586,9 @@ impl Filesystem for ObsFs {
             reply.ok();
             return;
         }
-        tracing::warn!(old = %old_path, new = %new_path, "rename is Copy+Delete, not atomic");
+        // Not a warning: rename is Copy+Delete by design on an object store,
+        // and backup tools rename constantly. Keep it as a trace of intent.
+        tracing::debug!(old = %old_path, new = %new_path, "rename (Copy+Delete)");
         // Directory? Check placeholder or any key below it.
         let is_dir = inner
             .client
@@ -1953,6 +2003,7 @@ mod tests {
             open_files: HashMap::new(),
             next_fh: 1,
             pending: HashSet::new(),
+            reported_failure: HashSet::new(),
             usage_cache: None,
         }
     }

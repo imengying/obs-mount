@@ -208,9 +208,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
     let client = ObsClient::new(ak, sk, bucket.clone(), endpoint.clone());
-    tracing::info!(
+    tracing::debug!(
         endpoint = %endpoint,
-        addressing = if client.uses_path_style() { "path-style (/bucket/key)" } else { "virtual-host (bucket.host/key)" },
+        addressing = if client.uses_path_style() { "path-style" } else { "virtual-host" },
         "OBS client configured"
     );
     // Startup self-check 1: refuse a POSIX/file bucket.
@@ -242,9 +242,7 @@ fn main() -> anyhow::Result<()> {
     // Startup self-check 2: the bucket must be listable before we mount,
     // otherwise a bad AK/SK or region shows up as an empty-looking mount.
     match client.list_dir("") {
-        Ok(_) => {
-            tracing::info!(bucket = %bucket, mountpoint = %mountpoint.display(), "OBS bucket reachable, mounting")
-        }
+        Ok(_) => {}
         Err(e) => {
             tracing::error!(error = %e, "OBS bucket check failed; refusing to mount (check AK/SK, bucket, region/endpoint, and clock/NTP)");
             anyhow::bail!("OBS bucket check failed: {e}");
@@ -263,7 +261,7 @@ fn main() -> anyhow::Result<()> {
         threshold: multipart_threshold,
         part_size,
     };
-    tracing::info!(
+    tracing::debug!(
         threshold = upload.threshold,
         part_size = upload.part_size,
         "upload tuning"
@@ -286,7 +284,7 @@ fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "could not check existing staging directories"),
     }
     let staging_dir = staging_dir_for(&temp_dir, current_uid())?;
-    tracing::info!(path = %staging_dir.display(), "private staging directory; failed uploads are retained here");
+    tracing::debug!(path = %staging_dir.display(), "staging directory");
     let fs = ObsFs::new(client, staging_dir, upload);
     // Every local user may use the mount. This is a personal backup mount
     // shared with other services on the same box (OpenList, nginx, rsync),
@@ -306,6 +304,12 @@ fn main() -> anyhow::Result<()> {
     let mut config = fuser::Config::default();
     config.mount_options = mount_options;
     config.acl = acl;
+    tracing::info!(
+        bucket = %bucket,
+        mountpoint = %mountpoint.display(),
+        endpoint = %endpoint,
+        "mounted"
+    );
     fuser::mount(fs, &mountpoint, &config).map_err(|e| {
         let msg = e.to_string();
         let hint = if msg.contains("No such file or directory") {
