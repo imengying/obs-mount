@@ -467,8 +467,15 @@ impl ObsClient {
         for (k, v) in extra_x_obs {
             x_obs.push((k.clone(), v.clone()));
         }
-        // CanonicalizedResource: /<bucket>/<key>[?<sorted sub-resources>]
-        let mut resource = format!("/{}/{}", self.bucket, key);
+        // CanonicalizedResource: /<bucket>/<encoded key>[?<sorted sub-resources>]
+        //
+        // The key is percent-encoded exactly as it appears in the request
+        // line. OBS signs the path it received, so signing the decoded form
+        // makes any key with a non-ASCII byte -- or a space, or any other
+        // character encode_key touches -- fail with SignatureDoesNotMatch,
+        // which this program surfaces as EACCES. ASCII keys happen to encode
+        // to themselves, which is why only the CJK directories broke.
+        let mut resource = format!("/{}/{}", self.bucket, encode_key(key));
         if !query.is_empty() {
             let subs: Vec<&str> = query
                 .split('&')
@@ -1361,6 +1368,34 @@ mod tests {
             signed_date_slot_is_empty,
             "a populated Date slot must not match what OBS expects"
         );
+    }
+
+    /// A CJK key broke every request: the resource was signed decoded while
+    /// OBS signs the encoded path from the request line, so `PT备份` failed
+    /// with SignatureDoesNotMatch and surfaced as EACCES. ASCII keys encode to
+    /// themselves, which is why only non-ASCII names broke.
+    #[test]
+    fn non_ascii_keys_are_signed_encoded_and_round_trip() {
+        let mock = crate::test_support::MockObs::new("[]");
+        let client = mock.client();
+        for key in ["PT备份", "PT备份/sub dir/a.txt", "a&b/中文.txt", "sp ace"] {
+            client.put_object_with_meta(key, b"payload", &[]).unwrap();
+            assert!(
+                mock.stats().contains("\"signature_failures\": 0"),
+                "signature rejected for {key}"
+            );
+            let meta = client.head_object(key).unwrap().unwrap();
+            assert_eq!(meta.size, 7);
+            assert_eq!(client.get_range(key, 0, 7).unwrap(), b"payload");
+            // Listing is what a failing `ls` actually exercises, and a
+            // delimiter-ed listing only returns the first path component, so
+            // list without one.
+            let listed = client.list_objects("", "", None, 1000).unwrap();
+            assert!(
+                listed.objects.iter().any(|o| o.key == key),
+                "{key} missing from listing"
+            );
+        }
     }
 
     #[test]

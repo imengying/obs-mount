@@ -51,9 +51,14 @@ FAILURES = []         # list of strings, dumped at exit / on /__stats
 
 def canonicalized_resource(path, raw_query):
     # path is the raw (percent-encoded) request path, e.g. /bucket/a%20b.txt
-    # virtual-host style: the bucket is NOT in the URL path
+    # virtual-host style: the bucket is NOT in the URL path.
+    #
+    # The key stays percent-encoded, because that is what OBS signs: it hashes
+    # the path exactly as it arrived. Decoding here (as this fixture used to)
+    # agrees with a client that signs the decoded key, so CJK or spaced keys
+    # pass here and then fail against production with SignatureDoesNotMatch.
     bucket = BUCKET
-    key = unquote(path[1:]) if len(path) > 1 else ""
+    key = path[1:] if len(path) > 1 else ""
     if key == BUCKET:
         key = ""
     elif key.startswith(BUCKET + "/"):
