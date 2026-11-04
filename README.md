@@ -87,6 +87,6 @@ cargo test --all-features
 cargo test -- --ignored --nocapture
 ```
 
-测试在进程内启动模拟 OBS 服务，覆盖签名、读写、元数据、分段上传、上传失败保留与恢复，无需 Python 或云端凭据。CLI 和挂载测试默认标记为 `ignored`，可用 `OBS_MOUNT_BIN` 指定待测二进制；CI 缺少 `/dev/fuse` 时会明确跳过挂载测试。真实 OBS、长期稳定性和断网恢复仍需另外验证。
+测试在进程内启动模拟 OBS 服务，覆盖签名、读写、元数据、分段上传、上传失败保留与恢复，无需 Python 或云端凭据。CLI 和挂载测试默认标记为 `ignored`，可用 `OBS_MOUNT_BIN` 指定待测二进制；CI 为容器提供 `/dev/fuse` 并强制执行挂载测试，设备缺失或测试失败都会阻止发布。真实 OBS、长期稳定性和断网恢复仍需另外验证。
 
 推送 `v*` tag 触发 CI 构建并发布静态 musl 包；构建与发布步骤见 [CI 配置](.github/workflows/ci.yml)。

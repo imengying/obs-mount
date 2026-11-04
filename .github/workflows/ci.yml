@@ -24,8 +24,18 @@ jobs:
   build:
     name: build & test (Debian 13, static)
     runs-on: ubuntu-latest
-    container: debian:trixie-slim
+    container:
+      image: debian:trixie-slim
+      # FUSE needs both its device and permission to mount inside the container.
+      options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined
     steps:
+      - name: Require FUSE device
+        run: |
+          if [ ! -c /dev/fuse ] || [ ! -r /dev/fuse ] || [ ! -w /dev/fuse ]; then
+            echo "::error::FUSE mount tests require a readable and writable /dev/fuse"
+            exit 1
+          fi
+
       - name: Install build dependencies
         run: |
           set -eux
@@ -84,16 +94,20 @@ jobs:
           "$bin" 2>&1 | grep -qi "not set" || {
             echo "expected a missing-configuration error"; exit 1; }
 
-      - name: CLI and mount tests against mock OBS
+      - name: CLI test against mock OBS
         env:
           OBS_MOUNT_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/obs-mount
         run: |
           cargo test tests::rejects_file_bucket_before_mounting -- --exact --ignored
-          if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
-            cargo test fs::tests::mounted::round_trip -- --exact --ignored --nocapture
-          else
-            echo "SKIP: FUSE mount test requires an accessible /dev/fuse"
-          fi
+
+      - name: Required FUSE mount test
+        timeout-minutes: 5
+        env:
+          OBS_MOUNT_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/obs-mount
+        run: |
+          cargo test fs::tests::mounted::round_trip -- --exact --ignored --list \
+            | grep -Fx 'fs::tests::mounted::round_trip: test'
+          cargo test fs::tests::mounted::round_trip -- --exact --ignored --nocapture
 
       # Everything needed at the archive root: the binary, so ExecStart= needs
       # no rename, and a config template, so there is no separate download.
