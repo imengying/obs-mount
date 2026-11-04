@@ -312,24 +312,48 @@ pub struct ObsClient {
 
 /// Whether an endpoint must be addressed path-style (`/bucket/key`).
 ///
-/// Two cases force it, both handled by obsfs as well (`pathrequeststyle`):
+/// Huawei's OBS service endpoint rejects path-style addressing outright with
+/// `VirtualHostDomainRequired` ("Virtual host domain is required while
+/// accessing a specific bucket"), so a service endpoint such as
+/// `https://obs.cn-north-4.myhuaweicloud.com` must be reached as
+/// `<bucket>.obs.cn-north-4.myhuaweicloud.com` instead.
 ///
-///  * the host is a bare IP address, where `bucket.10.0.0.1` cannot resolve;
-///  * the endpoint is a *service* endpoint whose host does not already start
-///    with the bucket name, e.g. `https://obs.cn-north-4.myhuaweicloud.com`.
-///
-/// The second case matters for usability: obsfs takes a service endpoint plus
-/// a separate bucket name, and users coming from it will configure the same
-/// way. Detecting it from the host means both spellings work with no extra
-/// flag:
-///
-///   endpoint: https://my-bucket.obs.cn-north-4.myhuaweicloud.com  (virtual)
-///   endpoint: https://obs.cn-north-4.myhuaweicloud.com            (path-style)
+/// Path-style is only for hosts that cannot carry the bucket as a subdomain:
+///  * a bare IP address, where `bucket.10.0.0.1` cannot resolve;
+///  * a custom domain in front of the bucket, where the user's own hostname
+///    already points at it and prefixing the bucket name would break it.
 fn needs_path_style(endpoint: &str, bucket: &str) -> bool {
-    match host_of(endpoint) {
-        Some(host) => is_ip_address(&host) || !host.starts_with(&format!("{bucket}.")),
-        None => false,
+    let Some(host) = host_of(endpoint) else {
+        return false;
+    };
+    if host.starts_with(&format!("{bucket}.")) {
+        return false;
     }
+    // An OBS host can carry the bucket as a subdomain; a custom domain
+    // cannot, so it keeps path-style.
+    !is_obs_host(&host)
+}
+
+/// Whether the endpoint's host already starts with `<bucket>.`.
+fn host_already_has_bucket(endpoint: &str, bucket: &str) -> bool {
+    host_of(endpoint).is_some_and(|h| h.starts_with(&format!("{bucket}.")))
+}
+
+/// Rewrite a service endpoint into its virtual-hosted form:
+/// `https://obs.cn-north-4.myhuaweicloud.com` becomes
+/// `https://<bucket>.obs.cn-north-4.myhuaweicloud.com`.
+fn virtual_host_endpoint(endpoint: &str, bucket: &str) -> String {
+    let (scheme, rest) = match endpoint.split_once("://") {
+        Some(parts) => parts,
+        None => return endpoint.to_string(),
+    };
+    format!("{scheme}://{bucket}.{rest}")
+}
+
+/// Whether `host` is served by Huawei OBS itself, e.g.
+/// `obs.cn-north-4.myhuaweicloud.com` or `obs-private.ap-southeast-1...`.
+fn is_obs_host(host: &str) -> bool {
+    host.contains("myhuaweicloud")
 }
 
 /// Extract the host (no scheme, no port, no path) from a URL.
@@ -345,21 +369,6 @@ fn host_of(endpoint: &str) -> Option<String> {
     } else {
         Some(host.to_string())
     }
-}
-
-/// True for IPv4 dotted quads and bracketed/simple IPv6 literals.
-fn is_ip_address(host: &str) -> bool {
-    if let Some(inner) = host.strip_prefix('[') {
-        return inner.contains(']');
-    }
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() == 4 {
-        return parts.iter().all(|p| {
-            !p.is_empty() && p.len() <= 3 && p.parse::<u16>().map(|n| n <= 255) == Ok(true)
-        });
-    }
-    // Bare IPv6 literal, e.g. "::1".
-    host.contains(':')
 }
 
 /// Re-open files for every retry; memory use is independent of object size.
@@ -402,12 +411,21 @@ impl ObsClient {
             .timeout(Duration::from_secs(120))
             .build()
             .expect("reqwest client");
+        let endpoint = endpoint.trim_end_matches('/').to_string();
         let path_style = needs_path_style(&endpoint, &bucket);
+        // Path-style keeps the endpoint as given and appends /<bucket>. The
+        // virtual-hosted form has to put the bucket into the host itself, or
+        // OBS answers VirtualHostDomainRequired.
+        let endpoint = if path_style || host_already_has_bucket(&endpoint, &bucket) {
+            endpoint
+        } else {
+            virtual_host_endpoint(&endpoint, &bucket)
+        };
         Self {
             ak,
             sk,
             bucket,
-            endpoint: endpoint.trim_end_matches('/').to_string(),
+            endpoint,
             path_style,
             http,
         }
@@ -1405,15 +1423,21 @@ mod tests {
     }
 
     #[test]
-    fn service_endpoint_uses_path_style() {
-        // obsfs takes a service endpoint plus a separate bucket name; the
-        // host does not contain the bucket, so the bucket must go in the path.
-        assert!(needs_path_style(
+    fn service_endpoint_becomes_virtual_hosted() {
+        // OBS rejects path-style on its service endpoints with
+        // VirtualHostDomainRequired, so a bare service endpoint must be
+        // rewritten to put the bucket in the host.
+        assert!(!needs_path_style(
             "https://obs.cn-north-4.myhuaweicloud.com",
             "my-bucket"
         ));
-        assert!(needs_path_style(
-            "http://obs.cn-north-4.myhuaweicloud.com:8080",
+        assert_eq!(
+            virtual_host_endpoint("https://obs.cn-north-4.myhuaweicloud.com", "my-bucket"),
+            "https://my-bucket.obs.cn-north-4.myhuaweicloud.com"
+        );
+        // Private and custom-suffix hosts are OBS too.
+        assert!(!needs_path_style(
+            "https://obs-private.ap-southeast-1.myhuaweicloud.com",
             "my-bucket"
         ));
     }
@@ -1440,17 +1464,29 @@ mod tests {
             "https://b.obs.cn-north-4.myhuaweicloud.com"
         );
 
-        let path_style = ObsClient::new(
+        // A service endpoint is rewritten rather than addressed path-style.
+        let service = ObsClient::new(
             "ak".into(),
             "sk".into(),
             "b".into(),
             "https://obs.cn-north-4.myhuaweicloud.com".into(),
         );
-        assert!(path_style.uses_path_style());
+        assert!(!service.uses_path_style());
         assert_eq!(
-            path_style.object_base(),
-            "https://obs.cn-north-4.myhuaweicloud.com/b"
+            service.object_base(),
+            "https://b.obs.cn-north-4.myhuaweicloud.com"
         );
+
+        // A custom domain keeps path-style: prefixing it with the bucket name
+        // would point at a host that does not exist.
+        let custom = ObsClient::new(
+            "ak".into(),
+            "sk".into(),
+            "b".into(),
+            "https://s3.example.com".into(),
+        );
+        assert!(custom.uses_path_style());
+        assert_eq!(custom.object_base(), "https://s3.example.com/b");
     }
 
     /// OBS serves POSIX/file buckets behind the same endpoint; mounting one as

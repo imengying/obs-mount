@@ -31,15 +31,18 @@ YAML，默认 `/etc/obs/obs.yaml`，可用 `-c` 指定。优先级：命令行 >
 | `multipart_threshold` | `OBS_MULTIPART_THRESHOLD` | 默认 25 MB |
 | `multipart_part_size` | `OBS_MULTIPART_PART_SIZE` | 默认 10 MB，下限 5 MiB |
 
-`endpoint` 支持两种写法，按 host 自动选择寻址方式：
+`endpoint` 按 host 自动选择寻址方式：
 
 | 写法 | 寻址 |
 |---|---|
 | `https://<bucket>.obs.<region>.myhuaweicloud.com` | 虚拟主机式 |
-| `https://obs.<region>.myhuaweicloud.com` + `bucket:` | 路径式 |
+| `https://obs.<region>.myhuaweicloud.com` + `bucket:` | 自动补成 `<bucket>.obs...` |
 | `http://10.0.0.1:9000` 之类 IP 端点 | 路径式 |
+| 自有域名（如 `https://s3.example.com`） | 路径式 |
 
-host 不以 `<bucket>.` 开头或为 IP 时自动走路径式。不要跨区域挂载；服务器时钟须 NTP 对时
+华为云 OBS 服务端点只接受虚拟主机式，用路径式会被拒（`VirtualHostDomainRequired`），
+所以 `obs.<region>.myhuaweicloud.com` 会自动补成 `<bucket>.obs.<region>...`。
+只有 IP 端点和自有域名走路径式。不要跨区域挂载；服务器时钟须 NTP 对时
 （Date 偏差超 15 分钟即 403）。
 
 启动时用 `HEAD /` 检查桶类型，返回 `x-obs-bucket-type: POSIX` 或
