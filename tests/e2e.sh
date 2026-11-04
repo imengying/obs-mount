@@ -61,6 +61,15 @@ pass() { echo "  ok   $1"; }
 fail() { echo "  FAIL $1"; echo "       got: $2"; echo "       want: $3"; failures=$((failures + 1)); }
 eq() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1" "$2" "$3"; fi; }
 
+echo "== environment =="
+echo "  uname: $(uname -sr)"
+echo "  id: $(id)"
+echo "  /dev/fuse: $(ls -l /dev/fuse 2>&1)"
+echo "  fusermount3: $(command -v fusermount3 || echo none)"
+echo "  fusermount: $(command -v fusermount || echo none)"
+echo "  fuse.conf: $(cat /etc/fuse.conf 2>/dev/null | tr '\n' ' ' || echo none)"
+echo "  fuse module: $(grep -c fuse /proc/filesystems 2>/dev/null || echo 0) entries"
+
 echo "== starting mock OBS on 127.0.0.1:$PORT =="
 OBS_MOCK_ACCESS_LOG=$ACCESS python3 "$REPO/tests/mock_obs.py" "$PORT" >"$WORK/server.log" 2>&1 &
 server_pid=$!
@@ -89,6 +98,8 @@ done
 if ! is_mounted "$MNT"; then
   echo "FAIL: mount did not come up"
   echo "--- diagnostics ---"
+  echo "mount log size: $(wc -c <"$WORK/mount.log") bytes"
+  echo "mock server alive: $(kill -0 "$server_pid" 2>/dev/null && echo yes || echo no)"
   ls -l /dev/fuse 2>&1 || echo "/dev/fuse MISSING"
   id
   command -v fusermount3 fusermount mountpoint 2>&1 || true
