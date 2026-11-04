@@ -18,16 +18,12 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # One build, one artifact: a fully static musl binary built on Debian 13.
+  # One build, one artifact: a fully static musl binary built on Ubuntu 24.04.
   # Nothing links against the host's glibc, so there is no glibc version to
   # track and the result runs on any x86_64 Linux.
   build:
-    name: build & test (Debian 13, static)
+    name: build & test (Ubuntu 24.04, static)
     runs-on: ubuntu-24.04
-    container:
-      image: debian:trixie-slim
-      # FUSE needs both its device and permission to mount inside the container.
-      options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined
     steps:
       - name: Require FUSE device
         run: |
@@ -39,30 +35,24 @@ jobs:
       - name: Install build dependencies
         run: |
           set -eux
-          apt-get update
+          sudo apt-get update
           # fuse3: the ignored Rust test mounts a real FUSE filesystem.
-          # curl: the rustup installer. file/binutils: verify the
-          # binary really is static.
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl git build-essential cmake musl-tools perl \
-            pkg-config file binutils fuse3
-          rm -rf /var/lib/apt/lists/*
+          # jq locates the compiled test harness; only that harness runs as root.
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake musl-tools perl pkg-config file binutils fuse3 jq
 
       - uses: actions/checkout@v7
 
       - name: Install Rust (musl target)
         run: |
           set -eux
-          # rust-toolchain.toml supplies the channel and components; only the
-          # musl target has to be added here.
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustup" target add x86_64-unknown-linux-musl
+          # The hosted runner already supplies rustup. Match rust-toolchain.toml.
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup target add x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2.9.3
         with:
-          key: musl
+          key: ubuntu-24.04-musl
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -87,12 +77,21 @@ jobs:
           set -eux
           bin=target/x86_64-unknown-linux-musl/release/obs-mount
           file "$bin"
-          ldd "$bin" 2>&1 | grep -q "statically linked"
+          # Inspect ELF headers instead of relying on distro-specific ldd output.
+          readelf -lW "$bin" > program-headers.txt
+          readelf -dW "$bin" > dynamic-section.txt
+          if grep -q INTERP program-headers.txt || grep -q NEEDED dynamic-section.txt; then
+            echo "binary requires a dynamic loader or shared libraries"
+            exit 1
+          fi
           "$bin" --version
           "$bin" --help > /dev/null
           # A missing configuration must be a clear error, not a panic.
-          "$bin" 2>&1 | grep -qi "not set" || {
-            echo "expected a missing-configuration error"; exit 1; }
+          if output=$("$bin" 2>&1); then
+            echo "expected a missing-configuration error"
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -qi "not set"
 
       - name: CLI test against mock OBS
         env:
@@ -105,9 +104,14 @@ jobs:
         env:
           OBS_MOUNT_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/obs-mount
         run: |
-          cargo test fs::tests::mounted::round_trip -- --exact --ignored --list \
+          # Preserve root + cross-user mount coverage without compiling as root.
+          test_bin=$(cargo test --no-run --message-format=json | jq -r \
+            'select(.reason == "compiler-artifact" and .profile.test and .target.name == "obs-mount") | .executable // empty')
+          test -x "$test_bin"
+          "$test_bin" fs::tests::mounted::round_trip --exact --ignored --list \
             | grep -Fx 'fs::tests::mounted::round_trip: test'
-          cargo test fs::tests::mounted::round_trip -- --exact --ignored --nocapture
+          sudo env OBS_MOUNT_BIN="$OBS_MOUNT_BIN" \
+            "$test_bin" fs::tests::mounted::round_trip --exact --ignored --nocapture
 
       # Everything needed at the archive root: the binary, so ExecStart= needs
       # no rename, and a config template, so there is no separate download.
