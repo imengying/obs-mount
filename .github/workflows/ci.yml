@@ -30,12 +30,12 @@ jobs:
         run: |
           set -eux
           apt-get update
-          # fuse3/attr: the e2e test mounts a real FUSE filesystem and sets
-          # xattrs. curl: the rustup installer. file/binutils: verify the
+          # fuse3: the ignored Rust test mounts a real FUSE filesystem.
+          # curl: the rustup installer. file/binutils: verify the
           # binary really is static.
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates curl git build-essential cmake musl-tools perl \
-            pkg-config file binutils fuse3 attr python3
+            pkg-config file binutils fuse3
           rm -rf /var/lib/apt/lists/*
 
       - uses: actions/checkout@v7
@@ -84,10 +84,16 @@ jobs:
           "$bin" 2>&1 | grep -qi "not set" || {
             echo "expected a missing-configuration error"; exit 1; }
 
-      - name: End-to-end test against mock OBS
+      - name: CLI and mount tests against mock OBS
         env:
           OBS_MOUNT_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/obs-mount
-        run: OBS_E2E_REQUIRE_XATTR=1 ./tests/e2e.sh
+        run: |
+          cargo test tests::rejects_file_bucket_before_mounting -- --exact --ignored
+          if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then
+            cargo test fs::tests::mounted::round_trip -- --exact --ignored --nocapture
+          else
+            echo "SKIP: FUSE mount test requires an accessible /dev/fuse"
+          fi
 
       # Everything needed at the archive root: the binary, so ExecStart= needs
       # no rename, and a config template, so there is no separate download.

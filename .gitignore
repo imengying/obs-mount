@@ -5,4 +5,3 @@
 # Logs and archives that end up in the working tree while debugging CI.
 *.log
 logs_*.zip
-__pycache__/

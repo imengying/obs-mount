@@ -558,4 +558,21 @@ mod tests {
         );
         std::fs::remove_dir_all(base).unwrap();
     }
+    #[test]
+    #[ignore = "requires a built obs-mount binary"]
+    fn rejects_file_bucket_before_mounting() {
+        let mock = crate::test_support::MockObs::with_config(crate::test_support::Config {
+            file_bucket: true,
+            ..Default::default()
+        });
+        let mut process = crate::test_support::MountProcess::spawn(&mock, "rejected", None);
+        assert!(!process.wait_exit().success());
+        assert!(
+            process.log().contains("POSIX/file bucket"),
+            "{}",
+            process.log()
+        );
+        assert!(!crate::test_support::is_mounted(&process.mountpoint));
+        assert_eq!(mock.stats().signature_failures, 0);
+    }
 }

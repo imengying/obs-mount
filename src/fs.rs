@@ -2425,7 +2425,7 @@ mod tests {
                 .contains(&(xattr_key("user.colour"), B64.encode(b"blue")))
         );
         assert_eq!(inner.client.get_range("backup", 0, 4).unwrap(), b"repl");
-        assert!(mock.stats().contains("\"signature_failures\": 0"));
+        assert_eq!(mock.stats().signature_failures, 0);
     }
 
     #[test]
@@ -2481,5 +2481,337 @@ mod tests {
                 .mode,
             libc::S_IFDIR | 0o700
         );
+    }
+    mod mounted {
+        use super::*;
+        use crate::test_support::{MockObs, MountProcess};
+        use std::ffi::{CStr, CString};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, chown, symlink};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        fn c_path(path: &Path) -> CString {
+            CString::new(path.as_os_str().as_bytes()).unwrap()
+        }
+
+        fn volume(path: &Path) -> libc::statvfs {
+            let mut info = std::mem::MaybeUninit::uninit();
+            assert_eq!(
+                unsafe { libc::statvfs(c_path(path).as_ptr(), info.as_mut_ptr()) },
+                0
+            );
+            unsafe { info.assume_init() }
+        }
+
+        fn set_xattr(path: &Path, name: &CStr, value: &[u8]) {
+            let result = unsafe {
+                libc::setxattr(
+                    c_path(path).as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            assert_eq!(result, 0, "setxattr: {}", std::io::Error::last_os_error());
+        }
+
+        fn get_xattr(path: &Path, name: &CStr) -> std::io::Result<Vec<u8>> {
+            let mut value = vec![0; 4096];
+            let length = unsafe {
+                libc::getxattr(
+                    c_path(path).as_ptr(),
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            };
+            if length < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            value.truncate(length as usize);
+            Ok(value)
+        }
+
+        fn list_xattrs(path: &Path) -> Vec<String> {
+            let mut value = vec![0u8; 4096];
+            let length = unsafe {
+                libc::listxattr(
+                    c_path(path).as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            };
+            assert!(
+                length >= 0,
+                "listxattr: {}",
+                std::io::Error::last_os_error()
+            );
+            value[..length as usize]
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8(s.to_vec()).unwrap())
+                .collect()
+        }
+
+        fn write_file(path: &Path, data: &[u8]) {
+            let mut file = File::create(path).unwrap();
+            file.write_all(data).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        fn read_as_other_user(path: &Path) -> Vec<u8> {
+            let output = Command::new("cat")
+                .arg(path)
+                .uid(65534)
+                .gid(65534)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        }
+
+        fn write_as_other_user(path: &Path, data: &[u8]) {
+            let mut child = Command::new("tee")
+                .arg(path)
+                .uid(65534)
+                .gid(65534)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(data).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        #[test]
+        #[ignore = "requires /dev/fuse, fusermount3 and a built obs-mount binary"]
+        fn round_trip() {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/fuse")
+                .expect("this test requires an accessible /dev/fuse");
+            let mock = MockObs::new("[]");
+            // All test data stays inside this fresh directory. Use a numeric
+            // unprivileged UID for cross-user checks; never create OS accounts.
+            fs::set_permissions(&mock.staging, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut mount = MountProcess::spawn(&mock, "mnt", None);
+            assert!(mount.wait_mounted(), "mount failed: {}", mount.log());
+            let root = &mount.mountpoint;
+
+            write_file(&root.join("small.txt"), b"hello\n");
+            assert_eq!(fs::read(root.join("small.txt")).unwrap(), b"hello\n");
+            assert_eq!(fs::metadata(root.join("small.txt")).unwrap().len(), 6);
+            for i in 1..=5 {
+                write_file(&root.join("over.txt"), format!("v{i}").as_bytes());
+            }
+            assert_eq!(fs::read(root.join("over.txt")).unwrap(), b"v5");
+            write_file(&root.join("append.txt"), b"a\n");
+            {
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(root.join("append.txt"))
+                    .unwrap();
+                file.write_all(b"b\n").unwrap();
+                file.sync_all().unwrap();
+            }
+            assert_eq!(fs::read(root.join("append.txt")).unwrap(), b"a\nb\n");
+
+            fs::create_dir_all(root.join("dir/sub/deep")).unwrap();
+            write_file(&root.join("dir/sub/deep/file"), b"nested");
+            assert_eq!(fs::read_dir(root.join("dir/sub/deep")).unwrap().count(), 1);
+            fs::rename(root.join("small.txt"), root.join("renamed.txt")).unwrap();
+            assert_eq!(fs::read(root.join("renamed.txt")).unwrap(), b"hello\n");
+            fs::rename(root.join("dir"), root.join("moved")).unwrap();
+            assert_eq!(
+                fs::read(root.join("moved/sub/deep/file")).unwrap(),
+                b"nested"
+            );
+
+            write_file(&root.join("truncate.txt"), b"0123456789");
+            OpenOptions::new()
+                .write(true)
+                .open(root.join("truncate.txt"))
+                .unwrap()
+                .set_len(4)
+                .unwrap();
+            assert_eq!(fs::read(root.join("truncate.txt")).unwrap(), b"0123");
+            write_file(&root.join("range.txt"), b"ABCDEFGHIJ");
+            {
+                let mut file = File::open(root.join("range.txt")).unwrap();
+                file.seek(SeekFrom::Start(3)).unwrap();
+                let mut range = [0; 4];
+                file.read_exact(&mut range).unwrap();
+                assert_eq!(&range, b"DEFG");
+            }
+
+            // Compare uploads with independent source files, including the
+            // exact multipart threshold. A fresh mount below also rereads OBS.
+            for (name, size) in [
+                ("big.bin", 30 * 1024 * 1024),
+                ("exact.bin", 25 * 1024 * 1024),
+            ] {
+                let data: Vec<_> = (0..size)
+                    .map(|i| ((i * 31 + i / 257) % 251) as u8)
+                    .collect();
+                let source = mock.staging.join(name);
+                fs::write(&source, data).unwrap();
+                fs::copy(&source, root.join(name)).unwrap();
+                assert_eq!(
+                    crate::obs::md5_base64(&fs::read(root.join(name)).unwrap()),
+                    crate::obs::md5_base64(&fs::read(source).unwrap())
+                );
+            }
+            fs::remove_file(root.join("renamed.txt")).unwrap();
+            assert!(!root.join("renamed.txt").exists());
+            fs::create_dir(root.join("empty")).unwrap();
+            fs::remove_dir(root.join("empty")).unwrap();
+            assert!(!root.join("empty").exists());
+            assert_eq!(
+                fs::remove_dir(root.join("moved"))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ENOTEMPTY)
+            );
+            for name in ["a b.txt", "中文.txt"] {
+                write_file(&root.join(name), b"special");
+                assert_eq!(fs::read(root.join(name)).unwrap(), b"special");
+            }
+
+            let usage = volume(root);
+            assert_eq!(usage.f_frsize, 4096);
+            assert_eq!(usage.f_blocks * usage.f_frsize, SYNTHETIC_TOTAL);
+            assert!(usage.f_bavail > 0);
+
+            let meta = root.join("meta.txt");
+            write_file(&meta, b"metadata");
+            fs::set_permissions(&meta, fs::Permissions::from_mode(0o640)).unwrap();
+            assert_eq!(fs::metadata(&meta).unwrap().mode() & 0o777, 0o640);
+            if crate::current_uid() == 0 {
+                chown(&meta, Some(1234), Some(5678)).unwrap();
+                assert_eq!(
+                    (
+                        fs::metadata(&meta).unwrap().uid(),
+                        fs::metadata(&meta).unwrap().gid()
+                    ),
+                    (1234, 5678)
+                );
+            }
+            let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_934_245);
+            File::open(&meta)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            assert_eq!(fs::metadata(&meta).unwrap().modified().unwrap(), modified);
+            write_file(&root.join("real.txt"), b"target");
+            symlink("real.txt", root.join("link.txt")).unwrap();
+            assert_eq!(
+                fs::read_link(root.join("link.txt")).unwrap(),
+                PathBuf::from("real.txt")
+            );
+            assert_eq!(fs::read(root.join("link.txt")).unwrap(), b"target");
+
+            // Direct syscalls keep xattr coverage independent of external tools.
+            set_xattr(&meta, c"user.colour", b"blue");
+            assert_eq!(get_xattr(&meta, c"user.colour").unwrap(), b"blue");
+            assert!(list_xattrs(&meta).contains(&"user.colour".to_string()));
+            std::thread::sleep(Duration::from_secs(6));
+            assert_eq!(get_xattr(&meta, c"user.colour").unwrap(), b"blue");
+            let before = fs::metadata(&meta).unwrap();
+            {
+                let mut file = OpenOptions::new().append(true).open(&meta).unwrap();
+                file.write_all(b"more").unwrap();
+                file.sync_all().unwrap();
+                file.set_len(3).unwrap();
+            }
+            std::thread::sleep(Duration::from_secs(6));
+            let after = fs::metadata(&meta).unwrap();
+            assert_eq!(after.mode() & 0o777, 0o640);
+            assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+            assert_eq!(get_xattr(&meta, c"user.colour").unwrap(), b"blue");
+            set_xattr(&meta, c"user.owner", b"alice");
+            let names = list_xattrs(&meta);
+            assert!(
+                names.contains(&"user.colour".to_string())
+                    && names.contains(&"user.owner".to_string())
+            );
+            assert!(names.iter().all(|name| !name.starts_with("xdg.")));
+            assert_eq!(
+                unsafe { libc::removexattr(c_path(&meta).as_ptr(), c"user.colour".as_ptr()) },
+                0
+            );
+            assert!(!list_xattrs(&meta).contains(&"user.colour".to_string()));
+            assert_eq!(
+                get_xattr(&meta, c"user.nope").unwrap_err().raw_os_error(),
+                Some(libc::ENODATA)
+            );
+
+            let mut fresh = MountProcess::spawn(&mock, "fresh", None);
+            assert!(fresh.wait_mounted(), "fresh mount failed: {}", fresh.log());
+            let usage = volume(&fresh.mountpoint);
+            assert!(
+                usage.f_blocks > usage.f_bfree,
+                "fresh mount must report used space"
+            );
+            assert_eq!(
+                crate::obs::md5_base64(&fs::read(fresh.mountpoint.join("big.bin")).unwrap()),
+                crate::obs::md5_base64(&fs::read(mock.staging.join("big.bin")).unwrap())
+            );
+            write_file(&fresh.mountpoint.join("fresh.txt"), b"path-style");
+            assert_eq!(
+                fs::read(fresh.mountpoint.join("fresh.txt")).unwrap(),
+                b"path-style"
+            );
+            fresh.terminate();
+
+            if crate::current_uid() == 0 {
+                assert_eq!(read_as_other_user(&root.join("real.txt")), b"target");
+                write_as_other_user(&root.join("shared.txt"), b"from-other");
+                assert_eq!(fs::read(root.join("shared.txt")).unwrap(), b"from-other");
+                let mut unprivileged =
+                    MountProcess::spawn(&mock, "unprivileged", Some((65534, 65534)));
+                if unprivileged.wait_mounted() {
+                    write_as_other_user(&unprivileged.mountpoint.join("user.txt"), b"non-root");
+                    assert_eq!(
+                        read_as_other_user(&unprivileged.mountpoint.join("user.txt")),
+                        b"non-root"
+                    );
+                    unprivileged.terminate();
+                } else {
+                    let allowed = fs::read_to_string("/etc/fuse.conf")
+                        .unwrap_or_default()
+                        .lines()
+                        .any(|line| {
+                            line.split('#').next().unwrap_or("").trim() == "user_allow_other"
+                        });
+                    assert!(
+                        !allowed,
+                        "unprivileged mount failed despite user_allow_other: {}",
+                        unprivileged.log()
+                    );
+                    assert!(
+                        unprivileged.log().contains("user_allow_other"),
+                        "missing configuration hint: {}",
+                        unprivileged.log()
+                    );
+                }
+            } else {
+                eprintln!("SKIP: cross-user checks require root");
+            }
+            mount.terminate();
+            assert_eq!(mock.stats().signature_failures, 0);
+        }
     }
 }

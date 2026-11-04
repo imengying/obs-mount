@@ -407,7 +407,12 @@ impl RequestBody {
 
 impl ObsClient {
     pub fn new(ak: String, sk: String, bucket: String, endpoint: String) -> Self {
-        let http = Client::builder()
+        let builder = Client::builder();
+        // Tests only talk to local fixtures; machine proxy settings must not
+        // route their requests elsewhere. Production still uses system proxies.
+        #[cfg(test)]
+        let builder = builder.no_proxy();
+        let http = builder
             .timeout(Duration::from_secs(120))
             .build()
             .expect("reqwest client");
@@ -1380,8 +1385,9 @@ mod tests {
         let client = mock.client();
         for key in ["PT备份", "PT备份/sub dir/a.txt", "a&b/中文.txt", "sp ace"] {
             client.put_object_with_meta(key, b"payload", &[]).unwrap();
-            assert!(
-                mock.stats().contains("\"signature_failures\": 0"),
+            assert_eq!(
+                mock.stats().signature_failures,
+                0,
                 "signature rejected for {key}"
             );
             let meta = client.head_object(key).unwrap().unwrap();
@@ -1661,7 +1667,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(client.head_object("empty").unwrap().unwrap().size, 0);
-        assert!(mock.stats().contains("\"signature_failures\": 0"));
+        assert_eq!(mock.stats().signature_failures, 0);
     }
 
     #[test]
@@ -1682,7 +1688,7 @@ mod tests {
         );
         assert!(source.exists());
         assert!(client.head_object("backup").unwrap().is_none());
-        assert!(mock.stats().contains("\"uploads\": 0"));
+        assert_eq!(mock.stats().uploads, 0);
     }
 
     #[test]
