@@ -283,14 +283,28 @@ fn main() -> anyhow::Result<()> {
     // made every unprivileged mount fail. obsfs keeps allow_other off unless
     // `-o allow_other` is passed (hws_s3fs.cpp:210, `static bool allow_other
     // = false`), and this does the same.
-    let acl = fuser::SessionACL::Owner;
-    let mount_options = vec![MountOption::FSName("obs-mount".to_string())];
-    // auto_unmount keeps the mount alive through a fusermount helper and is
-    // only available for the All/RootAndOwner sessions, so it cannot be used
-    // with an owner-only mount. Not a real loss: fuser's Session unmounts on
-    // drop, which covers a normal exit; only SIGKILL leaves the mount behind,
-    // and running as root the kernel clears it when the process dies anyway.
-    tracing::debug!("owner-only session: auto_unmount not used (fuser requires allow_other)");
+    // Access control: allow only the mounting user, like obsfs (whose
+    // allow_other defaults to off, hws_s3fs.cpp:210). fuser maps both `All`
+    // and `RootAndOwner` onto the kernel's allow_other, which fusermount
+    // rejects for a non-root user unless /etc/fuse.conf opts in -- but it is
+    // fine as root, and root only is also what makes auto_unmount available.
+    let is_root = current_uid() == 0;
+    let acl = if is_root {
+        fuser::SessionACL::RootAndOwner
+    } else {
+        fuser::SessionACL::Owner
+    };
+    let mut mount_options = vec![MountOption::FSName("obs-mount".to_string())];
+    // auto_unmount needs a session other than Owner: fusermount holds the
+    // mount open and detaches it when this process dies, including on
+    // SIGTERM/SIGKILL. Without it a `systemctl stop` would leave a stale
+    // mountpoint behind, and cleaning that up would require knowing the
+    // mountpoint -- which only the config knows, not the unit file.
+    if acl == fuser::SessionACL::Owner {
+        tracing::debug!("unprivileged mount: auto_unmount unavailable with an owner-only session");
+    } else {
+        mount_options.push(MountOption::AutoUnmount);
+    }
     // Config is #[non_exhaustive], so build it from Default and mutate.
     let mut config = fuser::Config::default();
     config.mount_options = mount_options;
@@ -300,6 +314,9 @@ fn main() -> anyhow::Result<()> {
         let hint = if msg.contains("No such file or directory") {
             "  If /dev/fuse exists, the fusermount helper is missing: \
              apt-get install fuse3."
+        } else if msg.contains("allow_other") {
+            "  fusermount refused allow_other: add `user_allow_other` to \
+             /etc/fuse.conf, or run as root."
         } else {
             ""
         };

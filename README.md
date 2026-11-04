@@ -167,12 +167,10 @@ sudo mkdir -p /mnt/obs
 sudo systemctl daemon-reload && sudo systemctl enable --now obs-mount
 ```
 
-卸载：`systemctl stop obs-mount` 或 `fusermount -u /mnt/obs`。
+卸载：`systemctl stop obs-mount`。进程退出时由 fusermount 自动摘除挂载，
+所以 unit 文件里不需要写挂载点，`systemctl stop` 对任何配置路径都成立。
 
-**访问权限**：默认只有挂载者本人能访问，与 obsfs 一致（它也是 `allow_other`
-默认关闭）。这是 FUSE 的 owner-only 模式，不需要 `/etc/fuse.conf` 里配
-`user_allow_other`，所以普通用户也能直接挂载。进程正常退出时 fuser 会自动卸载；
-被 `SIGKILL` 杀掉则需手动 `umount`。
+**访问权限**：只有挂载者本人能访问，与 obsfs 一致（它的 `allow_other` 也默认关闭）。
 
 ## 验证状态
 

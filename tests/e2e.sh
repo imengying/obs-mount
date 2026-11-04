@@ -303,13 +303,8 @@ kill "$path_pid" 2>/dev/null
 # allow_other, which fusermount rejects without user_allow_other in
 # /etc/fuse.conf, and auto_unmount is not available for an owner-only
 # session. Both are now chosen from the effective uid.
-echo "== mount is owner-only (no allow_other by default, like obsfs) =="
+echo "== mount is read-write =="
 opts=$(grep -F " $MNT " /proc/self/mountinfo | sed 's/.* - [^ ]* //')
-if printf '%s' "$opts" | grep -q "allow_other"; then
-  fail "mount options carry allow_other" "$opts" "owner-only"
-else
-  pass "mount options are owner-only"
-fi
 opts_rw=$(printf '%s' "$opts" | grep -c '\brw\b' || true)
 eq "mount is read-write" "$opts_rw" "1"
 
@@ -353,6 +348,39 @@ EOF
     echo "  skip unprivileged mount (cannot create a test user)"
   fi
 fi
+
+# --- unmount on SIGTERM ------------------------------------------------
+# auto_unmount makes fusermount detach the mount when this process dies, so
+# `systemctl stop` does not need to know the mountpoint. The unit file carries
+# no path for that reason; this asserts the behaviour it relies on.
+echo "== SIGTERM detaches the mount =="
+SMNT=$WORK/sigmnt
+mkdir -p "$SMNT"
+cat >"$WORK/sig.yaml" <<EOF
+mountpoint: $SMNT
+bucket: test-bucket
+endpoint: http://127.0.0.1:$PORT
+ak: TESTAK
+sk: TESTSK
+EOF
+chmod 600 "$WORK/sig.yaml"
+setsid "$BIN" --config "$WORK/sig.yaml" >"$WORK/sig.log" 2>&1 &
+sig_pid=$!
+for _ in $(seq 1 50); do is_mounted "$SMNT" && break; sleep 0.1; done
+if is_mounted "$SMNT"; then
+  kill -TERM "$sig_pid" 2>/dev/null
+  for _ in $(seq 1 50); do is_mounted "$SMNT" || break; sleep 0.1; done
+  if is_mounted "$SMNT"; then
+    fail "mount detached on SIGTERM" "still mounted" "detached"
+    umount -l "$SMNT" 2>/dev/null
+  else
+    pass "mount detached on SIGTERM"
+  fi
+else
+  fail "SIGTERM test mount" "not mounted" "mounted"
+  echo "--- sig.log ---"; tail -8 "$WORK/sig.log"
+fi
+wait "$sig_pid" 2>/dev/null
 
 # --- a POSIX/file bucket must be refused, not silently misused ------------
 echo "== refuses an OBS POSIX (file) bucket =="

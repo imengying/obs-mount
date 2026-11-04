@@ -6,7 +6,6 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/etc/obs/obs-mount --config /etc/obs/obs-mount.yaml
-ExecStop=-/usr/bin/fusermount3 -u /mnt/obs
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
