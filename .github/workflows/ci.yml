@@ -68,9 +68,22 @@ jobs:
           # fuse3 provides fusermount; attr provides setfattr/getfattr so the
           # xattr assertions actually run instead of silently skipping.
           sudo apt-get install -y --no-install-recommends fuse3 attr
-          OBS_E2E_REQUIRE_XATTR=1 ./tests/e2e.sh
+          set +e
+          OBS_E2E_REQUIRE_XATTR=1 ./tests/e2e.sh >"$RUNNER_TEMP/e2e.log" 2>&1
+          status=$?
+          cat "$RUNNER_TEMP/e2e.log"
+          exit $status
+
+      - name: Upload e2e log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-log
+          path: ${{ runner.temp }}/e2e.log
+          if-no-files-found: ignore
 
       - name: Upload glibc binary
+        if: success()
         uses: actions/upload-artifact@v7
         with:
           name: obs-mount-x86_64-linux-gnu

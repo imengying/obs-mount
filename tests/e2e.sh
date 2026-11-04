@@ -25,8 +25,16 @@ server_pid=""
 mount_pid=""
 failures=0
 
+# Is $1 a mountpoint? Reads /proc rather than shelling out to `mountpoint`,
+# which some minimal images do not ship -- a missing binary made this report
+# "mount failed" when the mount was actually fine.
+is_mounted() {
+  awk -v p="$1" '{ for (i = 5; i <= NF; i++) if ($i == p) found = 1 } END { exit !found }' \
+    /proc/self/mountinfo 2>/dev/null
+}
+
 cleanup() {
-  if mountpoint -q "$MNT" 2>/dev/null; then
+  if is_mounted "$MNT"; then
     fusermount3 -u "$MNT" 2>/dev/null || fusermount -u "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null
   fi
   [ -n "$mount_pid" ] && kill "$mount_pid" 2>/dev/null
@@ -75,15 +83,17 @@ echo "== mounting =="
 "$BIN" --config "$CONF" >"$WORK/mount.log" 2>&1 &
 mount_pid=$!
 for _ in $(seq 1 50); do
-  mountpoint -q "$MNT" && break
+  is_mounted "$MNT" && break
   sleep 0.1
 done
-if ! mountpoint -q "$MNT"; then
+if ! is_mounted "$MNT"; then
   echo "FAIL: mount did not come up"
   echo "--- diagnostics ---"
   ls -l /dev/fuse 2>&1 || echo "/dev/fuse MISSING"
   id
   command -v fusermount3 fusermount mountpoint 2>&1 || true
+  echo "--- mountinfo for $MNT ---"
+  grep -F " $MNT " /proc/self/mountinfo 2>/dev/null || echo "(not listed)"
   cat /proc/filesystems | grep -i fuse || echo "fuse not in /proc/filesystems"
   echo "--- mount log ---"
   tail -30 "$WORK/mount.log"
@@ -264,10 +274,10 @@ chmod 600 "$WORK/path.yaml"
 "$BIN" --config "$WORK/path.yaml" >"$WORK/path.log" 2>&1 &
 path_pid=$!
 for _ in $(seq 1 50); do
-  mountpoint -q "$PATH_MNT" && break
+  is_mounted "$PATH_MNT" && break
   sleep 0.1
 done
-if mountpoint -q "$PATH_MNT"; then
+if is_mounted "$PATH_MNT"; then
   echo hello-path >"$PATH_MNT/p.txt"
   eq "path-style write/read" "$(cat "$PATH_MNT/p.txt")" "hello-path"
   fusermount3 -u "$PATH_MNT" 2>/dev/null || fusermount -u "$PATH_MNT" 2>/dev/null || umount -l "$PATH_MNT" 2>/dev/null
