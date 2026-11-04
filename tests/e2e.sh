@@ -298,6 +298,52 @@ else
 fi
 kill "$path_pid" 2>/dev/null
 
+# --- unprivileged mount --------------------------------------------------
+# Running as a normal user used to fail outright: the session ACL asked for
+# allow_other, which fusermount rejects without user_allow_other in
+# /etc/fuse.conf, and auto_unmount is not available for an owner-only
+# session. Both are now chosen from the effective uid.
+echo "== unprivileged mount (non-root, no user_allow_other) =="
+if [ "$(id -u)" = "0" ] && [ -z "${OBS_E2E_SKIP_UNPRIV:-}" ]; then
+  TESTUSER=obs_e2e_user
+  if ! id "$TESTUSER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$TESTUSER" 2>/dev/null || true
+  fi
+  if id "$TESTUSER" >/dev/null 2>&1; then
+    UMNT=$WORK/umnt
+    mkdir -p "$UMNT"
+    # mktemp -d is 0700 root: the test user must be able to traverse $WORK,
+    # read its own config and run the binary from it.
+    chmod 755 "$WORK"
+    chown "$TESTUSER:$TESTUSER" "$UMNT"
+    cp "$BIN" "$WORK/obs-mount-unpriv"
+    chmod 755 "$WORK/obs-mount-unpriv"
+    cat >"$WORK/unpriv.yaml" <<EOF
+mountpoint: $UMNT
+bucket: test-bucket
+endpoint: http://127.0.0.1:$PORT
+ak: TESTAK
+sk: TESTSK
+EOF
+    chmod 644 "$WORK/unpriv.yaml"
+    setsid su -s /bin/bash "$TESTUSER" -c \
+      "$WORK/obs-mount-unpriv --config $WORK/unpriv.yaml" >"$WORK/unpriv.log" 2>&1 &
+    unpriv_pid=$!
+    for _ in $(seq 1 50); do is_mounted "$UMNT" && break; sleep 0.1; done
+    if is_mounted "$UMNT"; then
+      out=$(su -s /bin/bash "$TESTUSER" -c "echo hi > $UMNT/u.txt && cat $UMNT/u.txt" 2>&1)
+      eq "non-root write/read" "$out" "hi"
+      fusermount3 -u "$UMNT" 2>/dev/null || fusermount -u "$UMNT" 2>/dev/null || umount -l "$UMNT" 2>/dev/null
+    else
+      fail "unprivileged mount" "not mounted" "mounted"
+      tail -5 "$WORK/unpriv.log"
+    fi
+    kill "$unpriv_pid" 2>/dev/null
+  else
+    echo "  skip unprivileged mount (cannot create a test user)"
+  fi
+fi
+
 # --- a POSIX/file bucket must be refused, not silently misused ------------
 echo "== refuses an OBS POSIX (file) bucket =="
 for pid in $(pgrep -f "mock_obs[.]py $PORT" 2>/dev/null); do kill "$pid" 2>/dev/null; done

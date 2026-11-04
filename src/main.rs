@@ -208,8 +208,10 @@ fn main() -> anyhow::Result<()> {
     // Staging is not configurable: always under the system temp dir
     // (std::env::temp_dir(), i.e. $TMPDIR or /tmp on Linux), so a
     // half-written file never needs a hand-picked directory.
-    let staging_dir = std::env::temp_dir().join("obs-mount-staging");
-    std::fs::create_dir_all(&staging_dir)?;
+    // Per-uid directory in the system temp dir. A single shared name would be
+    // owned by whoever mounted first, and a second user could then neither
+    // create nor clean staging files in it.
+    let staging_dir = staging_dir_for(&std::env::temp_dir(), current_uid());
     let client = ObsClient::new(ak, sk, bucket.clone(), endpoint.clone());
     tracing::info!(
         endpoint = %endpoint,
@@ -272,10 +274,15 @@ fn main() -> anyhow::Result<()> {
         "upload tuning"
     );
     let fs = ObsFs::new(client, staging_dir, upload);
-    // fuser 0.18: allow-root moved from MountOption to the session ACL.
-    // allow_root is always on (the mount is normally run as root anyway):
-    // root plus the mounting user can see the mount. There is no
-    // allow_other option — other users do not get access.
+    // fuser 0.18 moved allow_root from MountOption to the session ACL, and
+    // both `All` and `RootAndOwner` become the kernel's `allow_other`. That
+    // option is rejected by fusermount for a non-root user unless
+    // /etc/fuse.conf contains user_allow_other, so it cannot be requested
+    // unconditionally:
+    //
+    //   root      -> RootAndOwner (root plus the mounting user)
+    //   non-root  -> Owner (only the mounting user; no allow_other needed,
+    //                which is what makes an unprivileged mount work at all)
     //
     // AutoUnmount is only possible through the setuid `fusermount` helper:
     // fuser refuses to take the direct /dev/fuse path when that option is
@@ -283,33 +290,47 @@ fn main() -> anyhow::Result<()> {
     // `ENOENT` that says nothing about a missing package. So probe for the
     // helper first and fall back to a plain mount (unmounted by the kernel
     // when the process dies, only not lazily detached) instead of failing.
-    let mut mount_options = vec![
-        MountOption::FSName("obs-mount".to_string()),
-        MountOption::DefaultPermissions,
-    ];
-    match fusermount_bin() {
-        Some(bin) => {
-            tracing::debug!(helper = %bin, "using fusermount helper (auto_unmount enabled)");
-            mount_options.push(MountOption::AutoUnmount);
+    let is_root = current_uid() == 0;
+    let acl = if is_root {
+        fuser::SessionACL::RootAndOwner
+    } else {
+        fuser::SessionACL::Owner
+    };
+    let mut mount_options = vec![MountOption::FSName("obs-mount".to_string())];
+    // auto_unmount is implemented by fusermount holding the mount open, and
+    // fuser only offers it for the All / RootAndOwner sessions, so it is
+    // incompatible with the Owner ACL that an unprivileged mount needs.
+    if acl == fuser::SessionACL::Owner {
+        tracing::debug!("unprivileged mount: auto_unmount unavailable with the owner-only session");
+    } else {
+        match fusermount_bin() {
+            Some(bin) => {
+                tracing::debug!(helper = %bin, "using fusermount helper (auto_unmount enabled)");
+                mount_options.push(MountOption::AutoUnmount);
+            }
+            None => tracing::warn!(
+                "fusermount/fusermount3 not found: mounting without auto_unmount. \
+                 Install the fuse3 package (Debian/Ubuntu: apt-get install fuse3) to get \
+                 automatic lazy unmount on exit."
+            ),
         }
-        None => tracing::warn!(
-            "fusermount/fusermount3 not found: mounting without auto_unmount. \
-             Install the fuse3 package (Debian/Ubuntu: apt-get install fuse3) to get \
-             automatic lazy unmount on exit."
-        ),
     }
-    let acl = fuser::SessionACL::RootAndOwner;
     // Config is #[non_exhaustive], so build it from Default and mutate.
     let mut config = fuser::Config::default();
     config.mount_options = mount_options;
     config.acl = acl;
     fuser::mount(fs, &mountpoint, &config).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot mount {}: {e}\n\
-             If this says 'No such file or directory' while /dev/fuse exists, the \
-             fusermount helper is missing: apt-get install fuse3.",
-            mountpoint.display()
-        )
+        let msg = e.to_string();
+        let hint = if msg.contains("allow_other") {
+            "  fusermount refused allow_other. Either run as root, or add\
+             `user_allow_other` to /etc/fuse.conf."
+        } else if msg.contains("No such file or directory") {
+            "  If /dev/fuse exists, the fusermount helper is missing:\
+             apt-get install fuse3."
+        } else {
+            ""
+        };
+        anyhow::anyhow!("cannot mount {}: {e}\n{hint}", mountpoint.display())
     })?;
     Ok(())
 }
@@ -327,6 +348,24 @@ fn fusermount_bin() -> Option<String> {
         .into_iter()
         .find(|name| search_path(name).is_some())
         .map(|name| search_path(name).unwrap_or_else(|| name.to_string()))
+}
+
+fn current_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+/// Staging directory for this user, created with 0700.
+///
+/// `/tmp/obs-mount-staging-<uid>` rather than one shared path: temp dirs are
+/// world-writable, so a fixed name would let one user's leftover files (or a
+/// file planted by someone else) sit in another user's staging area.
+fn staging_dir_for(base: &std::path::Path, uid: u32) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = base.join(format!("obs-mount-staging-{uid}"));
+    let _ = std::fs::create_dir_all(&dir);
+    // Best effort: tighten the mode even if the directory already existed.
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    dir
 }
 
 fn search_path(name: &str) -> Option<String> {
