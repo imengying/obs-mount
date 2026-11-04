@@ -58,7 +58,7 @@ impl FileConfig {
 /// Native OBS REST signing only (HMAC-SHA1, `Authorization: OBS AK:...`,
 /// `x-obs-*` headers) — no S3/SigV4 code path.
 ///
-/// Credentials come from a config file (YAML, see --config),
+/// Credentials come from a config file (YAML, see -c),
 /// the environment, or a flag — never put them on the command line in
 /// a way that shows up in `ps` output for a shared machine; prefer the
 /// file. Example /etc/obs/obs-mount.yaml:
@@ -117,7 +117,7 @@ struct Args {
     /// Config file (YAML) to read at startup. Defaults to
     /// $OBS_MOUNT_CONFIG, else /etc/obs/obs-mount.yaml if it exists.
     /// Flags and env vars override values from the file.
-    #[arg(long, env = "OBS_MOUNT_CONFIG")]
+    #[arg(short = 'c', env = "OBS_MOUNT_CONFIG")]
     config: Option<PathBuf>,
 
     /// Local directory to mount on (must exist and be empty).
@@ -163,7 +163,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    // Resolve the config file: explicit --config wins, otherwise the
+    // Resolve the config file: an explicit -c wins, otherwise the
     // first default location that exists; no file at all is fine as long
     // as every required value comes from a flag or the environment.
     let config_path = args.config.clone().or_else(|| {

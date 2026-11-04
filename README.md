@@ -11,12 +11,12 @@ sudo apt-get install -y fuse3 attr        # fusermount、setfattr/getfattr
 cargo build --release
 sudo install -m 0755 target/release/obs-mount /etc/obs/obs-mount
 sudo install -m 0600 obs-mount.yaml.example /etc/obs/obs-mount.yaml   # 填 AK/SK、桶、endpoint
-obs-mount --config /etc/obs/obs-mount.yaml
+obs-mount -c /etc/obs/obs-mount.yaml
 ```
 
 ## 配置
 
-YAML，默认 `/etc/obs/obs-mount.yaml`，可用 `--config` 指定。优先级：命令行 > 环境变量 > 文件。
+YAML，默认 `/etc/obs/obs-mount.yaml`，可用 `-c` 指定。优先级：命令行 > 环境变量 > 文件。
 未知字段启动即报错。模板见 `obs-mount.yaml.example`，含凭据的文件用 0600。
 
 | 字段 | 环境变量 | 说明 |

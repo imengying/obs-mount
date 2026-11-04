@@ -89,7 +89,7 @@ EOF
 chmod 600 "$CONF"
 
 echo "== mounting =="
-"$BIN" --config "$CONF" >"$WORK/mount.log" 2>&1 &
+"$BIN" -c "$CONF" >"$WORK/mount.log" 2>&1 &
 mount_pid=$!
 for _ in $(seq 1 50); do
   is_mounted "$MNT" && break
@@ -282,7 +282,7 @@ ak: TESTAK
 sk: TESTSK
 EOF
 chmod 600 "$WORK/path.yaml"
-"$BIN" --config "$WORK/path.yaml" >"$WORK/path.log" 2>&1 &
+"$BIN" -c "$WORK/path.yaml" >"$WORK/path.log" 2>&1 &
 path_pid=$!
 for _ in $(seq 1 50); do
   is_mounted "$PATH_MNT" && break
@@ -332,7 +332,7 @@ sk: TESTSK
 EOF
     chmod 644 "$WORK/unpriv.yaml"
     setsid su -s /bin/bash "$TESTUSER" -c \
-      "$WORK/obs-mount-unpriv --config $WORK/unpriv.yaml" >"$WORK/unpriv.log" 2>&1 &
+      "$WORK/obs-mount-unpriv -c $WORK/unpriv.yaml" >"$WORK/unpriv.log" 2>&1 &
     unpriv_pid=$!
     for _ in $(seq 1 50); do is_mounted "$UMNT" && break; sleep 0.1; done
     if is_mounted "$UMNT"; then
@@ -364,7 +364,7 @@ ak: TESTAK
 sk: TESTSK
 EOF
 chmod 600 "$WORK/sig.yaml"
-setsid "$BIN" --config "$WORK/sig.yaml" >"$WORK/sig.log" 2>&1 &
+setsid "$BIN" -c "$WORK/sig.yaml" >"$WORK/sig.log" 2>&1 &
 sig_pid=$!
 for _ in $(seq 1 50); do is_mounted "$SMNT" && break; sleep 0.1; done
 if is_mounted "$SMNT"; then
@@ -389,7 +389,7 @@ sleep 0.5
 OBS_MOCK_BUCKET_TYPE=posix python3 "$REPO/tests/mock_obs.py" "$PORT" >"$WORK/server2.log" 2>&1 &
 server_pid=$!
 sleep 1.2
-out=$("$BIN" --config "$CONF" 2>&1)
+out=$("$BIN" -c "$CONF" 2>&1)
 if printf '%s' "$out" | grep -qi "POSIX/file bucket"; then
   pass "file bucket rejected with an explanation"
 else
