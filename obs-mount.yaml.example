@@ -14,3 +14,15 @@ sk: YOUR_SECRET_KEY_HERE
 # 默认 25 MB 起用分段上传，每片 10 MB（与华为 obsfs 一致）。一般不用改。
 # multipart_threshold: 26214400
 # multipart_part_size: 10485760
+
+# 分段大小允许 100 KiB～5 GiB；单次 PUT 超过 5 GiB 会强制分段。
+# 工作线程直接从暂存文件读取各段，不把整个分段读入内存。
+# upload_concurrency: 4          # 1～32
+
+# 暂存始终使用系统 TMPDIR（默认 /tmp）。低于保留空间时拒绝继续扩展文件。
+# min_free_space: 67108864       # 64 MiB；设为 0 关闭预留检查
+# metadata_cache_entries: 10000  # 本地仍有暂存文件的元数据不参与淘汰
+
+# 每次尝试的总超时；连接建立超时为 30 秒。
+# request_timeout_secs: 120      # 元数据等普通请求
+# transfer_timeout_secs: 3600    # 内容传输、复制、合并分段

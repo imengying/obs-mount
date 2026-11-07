@@ -38,6 +38,8 @@ const SUBRESOURCES: &[&str] = &[
     "quota",
     "storageinfo",
     "encryption",
+    "metadata",
+    "versionId",
     "response-content-type",
     "response-content-language",
     "response-expires",
@@ -59,6 +61,10 @@ pub struct Fault {
     key: String,
     query: Option<String>,
     status: u16,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
     #[serde(default = "one")]
     count: usize,
 }
@@ -79,13 +85,16 @@ struct Object {
     data: Vec<u8>,
     meta: BTreeMap<String, String>,
     modified: String,
+    etag: String,
 }
 
 impl Object {
     fn new(data: Vec<u8>, meta: BTreeMap<String, String>) -> Self {
+        let etag = format!("\"{}\"", md5_hex(&data));
         Self {
             data,
             meta,
+            etag,
             modified: chrono::Utc::now()
                 .format("%a, %d %b %Y %H:%M:%S GMT")
                 .to_string(),
@@ -93,7 +102,7 @@ impl Object {
     }
 
     fn etag(&self) -> String {
-        format!("\"{}\"", md5_hex(&self.data))
+        self.etag.clone()
     }
 }
 
@@ -225,7 +234,19 @@ impl Incoming {
     fn meta(&self) -> BTreeMap<String, String> {
         self.headers
             .iter()
-            .filter(|(k, _)| k.starts_with("x-obs-meta-"))
+            .filter(|(k, _)| {
+                k.starts_with("x-obs-meta-")
+                    || matches!(
+                        k.as_str(),
+                        "content-type"
+                            | "content-encoding"
+                            | "content-disposition"
+                            | "content-language"
+                            | "cache-control"
+                            | "expires"
+                            | "x-obs-storage-class"
+                    )
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
@@ -392,7 +413,12 @@ impl State {
                     .is_none_or(|q| req.query.contains_key(q))
             {
                 fault.count -= 1;
-                return Reply::empty(fault.status);
+                return Reply {
+                    status: fault.status,
+                    body: fault.body.as_bytes().to_vec(),
+                    headers: fault.headers.clone().into_iter().collect(),
+                    length: None,
+                };
             }
         }
         if !req.valid_auth() {
@@ -491,6 +517,57 @@ impl State {
     }
 
     fn put(&mut self, req: &Incoming) -> Reply {
+        if req.query.contains_key("metadata") {
+            let Some(object) = self.objects.get_mut(&req.key) else {
+                return Reply::error(404, "NoSuchKey");
+            };
+            match req.header("x-obs-metadata-directive") {
+                "REPLACE_NEW" => object.meta.retain(|k, _| !k.starts_with("x-obs-meta-")),
+                "REPLACE" => object.meta.clear(),
+                _ => return Reply::error(400, "InvalidArgument"),
+            }
+            object.meta.extend(req.meta());
+            return Reply::empty(200);
+        }
+        if let (Some(id), Some(source)) = (
+            req.query.get("uploadId"),
+            req.headers.get("x-obs-copy-source"),
+        ) {
+            let key = decode(strip_bucket(source));
+            let Some(object) = self.objects.get(&key) else {
+                return Reply::error(404, "NoSuchKey");
+            };
+            if req.header("x-obs-copy-source-if-match") != object.etag() {
+                return Reply::empty(412);
+            }
+            let Some(range) = req.header("x-obs-copy-source-range").strip_prefix("bytes=") else {
+                return Reply::empty(400);
+            };
+            let Some((start, end)) = range
+                .split_once('-')
+                .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
+            else {
+                return Reply::empty(400);
+            };
+            let Some(data) = object.data.get(start..=end) else {
+                return Reply::empty(416);
+            };
+            let data = data.to_vec();
+            let Some(upload) = self.uploads.get_mut(id) else {
+                return Reply::error(404, "NoSuchUpload");
+            };
+            let number = req
+                .query
+                .get("partNumber")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            let etag = md5_hex(&data);
+            upload.parts.insert(number, data);
+            return Reply::xml(
+                200,
+                format!("<CopyPartResult><ETag>{etag}</ETag></CopyPartResult>"),
+            );
+        }
         if let Some(id) = req.query.get("uploadId") {
             let Some(upload) = self.uploads.get_mut(id).filter(|u| u.key == req.key) else {
                 return Reply::error(404, "NoSuchUpload");
@@ -511,6 +588,11 @@ impl State {
             let Some(mut object) = self.objects.get(&key).cloned() else {
                 return Reply::error(404, "NoSuchKey");
             };
+            if let Some(tag) = req.headers.get("x-obs-copy-source-if-match")
+                && tag != &object.etag()
+            {
+                return Reply::empty(412);
+            }
             if req
                 .header("x-obs-metadata-directive")
                 .eq_ignore_ascii_case("REPLACE")
@@ -834,6 +916,11 @@ impl MountProcess {
             "OBS_SK",
             "OBS_MULTIPART_THRESHOLD",
             "OBS_MULTIPART_PART_SIZE",
+            "OBS_UPLOAD_CONCURRENCY",
+            "OBS_MIN_FREE_SPACE",
+            "OBS_METADATA_CACHE_ENTRIES",
+            "OBS_REQUEST_TIMEOUT_SECS",
+            "OBS_TRANSFER_TIMEOUT_SECS",
         ] {
             command.env_remove(key);
         }
@@ -892,14 +979,20 @@ impl MountProcess {
             unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) },
             0
         );
-        self.wait_exit();
+        let status = self.wait_exit();
+        assert!(
+            status.success(),
+            "mount did not shut down cleanly ({status}): {}",
+            self.log()
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while is_mounted(&self.mountpoint) && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
         }
         assert!(
             !is_mounted(&self.mountpoint),
-            "SIGTERM left a stale mount: {}",
+            "SIGTERM left a stale mount {}: {}",
+            self.mountpoint.display(),
             self.log()
         );
     }
@@ -911,8 +1004,7 @@ impl Drop for MountProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if is_mounted(&self.mountpoint) {
-            for helper in ["fusermount3", "fusermount", "umount"] {
-                let flag = if helper == "umount" { "-l" } else { "-uz" };
+            for (helper, flag) in [("fusermount3", "-uz"), ("umount", "-l")] {
                 let _ = Command::new(helper)
                     .args([flag, "--"])
                     .arg(&self.mountpoint)

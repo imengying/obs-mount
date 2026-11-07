@@ -26,24 +26,65 @@ use quick_xml::events::Event;
 use reqwest::blocking::Client;
 use sha1::Sha1;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
 use std::time::Duration;
 use thiserror::Error;
 
 type HmacSha1 = Hmac<Sha1>;
 
-/// Total attempts per request (the first try plus retries). obsfs uses 3
-/// retries; this is 4 attempts, close enough while backing off further.
+/// Total attempts per request: one initial attempt and four retries.
 const RETRY_ATTEMPTS: u32 = 5;
+pub const MAX_SINGLE_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+pub const MIN_PART_SIZE: usize = 100 * 1024;
+pub const MAX_OBJECT_SIZE: u64 = MAX_SINGLE_SIZE * 10_000;
+pub const MAX_METADATA_SIZE: usize = 8 * 1024;
+const SYSTEM_METADATA: &[&str] = &[
+    "content-type",
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "expires",
+    "x-obs-storage-class",
+    "x-obs-website-redirect-location",
+];
+
+pub fn validate_metadata(meta: &[(String, String)]) -> Result<()> {
+    let size: usize = meta
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("x-obs-meta-")
+                .map(|name| name.len() + v.len())
+        })
+        .sum();
+    if size > MAX_METADATA_SIZE {
+        return Err(ObsError::Io(std::io::Error::from_raw_os_error(libc::E2BIG)));
+    }
+    Ok(())
+}
+
 const RETRY_BASE_MS: u64 = 500;
-/// Cap so a long outage cannot park a FUSE request for minutes.
+/// Maximum delay between attempts.
 const RETRY_MAX_MS: u64 = 8_000;
 
 /// Exponential backoff: 0.5s, 1s, 2s, 4s (capped).
 fn backoff_delay(attempt: u32) -> Duration {
     let ms = RETRY_BASE_MS.saturating_mul(1u64 << attempt.min(6));
     Duration::from_millis(ms.min(RETRY_MAX_MS))
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        % 251;
+    backoff_delay(attempt) + Duration::from_millis(jitter)
 }
 
 /// Statuses worth retrying: transient server-side failures and throttling.
@@ -94,6 +135,8 @@ fn is_subresource(name: &str) -> bool {
             | "storageinfo"
             | "quota"
             | "encryption"
+            | "metadata"
+            | "versionId"
             | "response-content-type"
             | "response-content-language"
             | "response-expires"
@@ -104,19 +147,19 @@ fn is_subresource(name: &str) -> bool {
 }
 
 /// Percent-encode one path segment (keeps unreserved chars, encodes the rest).
-pub fn encode_segment(s: &str) -> String {
+fn encode_segment(s: &str) -> String {
     urlencoding::encode(s).into_owned()
 }
 
 /// Encode a key, preserving `/` as the separator.
-pub fn encode_key(key: &str) -> String {
+fn encode_key(key: &str) -> String {
     key.split('/')
         .map(encode_segment)
         .collect::<Vec<_>>()
         .join("/")
 }
 
-pub fn rfc1123_now() -> String {
+fn rfc1123_now() -> String {
     Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
@@ -126,7 +169,7 @@ pub fn md5_base64(data: &[u8]) -> String {
     B64.encode(h.finalize())
 }
 
-pub fn obs_signature(
+fn obs_signature(
     sk: &str,
     method: &str,
     content_md5: &str,
@@ -164,11 +207,7 @@ pub fn obs_signature(
 #[derive(Debug, Clone, Default)]
 pub struct ObjectMeta {
     pub size: u64,
-    /// Kept for logging/diagnostics; nothing branches on it yet.
-    #[allow(dead_code)]
     pub last_modified: Option<String>,
-    /// Same: recorded so a future conditional request can use it.
-    #[allow(dead_code)]
     pub etag: Option<String>,
     /// POSIX-ish attributes persisted in object metadata. `None` means "not
     /// recorded on the object", which callers render with a default rather
@@ -177,6 +216,7 @@ pub struct ObjectMeta {
     /// Every `x-obs-meta-*` header, key without the prefix, lower-case.
     /// Holds user xattrs and the symlink target as well as `unix`'s fields.
     pub x_obs_meta: Vec<(String, String)>,
+    pub system_meta: Vec<(String, String)>,
 }
 
 /// The Unix attributes this program persists in object metadata.
@@ -208,7 +248,7 @@ pub mod meta_keys {
 }
 
 /// Parse the persisted Unix attributes out of an `x-obs-meta-*` list.
-pub fn parse_unix_meta(meta: &[(String, String)]) -> Option<UnixMeta> {
+fn parse_unix_meta(meta: &[(String, String)]) -> Option<UnixMeta> {
     let get = |key: &str| {
         meta.iter()
             .find(|(k, _)| k == key)
@@ -241,14 +281,6 @@ pub fn unix_meta_headers(meta: UnixMeta) -> Vec<(String, String)> {
     ]
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ListEntry {
-    pub key: String,
-    pub size: u64,
-    pub is_dir_placeholder: bool,
-}
-
 /// What kind of bucket sits behind the endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketKind {
@@ -263,7 +295,7 @@ pub enum BucketKind {
 
 /// Decide the bucket kind from the two headers OBS uses for it. Split out so
 /// the rule is testable without a server.
-pub fn classify_bucket(bucket_type: &str, fs_interface: &str) -> BucketKind {
+fn classify_bucket(bucket_type: &str, fs_interface: &str) -> BucketKind {
     if bucket_type.eq_ignore_ascii_case("posix") || fs_interface.eq_ignore_ascii_case("enabled") {
         BucketKind::File
     } else {
@@ -271,23 +303,9 @@ pub fn classify_bucket(bucket_type: &str, fs_interface: &str) -> BucketKind {
     }
 }
 
-/// Bucket usage as reported by `GET /?storageinfo`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BucketUsage {
-    pub size: Option<u64>,
-    pub object_number: Option<u64>,
-}
-
-/// Bucket quota as reported by `GET /?quota`.
-/// A `quota` of 0 means no quota is configured (unlimited), not "no space".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BucketQuota {
-    pub quota: Option<u64>,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ListResult {
-    pub objects: Vec<ListEntry>,
+    pub keys: Vec<String>,
     pub prefixes: Vec<String>, // directory prefixes, each ending with '/'
     pub is_truncated: bool,
     pub next_marker: Option<String>,
@@ -308,6 +326,8 @@ pub struct ObsClient {
     /// through a VPN/proxy/CNAME endpoint is impossible.
     path_style: bool,
     http: Client,
+    request_timeout: Duration,
+    transfer_timeout: Duration,
 }
 
 /// Whether an endpoint must be addressed path-style (`/bucket/key`).
@@ -374,15 +394,21 @@ fn host_of(endpoint: &str) -> Option<String> {
 /// Re-open files for every retry; memory use is independent of object size.
 enum RequestBody {
     Bytes(Vec<u8>),
-    File { path: PathBuf, len: u64 },
+    File {
+        path: PathBuf,
+        offset: u64,
+        len: u64,
+    },
 }
 
 impl RequestBody {
     fn md5(&self) -> Result<String> {
         match self {
             Self::Bytes(bytes) => Ok(md5_base64(bytes)),
-            Self::File { path, .. } => {
+            Self::File { path, offset, len } => {
                 let mut file = File::open(path)?;
+                file.seek(SeekFrom::Start(*offset))?;
+                let mut file = file.take(*len);
                 let mut hash = Md5::new();
                 let mut buf = [0u8; 64 * 1024];
                 loop {
@@ -400,7 +426,11 @@ impl RequestBody {
     fn body(&self) -> Result<reqwest::blocking::Body> {
         Ok(match self {
             Self::Bytes(bytes) => bytes.clone().into(),
-            Self::File { path, len } => reqwest::blocking::Body::sized(File::open(path)?, *len),
+            Self::File { path, offset, len } => {
+                let mut file = File::open(path)?;
+                file.seek(SeekFrom::Start(*offset))?;
+                reqwest::blocking::Body::sized(file.take(*len), *len)
+            }
         })
     }
 }
@@ -413,7 +443,9 @@ impl ObsClient {
         #[cfg(test)]
         let builder = builder.no_proxy();
         let http = builder
+            .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client");
         let endpoint = endpoint.trim_end_matches('/').to_string();
@@ -433,7 +465,15 @@ impl ObsClient {
             endpoint,
             path_style,
             http,
+            request_timeout: Duration::from_secs(120),
+            transfer_timeout: Duration::from_secs(3600),
         }
+    }
+
+    pub fn with_timeouts(mut self, request_seconds: u64, transfer_seconds: u64) -> Self {
+        self.request_timeout = Duration::from_secs(request_seconds);
+        self.transfer_timeout = Duration::from_secs(transfer_seconds);
+        self
     }
 
     /// Prefix that object URLs are appended to.
@@ -450,14 +490,17 @@ impl ObsClient {
         self.path_style
     }
 
-    #[allow(dead_code)]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub fn bucket(&self) -> &str {
         &self.bucket
     }
 
     /// Build the signed request parts for one call.
     /// `query` is the full query string (already encoded) or empty.
-    /// Returns (url, authorization, date, x-obs headers).
+    /// Returns (url, authorization, x-obs headers).
     fn sign(
         &self,
         method: &str,
@@ -472,30 +515,7 @@ impl ObsClient {
         for (k, v) in extra_x_obs {
             x_obs.push((k.clone(), v.clone()));
         }
-        // CanonicalizedResource: /<bucket>/<encoded key>[?<sorted sub-resources>]
-        //
-        // The key is percent-encoded exactly as it appears in the request
-        // line. OBS signs the path it received, so signing the decoded form
-        // makes any key with a non-ASCII byte -- or a space, or any other
-        // character encode_key touches -- fail with SignatureDoesNotMatch,
-        // which this program surfaces as EACCES. ASCII keys happen to encode
-        // to themselves, which is why only the CJK directories broke.
-        let mut resource = format!("/{}/{}", self.bucket, encode_key(key));
-        if !query.is_empty() {
-            let subs: Vec<&str> = query
-                .split('&')
-                .filter(|p| {
-                    let name = p.split('=').next().unwrap_or("");
-                    is_subresource(name)
-                })
-                .collect();
-            if !subs.is_empty() {
-                let mut subs = subs;
-                subs.sort();
-                resource.push('?');
-                resource.push_str(&subs.join("&"));
-            }
-        }
+        let resource = canonical_resource(&self.bucket, key, query);
         let sig = obs_signature(
             &self.sk,
             method,
@@ -535,40 +555,65 @@ impl ObsClient {
         extra_x_obs: &[(String, String)],
         extra_headers: &[(String, String)],
     ) -> Result<reqwest::blocking::Response> {
+        validate_metadata(extra_x_obs)?;
+        let mut standard = extra_headers.to_vec();
+        standard.extend(
+            extra_x_obs
+                .iter()
+                .filter(|(k, _)| !k.starts_with("x-obs-"))
+                .cloned(),
+        );
+        let content_type = extra_x_obs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or(content_type);
+        standard.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
+        let obs_headers: Vec<_> = extra_x_obs
+            .iter()
+            .filter(|(k, _)| k.starts_with("x-obs-"))
+            .cloned()
+            .collect();
         let content_md5 = body
             .as_ref()
             .map(RequestBody::md5)
             .transpose()?
             .unwrap_or_default();
-        // Only send Content-MD5 when there is a body; otherwise the signed
-        // value must stay empty or the signature will not match.
-        let (url, auth, x_obs) = self.sign(
-            method,
-            key,
-            query,
-            if body.is_some() { &content_md5 } else { "" },
-            content_type,
-            extra_x_obs,
-        );
-        let mut last_err: Option<ObsError> = None;
-        // obsfs retries 3 times (S3fsCurl::retries) with a fixed delay; this
-        // keeps the same attempt count but backs off exponentially, so a
-        // short throttle clears quickly and a real outage is not hammered.
-        for attempt in 0..RETRY_ATTEMPTS {
+        let transfer = matches!(&body, Some(RequestBody::File { .. }))
+            || (method == "GET" && !key.is_empty() && query.is_empty())
+            || (method == "POST" && query.starts_with("uploadId="))
+            || obs_headers.iter().any(|(k, _)| k == "x-obs-copy-source");
+        let timeout = if transfer {
+            self.transfer_timeout
+        } else {
+            self.request_timeout
+        };
+        // Re-sign each attempt and back off with jitter after transient failures.
+        let mut attempt = 0;
+        loop {
+            let (url, auth, x_obs) = self.sign(
+                method,
+                key,
+                query,
+                if body.is_some() { &content_md5 } else { "" },
+                content_type,
+                &obs_headers,
+            );
             let mut req = self
                 .http
                 .request(
                     reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
                     &url,
                 )
-                .header("Authorization", &auth);
+                .header("Authorization", &auth)
+                .timeout(timeout);
             // No `Date` header: `x-obs-date` below carries it, and sending
             // both makes reqwest and OBS disagree about which one is
             // canonical.
             for (k, v) in &x_obs {
                 req = req.header(k.as_str(), v.as_str());
             }
-            for (k, v) in extra_headers {
+            for (k, v) in &standard {
                 req = req.header(k.as_str(), v.as_str());
             }
             if !content_type.is_empty() {
@@ -580,34 +625,19 @@ impl ObsClient {
             match req.send() {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    // 5xx (or 429): retry with backoff, unless this was the
-                    // last try. 403 is never retried -- it means the
-                    // signature or credentials are wrong and will stay wrong.
-                    if status == 403 || !is_retryable_status(status) {
+                    if !is_retryable_status(status) || attempt + 1 == RETRY_ATTEMPTS {
                         return Ok(resp);
                     }
-                    if attempt + 1 == RETRY_ATTEMPTS {
-                        return Ok(resp);
-                    }
-                    let body_text = resp.text().unwrap_or_default();
-                    last_err = Some(ObsError::Http {
-                        status,
-                        method: method.to_string(),
-                        path: key.to_string(),
-                        body: body_text,
-                    });
-                    std::thread::sleep(backoff_delay(attempt));
                 }
                 Err(e) => {
                     if attempt + 1 == RETRY_ATTEMPTS {
                         return Err(ObsError::Network(e));
                     }
-                    last_err = Some(ObsError::Network(e));
-                    std::thread::sleep(backoff_delay(attempt));
                 }
             }
+            std::thread::sleep(retry_delay(attempt));
+            attempt += 1;
         }
-        Err(last_err.unwrap_or_else(|| ObsError::Other("request failed".into())))
     }
 
     fn check(
@@ -619,7 +649,7 @@ impl ObsClient {
         if (200..300).contains(&status) {
             Ok(resp)
         } else {
-            let body = resp.text().unwrap_or_default();
+            let body = response_diagnostic(resp);
             Err(ObsError::Http {
                 status,
                 method: method.to_string(),
@@ -698,6 +728,15 @@ impl ObsClient {
                 .map(|s| s.trim_matches('"').to_string()),
             unix,
             x_obs_meta,
+            system_meta: SYSTEM_METADATA
+                .iter()
+                .filter_map(|name| {
+                    Some((
+                        name.to_string(),
+                        headers.get(*name)?.to_str().ok()?.to_string(),
+                    ))
+                })
+                .collect(),
         }))
     }
 
@@ -709,11 +748,13 @@ impl ObsClient {
         max_keys: usize,
     ) -> Result<ListResult> {
         let mut query = format!(
-            "prefix={}&delimiter={}&max-keys={}",
+            "prefix={}&max-keys={}",
             urlencoding::encode(prefix),
-            urlencoding::encode(delimiter),
             max_keys
         );
+        if !delimiter.is_empty() {
+            query.push_str(&format!("&delimiter={}", urlencoding::encode(delimiter)));
+        }
         if let Some(m) = marker {
             query.push_str(&format!("&marker={}", urlencoding::encode(m)));
         }
@@ -725,45 +766,15 @@ impl ObsClient {
 
     /// List every key under `prefix` (no delimiter), following pagination.
     pub fn list_all_keys(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
-        let mut marker: Option<String> = None;
-        loop {
-            let mut query = format!("prefix={}&max-keys=1000", urlencoding::encode(prefix));
-            if let Some(m) = &marker {
-                query.push_str(&format!("&marker={}", urlencoding::encode(m)));
-            }
-            let resp = self.send("GET", "", &query, None, "", &[], &[])?;
-            let resp = Self::check(resp, "GET", "")?;
-            let text = resp.text()?;
-            let page = parse_list_xml(&text)?;
-            let truncated = page.is_truncated;
-            let next = page.next_marker.clone();
-            keys.extend(page.objects.into_iter().map(|o| o.key));
-            if !truncated {
-                break;
-            }
-            marker = next.or_else(|| keys.last().cloned());
-            if marker.is_none() {
-                break;
-            }
-        }
-        Ok(keys)
+        Ok(self.list_all(prefix, "")?.keys)
     }
 
-    /// Bucket-wide usage: `GET /?storageinfo`.
-    ///
-    /// Returns what OBS knows about the bucket as a whole -- total bytes
-    /// stored and the object count. This is the closest thing OBS offers to
-    /// "how full is it", but note it reports *used*, never *capacity*: a
-    /// bucket's limit is a quota the account owns, not a fixed disk size.
-    pub fn bucket_storage_info(&self) -> Result<BucketUsage> {
+    /// Stored bytes reported by `GET /?storageinfo`, not bucket capacity.
+    pub fn bucket_storage_size(&self) -> Result<Option<u64>> {
         let resp = self.send("GET", "", "storageinfo", None, "", &[], &[])?;
         let resp = Self::check(resp, "GET", "?storageinfo")?;
         let text = resp.text()?;
-        Ok(BucketUsage {
-            size: parse_tag(&text, "Size").and_then(|v| v.parse().ok()),
-            object_number: parse_tag(&text, "ObjectNumber").and_then(|v| v.parse().ok()),
-        })
+        Ok(parse_tag(&text, "Size").and_then(|v| v.parse().ok()))
     }
 
     /// Bucket storage quota: `GET /?quota`.
@@ -772,48 +783,101 @@ impl ObsClient {
     /// set, which means "unlimited" rather than "no space" -- the opposite
     /// of what a `df` reader would assume, so callers must not treat 0 as
     /// "full".
-    pub fn bucket_quota(&self) -> Result<BucketQuota> {
+    pub fn bucket_quota(&self) -> Result<Option<u64>> {
         let resp = self.send("GET", "", "quota", None, "", &[], &[])?;
         let resp = Self::check(resp, "GET", "?quota")?;
         let text = resp.text()?;
-        Ok(BucketQuota {
-            quota: parse_tag(&text, "StorageQuota").and_then(|v| v.parse().ok()),
-        })
+        Ok(parse_tag(&text, "StorageQuota").and_then(|v| v.parse().ok()))
     }
 
     /// List one directory level (delimiter="/"), following pagination.
     pub fn list_dir(&self, dir_prefix: &str) -> Result<ListResult> {
+        self.list_all(dir_prefix, "/")
+    }
+
+    fn list_all(&self, prefix: &str, delimiter: &str) -> Result<ListResult> {
         let mut out = ListResult::default();
         let mut marker: Option<String> = None;
         loop {
-            let page = self.list_objects(dir_prefix, "/", marker.as_deref(), 1000)?;
-            out.objects.extend(page.objects);
+            let page = self.list_objects(prefix, delimiter, marker.as_deref(), 1000)?;
+            out.keys.extend(page.keys);
             out.prefixes.extend(page.prefixes);
             if !page.is_truncated {
                 break;
             }
+            if page.next_marker == marker {
+                return Err(ObsError::Other("listing marker did not advance".into()));
+            }
             marker = page.next_marker;
             if marker.is_none() {
-                break;
+                return Err(ObsError::Other(
+                    "truncated listing has no continuation marker".into(),
+                ));
             }
         }
         Ok(out)
     }
 
+    #[cfg(test)]
     pub fn get_range(&self, key: &str, start: u64, len: usize) -> Result<Vec<u8>> {
-        let end = start + len as u64 - 1;
-        let range = format!("bytes={start}-{end}");
-        let resp = self.send(
-            "GET",
+        let meta = self
+            .head_object(key)?
+            .ok_or_else(|| ObsError::Other("object missing".into()))?;
+        self.get_range_checked(
             key,
-            "",
-            None,
-            "",
-            &[],
-            &[("Range".to_string(), range)],
-        )?;
-        let resp = Self::check(resp, "GET", key)?;
-        Ok(resp.bytes()?.to_vec())
+            start,
+            len,
+            meta.etag
+                .as_deref()
+                .ok_or_else(|| ObsError::Other("missing ETag".into()))?,
+            meta.size,
+        )
+    }
+
+    pub fn get_range_checked(
+        &self,
+        key: &str,
+        start: u64,
+        len: usize,
+        etag: &str,
+        total: u64,
+    ) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = start
+            .checked_add(len as u64 - 1)
+            .filter(|end| *end < total)
+            .ok_or_else(|| ObsError::Other("invalid range".into()))?;
+        let headers = vec![
+            ("Range".into(), format!("bytes={start}-{end}")),
+            ("If-Match".into(), format!("\"{}\"", etag.trim_matches('"'))),
+        ];
+        for attempt in 0..RETRY_ATTEMPTS {
+            let resp = self.send("GET", key, "", None, "", &[], &headers)?;
+            let resp = Self::check(resp, "GET", key)?;
+            let expected = format!("bytes {start}-{end}/{total}");
+            if resp.status().as_u16() != 206
+                || resp
+                    .headers()
+                    .get("content-range")
+                    .and_then(|v| v.to_str().ok())
+                    != Some(expected.as_str())
+            {
+                return Err(ObsError::Other(format!(
+                    "invalid Content-Range for {key}: expected {expected}"
+                )));
+            }
+            match resp.bytes() {
+                Ok(data) if data.len() == len => return Ok(data.to_vec()),
+                Ok(_) if attempt + 1 == RETRY_ATTEMPTS => {
+                    return Err(ObsError::Other("short range response".into()));
+                }
+                Err(e) if attempt + 1 == RETRY_ATTEMPTS => return Err(e.into()),
+                _ => std::thread::sleep(retry_delay(attempt)),
+            }
+        }
+        unreachable!()
     }
 
     /// PUT with `x-obs-meta-*` headers attached.
@@ -836,25 +900,16 @@ impl ObsClient {
         Ok(())
     }
 
-    /// Rewrite an object's metadata in place without moving its bytes.
-    ///
-    /// OBS exposes metadata replacement only through CopyObject with
-    /// `x-obs-metadata-directive: REPLACE` and the object copied onto itself,
-    /// which is exactly what obsfs does for chmod/chown/setxattr
-    /// (s3fs_setxattr_s3). The data is not re-uploaded, so changing a
-    /// permission bit on a 100 GiB object is cheap.
+    /// Update metadata through OBS's dedicated API. Unspecified system
+    /// headers survive REPLACE_NEW; the caller supplies all user metadata.
     pub fn set_object_meta(&self, key: &str, meta: &[(String, String)]) -> Result<()> {
-        let source = format!("/{}/{}", self.bucket, encode_key(key));
-        let mut headers = vec![
-            ("x-obs-copy-source".to_string(), source),
-            (
-                "x-obs-metadata-directive".to_string(),
-                "REPLACE".to_string(),
-            ),
-        ];
+        let mut headers = vec![("x-obs-metadata-directive".into(), "REPLACE_NEW".into())];
         headers.extend_from_slice(meta);
-        let resp = self.send("PUT", key, "", None, "", &headers, &[])?;
-        Self::check(resp, "PUT", key)?;
+        Self::check(
+            self.send("PUT", key, "metadata", None, "", &headers, &[])?,
+            "PUT",
+            key,
+        )?;
         Ok(())
     }
 
@@ -869,27 +924,71 @@ impl ObsClient {
     }
 
     pub fn copy_object(&self, src_key: &str, dst_key: &str) -> Result<()> {
-        let source = format!("/{}/{}", self.bucket, encode_key(src_key));
-        let resp = self.send(
-            "PUT",
-            dst_key,
-            "",
-            None,
-            "",
-            &[("x-obs-copy-source".to_string(), source)],
-            &[],
-        )?;
-        Self::check(resp, "PUT", dst_key)?;
-        Ok(())
+        self.copy_object_with_limit(src_key, dst_key, MAX_SINGLE_SIZE)
+    }
+
+    fn copy_object_with_limit(&self, src_key: &str, dst_key: &str, limit: u64) -> Result<()> {
+        let meta = self.head_object(src_key)?.ok_or_else(|| ObsError::Http {
+            status: 404,
+            method: "HEAD".into(),
+            path: src_key.into(),
+            body: "source missing".into(),
+        })?;
+        let etag = meta
+            .etag
+            .as_deref()
+            .ok_or_else(|| ObsError::Other("copy source has no ETag".into()))?;
+        let headers = vec![
+            (
+                "x-obs-copy-source".into(),
+                format!("/{}/{}", self.bucket, encode_key(src_key)),
+            ),
+            ("x-obs-copy-source-if-match".into(), format!("\"{etag}\"")),
+        ];
+        if meta.size <= limit {
+            let resp = self.send("PUT", dst_key, "", None, "", &headers, &[])?;
+            checked_result(resp, "PUT", dst_key, "CopyObjectResult")?;
+            return Ok(());
+        }
+        validate_object_size(meta.size)?;
+        let mut metadata = meta.system_meta.clone();
+        metadata.extend(
+            meta.x_obs_meta
+                .iter()
+                .map(|(k, v)| (format!("x-obs-meta-{k}"), v.clone())),
+        );
+        let id = self.initiate_multipart_with_meta(dst_key, &metadata)?;
+        let result = (|| {
+            let part_size = limit.max(meta.size.div_ceil(10_000));
+            let mut parts = Vec::new();
+            for (index, start) in (0..meta.size).step_by(part_size as usize).enumerate() {
+                let mut headers = headers.clone();
+                headers.push((
+                    "x-obs-copy-source-range".into(),
+                    format!("bytes={start}-{}", (start + part_size).min(meta.size) - 1),
+                ));
+                let query = format!(
+                    "partNumber={}&uploadId={}",
+                    index + 1,
+                    urlencoding::encode(&id)
+                );
+                let resp = self.send("PUT", dst_key, &query, None, "", &headers, &[])?;
+                let etag = checked_result(resp, "PUT", dst_key, "CopyPartResult")?;
+                parts.push((index as u32 + 1, etag));
+            }
+            self.complete_multipart(dst_key, &id, &parts)
+        })();
+        if result.is_err()
+            && let Err(e) = self.abort_multipart(dst_key, &id)
+        {
+            tracing::error!(key=dst_key, upload_id=%id, error=%e, "failed to cancel multipart copy; source retained");
+        }
+        result
     }
 
     /// Multipart init with `x-obs-meta-*`; metadata set here ends up on the
     /// final object, which is the only chance to attach it for a large file.
-    pub fn initiate_multipart_with_meta(
-        &self,
-        key: &str,
-        meta: &[(String, String)],
-    ) -> Result<String> {
+    fn initiate_multipart_with_meta(&self, key: &str, meta: &[(String, String)]) -> Result<String> {
         let resp = self.send("POST", key, "uploads", None, "", meta, &[])?;
         let resp = Self::check(resp, "POST", key)?;
         let text = resp.text()?;
@@ -897,12 +996,12 @@ impl ObsClient {
             .ok_or_else(|| ObsError::Other("no UploadId in response".into()))
     }
 
-    pub fn upload_part(
+    fn upload_part(
         &self,
         key: &str,
         upload_id: &str,
         part_number: u32,
-        data: &[u8],
+        body: RequestBody,
     ) -> Result<String> {
         let query = format!(
             "partNumber={part_number}&uploadId={}",
@@ -912,7 +1011,7 @@ impl ObsClient {
             "PUT",
             key,
             &query,
-            Some(RequestBody::Bytes(data.to_vec())),
+            Some(body),
             "application/octet-stream",
             &[],
             &[],
@@ -925,10 +1024,13 @@ impl ObsClient {
             .unwrap_or("")
             .trim_matches('"')
             .to_string();
+        if etag.is_empty() {
+            return Err(ObsError::Other("upload part response has no ETag".into()));
+        }
         Ok(etag)
     }
 
-    pub fn complete_multipart(
+    fn complete_multipart(
         &self,
         key: &str,
         upload_id: &str,
@@ -936,6 +1038,7 @@ impl ObsClient {
     ) -> Result<()> {
         let mut body = String::from("<CompleteMultipartUpload>");
         for (n, etag) in parts {
+            let etag = quick_xml::escape::escape(etag);
             body.push_str(&format!(
                 "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"
             ));
@@ -951,14 +1054,16 @@ impl ObsClient {
             &[],
             &[],
         )?;
-        Self::check(resp, "POST", key)?;
+        checked_result(resp, "POST", key, "CompleteMultipartUploadResult")?;
         Ok(())
     }
 
-    pub fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
+    fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
         let query = format!("uploadId={}", urlencoding::encode(upload_id));
         let resp = self.send("DELETE", key, &query, None, "", &[], &[])?;
-        let _ = Self::check(resp, "DELETE", key);
+        if resp.status().as_u16() != 404 {
+            Self::check(resp, "DELETE", key)?;
+        }
         Ok(())
     }
 
@@ -966,30 +1071,46 @@ impl ObsClient {
     /// An unsuccessful or short response must never become writable staging.
     pub fn download_to(&self, key: &str, path: &Path, meta: &ObjectMeta) -> Result<()> {
         let partial = path.with_extension("download");
-        let result = (|| {
-            let headers = meta
-                .etag
-                .as_ref()
-                .map(|tag| vec![("If-Match".into(), format!("\"{tag}\""))])
-                .unwrap_or_default();
-            let resp = self.send("GET", key, "", None, "", &[], &headers)?;
-            let mut resp = Self::check(resp, "GET", key)?;
-            let mut file = File::create(&partial)?;
-            let copied = std::io::copy(&mut resp, &mut file)?;
-            if copied != meta.size {
-                return Err(ObsError::Other(format!(
-                    "incomplete download: expected {}, received {copied}",
-                    meta.size
-                )));
+        let etag = meta
+            .etag
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ObsError::Other("download requires ETag".into()))?;
+        let headers = [("If-Match".into(), format!("\"{etag}\""))];
+        for attempt in 0..RETRY_ATTEMPTS {
+            let response = Self::check(
+                self.send("GET", key, "", None, "", &[], &headers)?,
+                "GET",
+                key,
+            )?;
+            let result = (|| {
+                let mut file = File::create(&partial)?;
+                let mut reader = response.take(meta.size.saturating_add(1));
+                let copied = std::io::copy(&mut reader, &mut file)?;
+                if copied != meta.size {
+                    return Err(ObsError::Other(format!(
+                        "incomplete download: expected {}, received {copied}",
+                        meta.size
+                    )));
+                }
+                file.sync_all()?;
+                std::fs::rename(&partial, path)?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&partial);
+                    if attempt + 1 == RETRY_ATTEMPTS
+                        || matches!(&e,ObsError::Io(e) if matches!(e.raw_os_error(),Some(libc::ENOSPC|libc::EACCES|libc::EROFS)))
+                    {
+                        return Err(e);
+                    }
+                    std::thread::sleep(retry_delay(attempt));
+                }
             }
-            file.flush()?;
-            std::fs::rename(&partial, path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(partial);
         }
-        result
+        unreachable!()
     }
 
     /// Upload a staging file with bounded buffers. Small PUTs also stream from
@@ -1001,15 +1122,33 @@ impl ObsClient {
         tuning: UploadTuning,
         meta: &[(String, String)],
     ) -> Result<()> {
-        let mut file = File::open(path)?;
-        let len = file.metadata()?.len();
-        if len == 0 || len < tuning.threshold {
+        tuning.validate()?;
+        let len = File::open(path)?.metadata()?.len();
+        validate_object_size(len)?;
+        let journal_path = path.with_extension("upload.yaml");
+        if journal_path.exists() {
+            let previous: UploadJournal =
+                serde_yaml::from_str(&std::fs::read_to_string(&journal_path)?)
+                    .map_err(|e| ObsError::Other(format!("invalid upload recovery record: {e}")))?;
+            if previous.bucket != self.bucket
+                || previous.endpoint != self.endpoint
+                || previous.key != key
+            {
+                return Err(ObsError::Other(
+                    "upload recovery record belongs to another object; inspect before retry".into(),
+                ));
+            }
+            self.abort_multipart(key, &previous.upload_id)?;
+            std::fs::remove_file(&journal_path)?;
+        }
+        if len == 0 || (len < tuning.threshold && len <= MAX_SINGLE_SIZE) {
             let resp = self.send(
                 "PUT",
                 key,
                 "",
                 Some(RequestBody::File {
                     path: path.to_owned(),
+                    offset: 0,
                     len,
                 }),
                 "application/octet-stream",
@@ -1019,58 +1158,216 @@ impl ObsClient {
             Self::check(resp, "PUT", key)?;
             return Ok(());
         }
-        let file_len = usize::try_from(len)
-            .map_err(|_| ObsError::Other("file too large for this platform".into()))?;
-        let part = multipart_part_size_with(file_len, tuning.part_size);
-        let upload_id = self.initiate_multipart_with_meta(key, meta)?;
-        let mut parts = Vec::new();
-        let mut remaining = file_len;
-        let mut part_no = 1;
-        let mut result = Ok(());
-        while remaining > 0 && result.is_ok() {
-            let mut handles = Vec::new();
-            for _ in 0..4 {
-                if remaining == 0 {
-                    break;
-                }
-                let mut chunk = vec![0; remaining.min(part)];
-                if let Err(e) = file.read_exact(&mut chunk) {
-                    result = Err(ObsError::Io(e));
-                    break;
-                }
-                remaining -= chunk.len();
-                let client = self.clone();
-                let key = key.to_owned();
-                let upload_id = upload_id.clone();
-                let number = part_no;
-                handles.push((
-                    number,
-                    std::thread::spawn(move || {
-                        client.upload_part(&key, &upload_id, number, &chunk)
-                    }),
-                ));
-                part_no += 1;
+        let part = multipart_part_size_with(len as usize, tuning.part_size) as u64;
+        let id = self.initiate_multipart_with_meta(key, meta)?;
+        let journal = Mutex::new(UploadJournal {
+            endpoint: self.endpoint.clone(),
+            bucket: self.bucket.clone(),
+            key: key.into(),
+            upload_id: id.clone(),
+            size: len,
+            parts: Vec::new(),
+            completing: false,
+        });
+        if let Err(e) = write_journal(&journal_path, &journal.lock().unwrap()) {
+            if let Err(abort) = self.abort_multipart(key, &id) {
+                tracing::error!(key, upload_id=%id, error=%abort, "multipart cancellation failed");
             }
-            // Always join all workers before aborting, including read failures.
-            for (number, handle) in handles {
-                match handle.join() {
-                    Ok(Ok(etag)) => parts.push((number, etag)),
-                    Ok(Err(e)) if result.is_ok() => result = Err(e),
-                    Err(_) if result.is_ok() => {
-                        result = Err(ObsError::Other("part upload thread panicked".into()))
-                    }
-                    _ => {}
+            return Err(e);
+        }
+        let next = AtomicU32::new(1);
+        let failed = AtomicBool::new(false);
+        let count = len.div_ceil(part) as u32;
+        let result = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..tuning.concurrency.min(count as usize))
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        while !failed.load(Ordering::Relaxed) {
+                            let number = next.fetch_add(1, Ordering::Relaxed);
+                            if number > count {
+                                break;
+                            }
+                            let offset = (number as u64 - 1) * part;
+                            let result = (|| {
+                                let etag = self.upload_part(
+                                    key,
+                                    &id,
+                                    number,
+                                    RequestBody::File {
+                                        path: path.to_owned(),
+                                        offset,
+                                        len: part.min(len - offset),
+                                    },
+                                )?;
+                                let mut journal = journal.lock().unwrap();
+                                journal.parts.push((number, etag));
+                                write_journal(&journal_path, &journal)
+                            })();
+                            if result.is_err() {
+                                failed.store(true, Ordering::Relaxed);
+                            }
+                            result?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            let mut error = None;
+            for worker in workers {
+                if let Err(e) = worker
+                    .join()
+                    .unwrap_or_else(|_| Err(ObsError::Other("upload worker panicked".into())))
+                    && error.is_none()
+                {
+                    error = Some(e);
                 }
             }
+            error.map_or(Ok(()), Err)
+        });
+        if let Err(e) = result {
+            match self.abort_multipart(key, &id) {
+                Ok(()) => {
+                    std::fs::remove_file(&journal_path)?;
+                }
+                Err(abort) => {
+                    tracing::error!(key, upload_id=%id, error=%abort, "multipart cancellation failed; recovery record retained")
+                }
+            }
+            return Err(e);
         }
-        if result.is_ok() {
-            result = self.complete_multipart(key, &upload_id, &parts);
-        }
-        if result.is_err() {
-            let _ = self.abort_multipart(key, &upload_id);
-        }
-        result
+        let mut journal = journal.into_inner().unwrap();
+        journal.parts.sort_by_key(|(n, _)| *n);
+        journal.completing = true;
+        write_journal(&journal_path, &journal)?;
+        // If completion is ambiguous, keep both the staged bytes and journal.
+        self.complete_multipart(key, &id, &journal.parts)?;
+        std::fs::remove_file(journal_path)?;
+        Ok(())
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UploadJournal {
+    endpoint: String,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    size: u64,
+    parts: Vec<(u32, String)>,
+    completing: bool,
+}
+
+fn write_journal(path: &Path, journal: &UploadJournal) -> Result<()> {
+    let bytes = serde_yaml::to_string(journal).map_err(|e| ObsError::Other(e.to_string()))?;
+    let temp = path.with_extension("tmp");
+    let mut file = File::create(&temp)?;
+    file.write_all(bytes.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(temp, path)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn validate_object_size(len: u64) -> Result<()> {
+    if len > MAX_OBJECT_SIZE {
+        return Err(ObsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)));
+    }
+    Ok(())
+}
+
+fn response_diagnostic(response: reqwest::blocking::Response) -> String {
+    let request = response
+        .headers()
+        .get("x-obs-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let extended = response
+        .headers()
+        .get("x-obs-id-2")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    format!(
+        "request-id={request}, id-2={extended}: {}",
+        response
+            .text()
+            .unwrap_or_else(|e| format!("unreadable error body: {e}"))
+    )
+}
+
+fn checked_result(
+    response: reqwest::blocking::Response,
+    method: &str,
+    key: &str,
+    expected: &str,
+) -> Result<String> {
+    let response = ObsClient::check(response, method, key)?;
+    let request = response
+        .headers()
+        .get("x-obs-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let text = response.text()?;
+    let mut reader = Reader::from_str(&text);
+    let mut depth = 0usize;
+    let mut root = None;
+    let mut closed = false;
+    let mut direct_etag = 0;
+    loop {
+        match reader.read_event()? {
+            Event::Start(e) => {
+                if depth == 0 {
+                    if root.is_some() {
+                        return Err(ObsError::Other("multiple response roots".into()));
+                    }
+                    root = Some(e.local_name().as_ref().to_string());
+                }
+                if e.local_name().as_ref() == "ETag" {
+                    if depth != 1 {
+                        return Err(ObsError::Other("invalid nested ETag".into()));
+                    }
+                    direct_etag += 1;
+                }
+                depth += 1;
+            }
+            Event::Empty(_) if depth == 0 => {
+                return Err(ObsError::Other("unexpected empty response root".into()));
+            }
+            Event::DocType(_) => {
+                return Err(ObsError::Other("unexpected XML document type".into()));
+            }
+            Event::Text(e) if depth == 0 && !e.as_ref().trim().is_empty() => {
+                return Err(ObsError::Other("text outside response root".into()));
+            }
+            Event::End(_) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| ObsError::Other("invalid response XML".into()))?;
+                if depth == 0 {
+                    closed = true;
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    let etag = parse_tag(&text, "ETag").filter(|s| !s.trim_matches('"').trim().is_empty());
+    if root.as_deref() != Some(expected)
+        || !closed
+        || depth != 0
+        || etag.is_none()
+        || direct_etag != 1
+    {
+        return Err(ObsError::Other(format!(
+            "{method} {key}: invalid {expected}, request-id={request}: {text}"
+        )));
+    }
+    etag.map(|tag| tag.trim_matches('"').to_string())
+        .ok_or_else(|| ObsError::Other("missing result ETag".into()))
 }
 
 /// Extract the text of the first `<tag>...</tag>` element.
@@ -1141,7 +1438,7 @@ fn parse_tag(xml: &str, tag: &str) -> Option<String> {
 /// Minimal ListBucketResult parser (Contents / CommonPrefixes / IsTruncated /
 /// NextMarker). Uses an event reader so the `xmlns` on the root element does
 /// not matter.
-pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
+fn parse_list_xml(xml: &str) -> Result<ListResult> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -1149,7 +1446,6 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
     // Stack of element names; Contents/CommonPrefixes are tracked by depth.
     let mut stack: Vec<String> = Vec::new();
     let mut cur_key: Option<String> = None;
-    let mut cur_size: u64 = 0;
     let mut cur_text_elem: Option<String> = None;
     let mut cur_text = String::new();
 
@@ -1159,7 +1455,6 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
                 let name = e.name().as_ref().to_owned();
                 if name == "Contents" {
                     cur_key = None;
-                    cur_size = 0;
                 }
                 stack.push(name.clone());
                 cur_text_elem = Some(name);
@@ -1189,11 +1484,7 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
                 if name == "Contents"
                     && let Some(key) = cur_key.take()
                 {
-                    out.objects.push(ListEntry {
-                        is_dir_placeholder: key.ends_with('/'),
-                        key,
-                        size: cur_size,
-                    });
+                    out.keys.push(key);
                 }
                 // Commit the element's text now that all fragments are in.
                 if let Some(elem) = cur_text_elem.take() {
@@ -1201,10 +1492,6 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
                     let in_prefix = stack.iter().any(|s| s == "CommonPrefixes");
                     match elem.as_str() {
                         "Key" if in_contents => cur_key = Some(std::mem::take(&mut cur_text)),
-                        "Size" if in_contents => {
-                            cur_size = cur_text.parse().unwrap_or(0);
-                            cur_text.clear();
-                        }
                         "Prefix" if in_prefix => out.prefixes.push(std::mem::take(&mut cur_text)),
                         "IsTruncated" if stack.len() == 2 => {
                             out.is_truncated = cur_text == "true";
@@ -1231,17 +1518,16 @@ pub fn parse_list_xml(xml: &str) -> Result<ListResult> {
     // OBS returns NextMarker only when truncated; fall back to the last key.
     if out.is_truncated
         && out.next_marker.is_none()
-        && let Some(last) = out.objects.last()
+        && let Some(last) = out.keys.last()
     {
-        out.next_marker = Some(last.key.clone());
+        out.next_marker = Some(last.clone());
     }
     Ok(out)
 }
 
-/// Canonical resource helper, exposed for unit tests.
-#[allow(dead_code)]
-pub fn canonical_resource(bucket: &str, key: &str, query: &str) -> String {
-    let mut resource = format!("/{bucket}/{key}");
+/// Sign the encoded path exactly as sent, plus sorted OBS subresources.
+fn canonical_resource(bucket: &str, key: &str, query: &str) -> String {
+    let mut resource = format!("/{bucket}/{}", encode_key(key));
     if !query.is_empty() {
         let mut subs: Vec<&str> = query
             .split('&')
@@ -1256,13 +1542,10 @@ pub fn canonical_resource(bucket: &str, key: &str, query: &str) -> String {
     resource
 }
 
-/// Part size for a multipart upload: 10 MB normally, growing just enough
-/// that the file never needs more than 10000 parts.
-/// Part size, honouring a configured base size but still growing it so a
-/// huge file never needs more than 10000 parts (the per-upload limit).
-pub fn multipart_part_size_with(file_len: usize, base: usize) -> usize {
+/// Grow the configured part size enough to stay within the 10000-part limit.
+fn multipart_part_size_with(file_len: usize, base: usize) -> usize {
     const MAX_PARTS: usize = 10_000;
-    let base = base.max(5 * 1024 * 1024); // OBS minimum part size is 5 MiB
+    let base = base.max(MIN_PART_SIZE); // OBS permits 100 KiB for non-final parts
     base.max(file_len.div_ceil(MAX_PARTS))
 }
 
@@ -1282,6 +1565,19 @@ pub const DEFAULT_MULTIPART_THRESHOLD: u64 = 25 * 1024 * 1024;
 pub struct UploadTuning {
     pub threshold: u64,
     pub part_size: usize,
+    pub concurrency: usize,
+}
+
+impl UploadTuning {
+    pub fn validate(self) -> Result<()> {
+        if self.threshold == 0
+            || !(MIN_PART_SIZE..=MAX_SINGLE_SIZE as usize).contains(&self.part_size)
+            || !(1..=32).contains(&self.concurrency)
+        {
+            return Err(ObsError::Other("invalid upload settings: threshold > 0, part size 100 KiB..5 GiB, concurrency 1..32 required".into()));
+        }
+        Ok(())
+    }
 }
 
 impl Default for UploadTuning {
@@ -1289,6 +1585,7 @@ impl Default for UploadTuning {
         Self {
             threshold: DEFAULT_MULTIPART_THRESHOLD,
             part_size: DEFAULT_PART_SIZE,
+            concurrency: 4,
         }
     }
 }
@@ -1296,6 +1593,209 @@ impl Default for UploadTuning {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn copy_requires_a_complete_success_result() {
+        for body in [
+            "<Error><Code>InternalError</Code></Error>",
+            "",
+            "<CopyObjectResult><ETag>abc</ETag>",
+            "<CopyObjectResult><ETag/></CopyObjectResult>",
+        ] {
+            let faults =
+                serde_json::json!([{"method":"PUT","key":"target","status":200,"body":body}]);
+            let mock = crate::test_support::MockObs::new(&faults.to_string());
+            let client = mock.client();
+            client
+                .put_object_with_meta("source", b"irreplaceable", &[])
+                .unwrap();
+            assert!(
+                client.copy_object("source", "target").is_err(),
+                "accepted {body}"
+            );
+            assert!(client.head_object("source").unwrap().is_some());
+            assert!(client.head_object("target").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn metadata_update_and_multipart_copy_preserve_content_and_system_headers() {
+        let mock = crate::test_support::MockObs::new("[]");
+        let client = mock.client();
+        client
+            .put_object_with_meta(
+                "src",
+                b"abcdefghijk",
+                &[
+                    ("content-type".into(), "text/plain".into()),
+                    ("cache-control".into(), "max-age=3600".into()),
+                    ("x-obs-meta-owner".into(), "alice".into()),
+                ],
+            )
+            .unwrap();
+        client
+            .set_object_meta("src", &[("x-obs-meta-owner".into(), "bob".into())])
+            .unwrap();
+        let meta = client.head_object("src").unwrap().unwrap();
+        assert!(
+            meta.system_meta
+                .contains(&("content-type".into(), "text/plain".into()))
+        );
+        assert!(
+            meta.system_meta
+                .contains(&("cache-control".into(), "max-age=3600".into()))
+        );
+        client.copy_object_with_limit("src", "dst", 4).unwrap();
+        assert_eq!(client.get_range("dst", 0, 11).unwrap(), b"abcdefghijk");
+        let copied = client.head_object("dst").unwrap().unwrap();
+        assert_eq!(copied.system_meta, meta.system_meta);
+        assert_eq!(copied.x_obs_meta, meta.x_obs_meta);
+        assert_eq!(mock.stats().uploads, 0);
+        assert_eq!(mock.stats().signature_failures, 0);
+    }
+
+    #[test]
+    fn completion_errors_and_cancel_errors_are_not_success() {
+        let mock = crate::test_support::MockObs::new(
+            r#"[
+            {"method":"POST","query":"uploadId","key":"data","status":200,"body":"<Error><Code>InternalError</Code></Error>"},
+            {"method":"DELETE","query":"uploadId","key":"data","status":403}
+        ]"#,
+        );
+        let client = mock.client();
+        let id = client.initiate_multipart_with_meta("data", &[]).unwrap();
+        let etag = client
+            .upload_part("data", &id, 1, RequestBody::Bytes(b"last part".to_vec()))
+            .unwrap();
+        assert!(
+            client
+                .complete_multipart("data", &id, &[(1, etag)])
+                .is_err()
+        );
+        assert!(client.abort_multipart("data", &id).is_err());
+        assert_eq!(mock.stats().uploads, 1);
+        client.abort_multipart("data", &id).unwrap();
+        assert_eq!(mock.stats().uploads, 0);
+    }
+
+    #[test]
+    fn failed_cancel_retains_journal_and_retry_cleans_recorded_upload() {
+        let mock = crate::test_support::MockObs::new(
+            r#"[
+            {"method":"PUT","query":"partNumber","key":"backup","status":403},
+            {"method":"DELETE","query":"uploadId","key":"backup","status":403}
+        ]"#,
+        );
+        let source = mock.staging.join("input");
+        std::fs::write(&source, b"local backup").unwrap();
+        let client = mock.client();
+        let tuning = UploadTuning {
+            threshold: 1,
+            ..Default::default()
+        };
+        assert!(
+            client
+                .upload_file_with_meta("backup", &source, tuning, &[])
+                .is_err()
+        );
+        let record = source.with_extension("upload.yaml");
+        let journal: UploadJournal =
+            serde_yaml::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+        assert!(!journal.upload_id.is_empty());
+        assert_eq!(journal.key, "backup");
+        assert_eq!(mock.stats().uploads, 1);
+        client
+            .upload_file_with_meta("backup", &source, tuning, &[])
+            .unwrap();
+        assert!(!record.exists());
+        assert_eq!(mock.stats().uploads, 0);
+        assert_eq!(client.get_range("backup", 0, 12).unwrap(), b"local backup");
+    }
+
+    #[test]
+    fn uncertain_completion_keeps_recovery_record_and_local_data() {
+        let mock = crate::test_support::MockObs::new(
+            r#"[{"method":"POST","query":"uploadId","key":"data","status":200,"body":"<CompleteMultipartUploadResult>"}]"#,
+        );
+        let client = mock.client();
+        let file = mock.staging.join("data");
+        std::fs::write(&file, b"recover me").unwrap();
+        let tuning = UploadTuning {
+            threshold: 1,
+            ..Default::default()
+        };
+        assert!(
+            client
+                .upload_file_with_meta("data", &file, tuning, &[])
+                .is_err()
+        );
+        let journal = file.with_extension("upload.yaml");
+        let record: UploadJournal =
+            serde_yaml::from_str(&std::fs::read_to_string(&journal).unwrap()).unwrap();
+        assert!(record.completing);
+        assert_eq!(record.parts.len(), 1);
+        assert_eq!(std::fs::read(&file).unwrap(), b"recover me");
+        client
+            .upload_file_with_meta("data", &file, tuning, &[])
+            .unwrap();
+        assert_eq!(client.get_range("data", 0, 10).unwrap(), b"recover me");
+        assert!(!journal.exists());
+        assert_eq!(mock.stats().uploads, 0);
+    }
+
+    #[test]
+    fn range_requests_pin_version_and_validate_response_interval() {
+        let mock = crate::test_support::MockObs::new("[]");
+        let client = mock.client();
+        client.put_object_with_meta("data", b"AAAA", &[]).unwrap();
+        let meta = client.head_object("data").unwrap().unwrap();
+        client.put_object_with_meta("data", b"BBBB", &[]).unwrap();
+        assert!(matches!(
+            client.get_range_checked("data", 0, 4, meta.etag.as_deref().unwrap(), 4),
+            Err(ObsError::Http { status: 412, .. })
+        ));
+        for (status, range) in [(200, "bytes 0-3/4"), (206, "bytes 1-4/5")] {
+            let faults = serde_json::json!([{"method":"GET","key":"data","status":status,"body":"abcd","headers":{"Content-Range":range}}]);
+            let mock = crate::test_support::MockObs::new(&faults.to_string());
+            assert!(
+                mock.client()
+                    .get_range_checked("data", 0, 4, "tag", 4)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn obs_limits_are_checked_before_network_requests() {
+        assert!(
+            UploadTuning {
+                part_size: MIN_PART_SIZE,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            UploadTuning {
+                part_size: MIN_PART_SIZE - 1,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            UploadTuning {
+                part_size: MAX_SINGLE_SIZE as usize + 1,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(validate_object_size(MAX_OBJECT_SIZE).is_ok());
+        assert!(validate_object_size(MAX_OBJECT_SIZE + 1).is_err());
+        assert!(
+            validate_metadata(&[("x-obs-meta-k".into(), "v".repeat(MAX_METADATA_SIZE))]).is_err()
+        );
+    }
 
     #[test]
     fn part_size_stays_10mb_below_limit_and_grows_above() {
@@ -1398,7 +1898,7 @@ mod tests {
             // list without one.
             let listed = client.list_objects("", "", None, 1000).unwrap();
             assert!(
-                listed.objects.iter().any(|o| o.key == key),
+                listed.keys.iter().any(|k| k == key),
                 "{key} missing from listing"
             );
         }
@@ -1414,8 +1914,7 @@ mod tests {
 <CommonPrefixes><Prefix>backups/sub/</Prefix></CommonPrefixes>
 </ListBucketResult>"#;
         let r = parse_list_xml(xml).unwrap();
-        assert_eq!(r.objects.len(), 1);
-        assert_eq!(r.objects[0].key, "backups/a.tar.gz");
+        assert_eq!(r.keys, ["backups/a.tar.gz"]);
         assert_eq!(r.prefixes, vec!["backups/sub/"]);
         assert!(!r.is_truncated);
     }
@@ -1570,7 +2069,7 @@ mod tests {
         // Never below the OBS 5 MiB minimum, even if configured lower.
         assert_eq!(
             multipart_part_size_with(30 * 1024 * 1024, 1024),
-            5 * 1024 * 1024
+            MIN_PART_SIZE
         );
         // Still grows for a file that would need more than 10000 parts.
         let huge = 100usize * 1024 * 1024 * 1024;
@@ -1616,9 +2115,7 @@ mod tests {
 <Contents><Key>a&amp;b/中文.txt</Key><Size>7</Size></Contents>
 </ListBucketResult>"#;
         let r = parse_list_xml(xml).unwrap();
-        assert_eq!(r.objects.len(), 1);
-        assert_eq!(r.objects[0].key, "a&b/中文.txt");
-        assert_eq!(r.objects[0].size, 7);
+        assert_eq!(r.keys, ["a&b/中文.txt"]);
     }
 
     #[test]
@@ -1640,6 +2137,7 @@ mod tests {
                     UploadTuning {
                         threshold,
                         part_size: 5 * 1024 * 1024,
+                        concurrency: 4,
                     },
                     &[],
                 )
@@ -1662,6 +2160,7 @@ mod tests {
                 UploadTuning {
                     threshold: 1,
                     part_size: DEFAULT_PART_SIZE,
+                    concurrency: 4,
                 },
                 &[],
             )

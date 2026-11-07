@@ -2,8 +2,8 @@
 name = "obs-mount"
 version = "0.1.0"
 edition = "2024"
-# edition 2024 needs 1.85; this is the floor, not the pin.
-rust-version = "1.85"
+# Let chains require Rust 1.88; stable is selected by rust-toolchain.toml.
+rust-version = "1.88"
 description = "Mount a Huawei Cloud OBS bucket as a local directory via FUSE, using OBS native REST signing (HMAC-SHA1, x-obs-*), not S3 compatibility."
 license = "MIT"
 
