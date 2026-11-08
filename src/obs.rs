@@ -104,6 +104,8 @@ pub enum ObsError {
     },
     #[error("network: {0}")]
     Network(#[from] reqwest::Error),
+    #[error("incomplete response: {0}")]
+    Incomplete(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("xml: {0}")]
@@ -555,6 +557,31 @@ impl ObsClient {
         extra_x_obs: &[(String, String)],
         extra_headers: &[(String, String)],
     ) -> Result<reqwest::blocking::Response> {
+        self.send_with(
+            method,
+            key,
+            query,
+            body,
+            content_type,
+            extra_x_obs,
+            extra_headers,
+            Ok,
+        )
+    }
+
+    /// One budget includes connection, HTTP status and response-body failures.
+    #[allow(clippy::too_many_arguments)]
+    fn send_with<T>(
+        &self,
+        method: &str,
+        key: &str,
+        query: &str,
+        body: Option<RequestBody>,
+        content_type: &str,
+        extra_x_obs: &[(String, String)],
+        extra_headers: &[(String, String)],
+        finish: impl Fn(reqwest::blocking::Response) -> Result<T>,
+    ) -> Result<T> {
         validate_metadata(extra_x_obs)?;
         let mut standard = extra_headers.to_vec();
         standard.extend(
@@ -622,16 +649,32 @@ impl ObsClient {
             if let Some(b) = &body {
                 req = req.header("Content-MD5", &content_md5).body(b.body()?);
             }
-            match req.send() {
+            let result = match req.send() {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    if !is_retryable_status(status) || attempt + 1 == RETRY_ATTEMPTS {
-                        return Ok(resp);
+                    if is_retryable_status(status) && attempt + 1 < RETRY_ATTEMPTS {
+                        Err(ObsError::Http {
+                            status,
+                            method: method.into(),
+                            path: key.into(),
+                            body: response_diagnostic(resp),
+                        })
+                    } else {
+                        finish(resp)
                     }
                 }
+                Err(e) => Err(ObsError::Network(e)),
+            };
+            match result {
+                Ok(value) => return Ok(value),
                 Err(e) => {
-                    if attempt + 1 == RETRY_ATTEMPTS {
-                        return Err(ObsError::Network(e));
+                    let retryable = match &e {
+                        ObsError::Network(_) | ObsError::Incomplete(_) => true,
+                        ObsError::Http { status, .. } => is_retryable_status(*status),
+                        _ => false,
+                    };
+                    if !retryable || attempt + 1 == RETRY_ATTEMPTS {
+                        return Err(e);
                     }
                 }
             }
@@ -853,8 +896,7 @@ impl ObsClient {
             ("Range".into(), format!("bytes={start}-{end}")),
             ("If-Match".into(), format!("\"{}\"", etag.trim_matches('"'))),
         ];
-        for attempt in 0..RETRY_ATTEMPTS {
-            let resp = self.send("GET", key, "", None, "", &[], &headers)?;
+        self.send_with("GET", key, "", None, "", &[], &headers, |resp| {
             let resp = Self::check(resp, "GET", key)?;
             let expected = format!("bytes {start}-{end}/{total}");
             if resp.status().as_u16() != 206
@@ -868,16 +910,15 @@ impl ObsClient {
                     "invalid Content-Range for {key}: expected {expected}"
                 )));
             }
-            match resp.bytes() {
-                Ok(data) if data.len() == len => return Ok(data.to_vec()),
-                Ok(_) if attempt + 1 == RETRY_ATTEMPTS => {
-                    return Err(ObsError::Other("short range response".into()));
-                }
-                Err(e) if attempt + 1 == RETRY_ATTEMPTS => return Err(e.into()),
-                _ => std::thread::sleep(retry_delay(attempt)),
+            let data = resp.bytes()?;
+            if data.len() != len {
+                return Err(ObsError::Incomplete(format!(
+                    "range for {key}: expected {len}, received {}",
+                    data.len()
+                )));
             }
-        }
-        unreachable!()
+            Ok(data.to_vec())
+        })
     }
 
     /// PUT with `x-obs-meta-*` headers attached.
@@ -1077,40 +1118,41 @@ impl ObsClient {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ObsError::Other("download requires ETag".into()))?;
         let headers = [("If-Match".into(), format!("\"{etag}\""))];
-        for attempt in 0..RETRY_ATTEMPTS {
-            let response = Self::check(
-                self.send("GET", key, "", None, "", &[], &headers)?,
-                "GET",
-                key,
-            )?;
-            let result = (|| {
-                let mut file = File::create(&partial)?;
-                let mut reader = response.take(meta.size.saturating_add(1));
-                let copied = std::io::copy(&mut reader, &mut file)?;
-                if copied != meta.size {
-                    return Err(ObsError::Other(format!(
-                        "incomplete download: expected {}, received {copied}",
-                        meta.size
-                    )));
+        let result = self.send_with("GET", key, "", None, "", &[], &headers, |response| {
+            let mut response = Self::check(response, "GET", key)?;
+            let mut file = File::create(&partial)?;
+            let mut copied = 0u64;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                // Separate network reads from local writes: only reads are retryable.
+                let n = response
+                    .read(&mut buffer)
+                    .map_err(|e| ObsError::Incomplete(e.to_string()))?;
+                if n == 0 {
+                    break;
                 }
-                file.sync_all()?;
-                std::fs::rename(&partial, path)?;
-                Ok(())
-            })();
-            match result {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let _ = std::fs::remove_file(&partial);
-                    if attempt + 1 == RETRY_ATTEMPTS
-                        || matches!(&e,ObsError::Io(e) if matches!(e.raw_os_error(),Some(libc::ENOSPC|libc::EACCES|libc::EROFS)))
-                    {
-                        return Err(e);
-                    }
-                    std::thread::sleep(retry_delay(attempt));
+                copied += n as u64;
+                if copied > meta.size {
+                    return Err(ObsError::Other(
+                        "download exceeds expected object size".into(),
+                    ));
                 }
+                file.write_all(&buffer[..n])?;
             }
+            if copied != meta.size {
+                return Err(ObsError::Incomplete(format!(
+                    "expected {}, received {copied}",
+                    meta.size
+                )));
+            }
+            file.sync_all()?;
+            std::fs::rename(&partial, path)?;
+            Ok(())
+        });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&partial);
         }
-        unreachable!()
+        result
     }
 
     /// Upload a staging file with bounded buffers. Small PUTs also stream from
@@ -1258,16 +1300,7 @@ struct UploadJournal {
 }
 
 fn write_journal(path: &Path, journal: &UploadJournal) -> Result<()> {
-    let bytes = serde_yaml::to_string(journal).map_err(|e| ObsError::Other(e.to_string()))?;
-    let temp = path.with_extension("tmp");
-    let mut file = File::create(&temp)?;
-    file.write_all(bytes.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(temp, path)?;
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
+    crate::persist::write_yaml(path, journal).map_err(ObsError::from)
 }
 
 fn validate_object_size(len: u64) -> Result<()> {
@@ -1317,9 +1350,14 @@ fn checked_result(
     let mut root = None;
     let mut closed = false;
     let mut direct_etag = 0;
+    let mut in_etag = false;
+    let mut etag = String::new();
     loop {
         match reader.read_event()? {
             Event::Start(e) => {
+                if in_etag {
+                    return Err(ObsError::Other("nested element in ETag".into()));
+                }
                 if depth == 0 {
                     if root.is_some() {
                         return Err(ObsError::Other("multiple response roots".into()));
@@ -1331,11 +1369,17 @@ fn checked_result(
                         return Err(ObsError::Other("invalid nested ETag".into()));
                     }
                     direct_etag += 1;
+                    in_etag = true;
                 }
                 depth += 1;
             }
             Event::Empty(_) if depth == 0 => {
                 return Err(ObsError::Other("unexpected empty response root".into()));
+            }
+            Event::Empty(e) if in_etag || e.local_name().as_ref() == "ETag" => {
+                return Err(ObsError::Other(
+                    "invalid empty element in ETag result".into(),
+                ));
             }
             Event::DocType(_) => {
                 return Err(ObsError::Other("unexpected XML document type".into()));
@@ -1343,7 +1387,19 @@ fn checked_result(
             Event::Text(e) if depth == 0 && !e.as_ref().trim().is_empty() => {
                 return Err(ObsError::Other("text outside response root".into()));
             }
-            Event::End(_) => {
+            Event::Text(e) if in_etag => etag.push_str(&e.xml10_content()),
+            Event::CData(e) if in_etag => etag.push_str(&e.xml10_content()),
+            Event::GeneralRef(e) if in_etag => match e.resolve_char_ref() {
+                Ok(Some(ch)) => etag.push(ch),
+                _ => etag.push_str(
+                    quick_xml::escape::resolve_predefined_entity(e.as_ref())
+                        .ok_or_else(|| ObsError::Other("unknown XML entity in ETag".into()))?,
+                ),
+            },
+            Event::End(e) => {
+                if e.local_name().as_ref() == "ETag" {
+                    in_etag = false;
+                }
                 depth = depth
                     .checked_sub(1)
                     .ok_or_else(|| ObsError::Other("invalid response XML".into()))?;
@@ -1355,19 +1411,18 @@ fn checked_result(
             _ => {}
         }
     }
-    let etag = parse_tag(&text, "ETag").filter(|s| !s.trim_matches('"').trim().is_empty());
+    let etag = etag.trim().trim_matches('"');
     if root.as_deref() != Some(expected)
         || !closed
         || depth != 0
-        || etag.is_none()
+        || etag.trim().is_empty()
         || direct_etag != 1
     {
         return Err(ObsError::Other(format!(
             "{method} {key}: invalid {expected}, request-id={request}: {text}"
         )));
     }
-    etag.map(|tag| tag.trim_matches('"').to_string())
-        .ok_or_else(|| ObsError::Other("missing result ETag".into()))
+    Ok(etag.to_string())
 }
 
 /// Extract the text of the first `<tag>...</tag>` element.
@@ -1594,12 +1649,50 @@ impl Default for UploadTuning {
 mod tests {
     use super::*;
     #[test]
+    fn transfer_errors_share_one_request_budget() {
+        // Two HTTP failures, one short body, then two more HTTP failures.
+        // A second body-retry budget would incorrectly allow a sixth GET.
+        std::thread::scope(|scope| {
+            for range in [true, false] {
+                scope.spawn(move || {
+                    let faults = serde_json::json!([
+                        {"method":"GET","key":"data","status":503,"count":2},
+                        {"method":"GET","key":"data","status":if range {206} else {200},
+                         "body":"x","headers":{"Content-Range":"bytes 0-3/4"}},
+                        {"method":"GET","key":"data","status":503,"count":2}
+                    ]);
+                    let mock = crate::test_support::MockObs::new(&faults.to_string());
+                    let client = mock.client();
+                    client.put_object_with_meta("data", b"data", &[]).unwrap();
+                    let meta = client.head_object("data").unwrap().unwrap();
+                    let destination = mock.staging.join("downloaded");
+                    if range {
+                        assert!(
+                            client
+                                .get_range_checked("data", 0, 4, meta.etag.as_deref().unwrap(), 4)
+                                .is_err()
+                        );
+                    } else {
+                        assert!(client.download_to("data", &destination, &meta).is_err());
+                        assert!(!destination.exists());
+                        assert!(!destination.with_extension("download").exists());
+                    }
+                    assert_eq!(mock.stats().requests["GET data"], RETRY_ATTEMPTS as usize);
+                });
+            }
+        });
+    }
+
+    #[test]
     fn copy_requires_a_complete_success_result() {
         for body in [
             "<Error><Code>InternalError</Code></Error>",
             "",
             "<CopyObjectResult><ETag>abc</ETag>",
             "<CopyObjectResult><ETag/></CopyObjectResult>",
+            "<CopyObjectResult><ETag>a<X/>b</ETag></CopyObjectResult>",
+            "<CopyObjectResult><ETag>a</ETag><ETag>b</ETag></CopyObjectResult>",
+            "<CopyObjectResult><ETag>a</ETag></CopyObjectResult><Other/>",
         ] {
             let faults =
                 serde_json::json!([{"method":"PUT","key":"target","status":200,"body":body}]);
@@ -1615,6 +1708,21 @@ mod tests {
             assert!(client.head_object("source").unwrap().is_some());
             assert!(client.head_object("target").unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn copy_result_accepts_namespace_and_decodes_etag_in_one_pass() {
+        let mock = crate::test_support::MockObs::new(
+            r#"[{"method":"PUT","key":"target","status":200,"body":"<?xml version=\"1.0\"?><r:CopyObjectResult xmlns:r=\"urn:obs\"><r:ETag>&quot;a&amp;b&#49;<![CDATA[c]]>&quot;</r:ETag></r:CopyObjectResult>"}]"#,
+        );
+        let client = mock.client();
+        let response = client
+            .send("PUT", "target", "", None, "", &[], &[])
+            .unwrap();
+        assert_eq!(
+            checked_result(response, "PUT", "target", "CopyObjectResult").unwrap(),
+            "a&b1c"
+        );
     }
 
     #[test]

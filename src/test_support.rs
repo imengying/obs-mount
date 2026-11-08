@@ -67,17 +67,20 @@ pub struct Fault {
     headers: BTreeMap<String, String>,
     #[serde(default = "one")]
     count: usize,
+    #[serde(default)]
+    delay_ms: u64,
 }
 
 fn one() -> usize {
     1
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Stats {
     pub signature_failures: usize,
     pub objects: usize,
     pub uploads: usize,
+    pub requests: BTreeMap<String, usize>,
 }
 
 #[derive(Clone)]
@@ -119,6 +122,7 @@ struct State {
     sequence: u64,
     signature_failures: usize,
     config: Config,
+    requests: BTreeMap<String, usize>,
 }
 
 impl State {
@@ -127,6 +131,7 @@ impl State {
             signature_failures: self.signature_failures,
             objects: self.objects.len(),
             uploads: self.uploads.len(),
+            requests: self.requests.clone(),
         }
     }
 }
@@ -341,6 +346,7 @@ struct Reply {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     length: Option<usize>,
+    delay_ms: u64,
 }
 
 impl Reply {
@@ -350,6 +356,7 @@ impl Reply {
             headers: Vec::new(),
             body: Vec::new(),
             length: None,
+            delay_ms: 0,
         }
     }
     fn header(mut self, name: &str, value: impl Into<String>) -> Self {
@@ -376,6 +383,8 @@ fn serve(mut request: Request, state: &Mutex<State>) {
         }
         Err(_) => Reply::error(400, "BadRequest"),
     };
+    // Delay only this response; unrelated mock requests must still progress.
+    thread::sleep(Duration::from_millis(reply.delay_ms));
     let headers = reply
         .headers
         .into_iter()
@@ -403,6 +412,10 @@ impl State {
             }
             .header("Content-Type", "application/json");
         }
+        *self
+            .requests
+            .entry(format!("{} {}", req.method, req.key))
+            .or_default() += 1;
         for fault in &mut self.config.faults {
             if fault.count > 0
                 && fault.method == req.method
@@ -418,6 +431,7 @@ impl State {
                     body: fault.body.as_bytes().to_vec(),
                     headers: fault.headers.clone().into_iter().collect(),
                     length: None,
+                    delay_ms: fault.delay_ms,
                 };
             }
         }

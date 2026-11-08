@@ -1,5 +1,6 @@
 mod fs;
 mod obs;
+mod persist;
 #[cfg(test)]
 mod test_support;
 

@@ -13,8 +13,9 @@
 //!   Copy+Delete and is not atomic. Unix attributes live in object metadata.
 //!
 //! fuser 0.18 calls the Filesystem trait through `&self`, so all mutable
-//! namespace and writable state are protected by one Mutex. Writes and
-//! namespace mutations are serialized; remote reads release it while fetching.
+//! namespace and writable state are protected by one Mutex. Namespace
+//! transactions remain serialized. Reads, statfs and ordinary writeback release
+//! it during network requests; same-inode writers wait for writeback to finish.
 //! Upload workers stream independent file ranges with bounded memory.
 
 use crate::obs::{ObsClient, ObsError, UnixMeta};
@@ -30,7 +31,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -68,12 +69,28 @@ struct CachedMeta {
     expires: Instant,
     /// Attributes read from object metadata. External objects without Unix
     /// attributes are shown with defaults.
-    unix: Option<UnixMeta>,
-    /// `<symlink target>` when this object is a symlink created by us.
-    symlink_target: Option<String>,
+    unix: Option<UnixAttrs>,
     /// All non-Unix object metadata, including xattrs and symlink targets.
     extra_meta: Vec<(String, String)>,
     system_meta: Vec<(String, String)>,
+}
+
+/// Cached ownership and mode; CachedMeta::mtime is the only timestamp copy.
+#[derive(Clone, Copy)]
+struct UnixAttrs {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl From<UnixMeta> for UnixAttrs {
+    fn from(value: UnixMeta) -> Self {
+        Self {
+            mode: value.mode,
+            uid: value.uid,
+            gid: value.gid,
+        }
+    }
 }
 
 /// A span of an object fetched ahead of demand.
@@ -94,10 +111,7 @@ impl ReadWindow {
 #[derive(Default)]
 struct OpenFile {
     ino: u64,
-    deleted: bool,
     etag: Option<String>,
-    key: String,
-    staging: Option<PathBuf>,
     /// Read-ahead window: the last Range GET result, kept so the following
     /// reads of the same region are served locally.
     ///
@@ -114,28 +128,30 @@ struct OpenFile {
     size: Option<u64>,
 }
 
+#[derive(Default)]
+struct FileState {
+    path: Option<String>,
+    detached: Option<CachedMeta>,
+    pending: bool,
+    reported_failure: bool,
+    uploading: bool,
+}
+
 struct Inner {
     client: ObsClient,
     staging_dir: PathBuf,
     upload: crate::obs::UploadTuning,
     next_ino: u64,
-    ino_to_path: HashMap<u64, String>,
+    files: HashMap<u64, FileState>,
     path_to_ino: HashMap<String, u64>,
     meta_cache: HashMap<String, CachedMeta>,
     open_files: HashMap<u64, OpenFile>,
     next_fh: u64,
-    detached: HashMap<u64, CachedMeta>,
     lookups: HashMap<u64, u64>,
     directories: HashMap<u64, Directory>,
     min_free_space: u64,
     cache_limit: usize,
     last_reclaim: Instant,
-    /// File-level dirty state survives a failed close and sibling releases.
-    pending: HashSet<PathBuf>,
-    /// Staging files whose failure has already been logged, so a caller that
-    /// retries on every flush/release does not repeat the same error. Cleared
-    /// when an upload finally succeeds.
-    reported_failure: HashSet<PathBuf>,
     /// Cached answer for statfs; `df` is cheap to call and usually polled by
     /// monitoring, so the bucket is queried at most once per TTL instead of
     /// once per request.
@@ -178,6 +194,7 @@ struct UsageSnapshot {
 
 pub struct ObsFs {
     inner: Mutex<Inner>,
+    uploads_done: Condvar,
     /// Clone of the client for paths that must not hold the global lock
     /// across a network round-trip (see `read`).
     client: ObsClient,
@@ -289,9 +306,8 @@ fn cached_from_meta(meta: &crate::obs::ObjectMeta, is_dir: bool) -> CachedMeta {
             })
             .unwrap_or(SystemTime::UNIX_EPOCH),
         expires: Instant::now() + Duration::from_secs(5),
-        unix: meta.unix,
+        unix: meta.unix.map(Into::into),
         system_meta: meta.system_meta.clone(),
-        symlink_target: crate::obs::symlink_target(&meta.x_obs_meta),
         extra_meta: meta
             .x_obs_meta
             .iter()
@@ -310,7 +326,6 @@ fn synthetic_meta(size: u64, is_dir: bool, mtime: SystemTime) -> CachedMeta {
         mtime,
         expires: Instant::now() + Duration::from_secs(5),
         unix: None,
-        symlink_target: None,
         extra_meta: Vec::new(),
         system_meta: Vec::new(),
     }
@@ -356,24 +371,22 @@ impl ObsFs {
     pub fn new(client: ObsClient, staging_dir: PathBuf, upload: crate::obs::UploadTuning) -> Self {
         Self {
             client: client.clone(),
+            uploads_done: Condvar::new(),
             inner: Mutex::new(Inner {
                 client,
                 staging_dir,
                 upload,
                 next_ino: 2,
-                ino_to_path: HashMap::new(),
+                files: HashMap::new(),
                 path_to_ino: HashMap::new(),
                 meta_cache: HashMap::new(),
                 open_files: HashMap::new(),
                 next_fh: 1,
-                detached: HashMap::new(),
                 lookups: HashMap::new(),
                 directories: HashMap::new(),
                 min_free_space: 64 * 1024 * 1024,
                 cache_limit: 10_000,
                 last_reclaim: Instant::now(),
-                pending: HashSet::new(),
-                reported_failure: HashSet::new(),
                 usage_cache: None,
             }),
         }
@@ -439,17 +452,18 @@ impl Inner {
                     .map(|(ino, _)| *ino),
             )
             .collect();
-        self.detached.retain(|ino, _| pinned.contains(ino));
         let removable: Vec<_> = self
-            .ino_to_path
+            .files
             .iter()
-            .filter(|(ino, _)| !pinned.contains(ino))
+            .filter(|(ino, file)| !pinned.contains(ino) && !file.uploading && !file.pending)
             .filter(|(ino, _)| !self.staging_path(**ino).exists())
-            .map(|(ino, p)| (*ino, p.clone()))
+            .map(|(ino, file)| (*ino, file.path.clone()))
             .collect();
         for (ino, path) in removable {
-            self.ino_to_path.remove(&ino);
-            if self.path_to_ino.get(&path) == Some(&ino) {
+            self.files.remove(&ino);
+            if let Some(path) = path
+                && self.path_to_ino.get(&path) == Some(&ino)
+            {
                 self.path_to_ino.remove(&path);
             }
         }
@@ -474,42 +488,28 @@ impl Inner {
         let Some(ino) = self.path_to_ino.get(path).copied() else {
             return Ok(());
         };
-        if self.open_files.values().any(|f| f.ino == ino && !f.deleted) {
-            if !self.staging_path(ino).exists() {
-                let meta = self
-                    .client
-                    .head_object(path)?
-                    .ok_or_else(|| ObsError::Other("open object disappeared".into()))?;
-                if self
-                    .open_files
-                    .values()
-                    .filter(|f| f.ino == ino)
-                    .any(|f| f.etag.is_some() && f.etag != meta.etag)
-                {
-                    return Err(std::io::Error::from_raw_os_error(libc::ESTALE).into());
-                }
-            }
+        if self.open_files.values().any(|f| f.ino == ino) {
             self.stage_existing(ino, path, false)?;
         }
         Ok(())
     }
 
+    fn path(&self, ino: &u64) -> Option<&String> {
+        self.files.get(ino)?.path.as_ref()
+    }
+
     fn detach_path(&mut self, path: &str) {
         if let Some(ino) = self.path_to_ino.remove(path) {
-            self.ino_to_path.remove(&ino);
-            if let Some(meta) = self.meta_cache.remove(path) {
-                self.detached.insert(ino, meta);
+            let meta = self.meta_cache.remove(path);
+            if let Some(file) = self.files.get_mut(&ino) {
+                file.path = None;
+                file.detached = meta;
+                file.pending = false;
+                file.reported_failure = false;
             }
-            let staging = self.staging_path(ino);
-            self.pending.remove(&staging);
-            self.reported_failure.remove(&staging);
-            // A deliberate unlink supersedes pending uploads for this inode.
-            // Any unfinished remote upload journal stays available for cleanup.
-            let _ = fs::remove_file(staging.with_extension("yaml"));
-            for open in self.open_files.values_mut().filter(|f| f.ino == ino) {
-                open.deleted = true;
-            }
-            self.release_staging(&staging);
+            // Keep unfinished upload journals for manual cancellation.
+            let _ = fs::remove_file(self.staging_path(ino).with_extension("yaml"));
+            self.release_staging(ino);
         }
         self.meta_cache.remove(path);
     }
@@ -554,11 +554,11 @@ impl Inner {
             .path_to_ino
             .iter()
             .filter(|(p, _)| p.as_str() == old || (is_dir && p.starts_with(&prefix)))
-            .map(|(p, ino)| (p.clone(), self.staging_path(*ino)))
-            .filter(|(_, s)| self.pending.contains(s))
+            .filter(|(_, ino)| self.files.get(ino).is_some_and(|f| f.pending))
+            .map(|(p, _)| p.clone())
             .collect();
-        for (key, staging) in staged {
-            self.upload_staged_path(&key, &staging)?;
+        for key in staged {
+            self.upload_staged_path(&key)?;
         }
         if !is_dir {
             self.prepare_detach(new)?;
@@ -595,7 +595,13 @@ impl Inner {
         }
         let ino = self.next_ino;
         self.next_ino += 1;
-        self.ino_to_path.insert(ino, path.to_string());
+        self.files.insert(
+            ino,
+            FileState {
+                path: Some(path.to_string()),
+                ..FileState::default()
+            },
+        );
         self.path_to_ino.insert(path.to_string(), ino);
         ino
     }
@@ -610,26 +616,25 @@ impl Inner {
             .collect();
         for p in doomed {
             if let Some(ino) = self.path_to_ino.remove(&p) {
-                self.ino_to_path.remove(&ino);
+                self.files.remove(&ino);
             }
             self.meta_cache.remove(&p);
         }
     }
 
-    /// How many open handles still reference this staging file. Staging files
-    /// are shared by every handle of one inode (the path is `ino-<n>`), so a
-    /// handle must not unlink one that another handle is still writing to.
-    fn staging_refs(&self, staging: &Path) -> usize {
-        self.open_files
-            .values()
-            .filter(|f| f.staging.as_deref() == Some(staging))
-            .count()
+    fn staging_refs(&self, ino: u64) -> usize {
+        self.open_files.values().filter(|f| f.ino == ino).count()
     }
 
-    /// Drop a staging file only when no handle references it any more.
-    fn release_staging(&mut self, staging: &Path) {
-        if self.staging_refs(staging) == 0 && !self.pending.contains(staging) {
-            let _ = fs::remove_file(staging);
+    fn release_staging(&mut self, ino: u64) {
+        if self.staging_refs(ino) == 0
+            && self
+                .files
+                .get(&ino)
+                .is_none_or(|f| !f.pending && !f.uploading)
+        {
+            let staging = self.staging_path(ino);
+            let _ = fs::remove_file(&staging);
             let _ = fs::remove_file(staging.with_extension("yaml"));
         }
     }
@@ -659,7 +664,9 @@ impl Inner {
             } else {
                 format!("{new}{}", &old_path[old.len()..])
             };
-            self.ino_to_path.insert(ino, new_path.clone());
+            if let Some(file) = self.files.get_mut(&ino) {
+                file.path = Some(new_path.clone());
+            }
             self.path_to_ino.insert(new_path.clone(), ino);
             if let Some(c) = self.meta_cache.remove(&old_path) {
                 self.meta_cache.insert(new_path.clone(), c);
@@ -669,13 +676,6 @@ impl Inner {
                 && let Err(e) = self.save_recovery(&new_path, &staging)
             {
                 tracing::error!(error = %e, path = %staging.display(), key = %new_path, "could not update recovery mapping after rename");
-            }
-            // Open handles carry the key they upload to: retarget them so a
-            // file renamed while open still lands on the new key.
-            for f in self.open_files.values_mut() {
-                if f.key == old_path && !f.deleted {
-                    f.key = new_path.clone();
-                }
             }
         }
         self.meta_cache.remove(old);
@@ -698,10 +698,8 @@ impl Inner {
 
     /// Like `attr`, but honours attributes persisted in object metadata.
     ///
-    /// When an object carries no `x-obs-meta-mode` (uploaded by another tool,
-    /// or by a build before this feature), fall back to a fixed default
-    /// rather than inventing values: 0755/0644 owned by the requesting
-    /// user, which is what this program used to report unconditionally.
+    /// External objects without Unix attributes use 0755/0644 and the
+    /// requesting user as their owner.
     fn attr_with_meta(
         &self,
         req: &Request,
@@ -715,10 +713,7 @@ impl Inner {
         // A persisted mtime wins over the caller-supplied one: `resolve`
         // reports "now" for anything it synthesized (staging files,
         // directories), which would otherwise mask `touch -d`.
-        let mtime = match unix {
-            Some(u) => unix_time(u.mtime),
-            _ => mtime,
-        };
+        let mtime = cached.map_or(mtime, |c| c.mtime);
         let kind = match unix.map(|u| u.mode & libc::S_IFMT) {
             Some(m) if m == libc::S_IFLNK => FileType::Symlink,
             _ => kind,
@@ -809,7 +804,7 @@ impl Inner {
             && self
                 .open_files
                 .values()
-                .filter(|f| f.key == path && !f.deleted)
+                .filter(|f| f.ino == ino)
                 .any(|f| f.etag.is_some() && f.etag != meta.etag)
         {
             return Err(std::io::Error::from_raw_os_error(libc::ESTALE).into());
@@ -823,12 +818,7 @@ impl Inner {
         self.meta_cache
             .insert(path.into(), cached_from_meta(&meta, false));
         // Readers opened before the writer must follow the shared copy too.
-        for open in self
-            .open_files
-            .values_mut()
-            .filter(|f| f.key == path && !f.deleted)
-        {
-            open.staging = Some(staging.clone());
+        for open in self.open_files.values_mut().filter(|f| f.ino == ino) {
             open.window = None;
         }
         Ok(staging)
@@ -845,12 +835,12 @@ impl Inner {
             .map(|(k, v)| (xattr_header_key(k), v.clone()))
             .collect();
         if let Some(unix) = cached.unix {
-            headers.extend(crate::obs::unix_meta_headers(unix));
-        }
-        if let Some(target) = &cached.symlink_target {
-            let key = xattr_header_key(crate::obs::meta_keys::SYMLINK_TARGET);
-            headers.retain(|(k, _)| k != &key);
-            headers.push((key, target.clone()));
+            headers.extend(crate::obs::unix_meta_headers(UnixMeta {
+                mode: unix.mode,
+                uid: unix.uid,
+                gid: unix.gid,
+                mtime: unix_seconds(cached.mtime),
+            }));
         }
         headers.extend(cached.system_meta.clone());
         crate::obs::validate_metadata(&headers)?;
@@ -873,22 +863,23 @@ impl Inner {
             key: path,
             metadata: self.metadata_headers(path)?,
         };
-        let yaml = serde_yaml::to_string(&record).map_err(|e| ObsError::Other(e.to_string()))?;
-        let temp = staging.with_extension("yaml.tmp");
-        let mut file = File::create(&temp)?;
-        file.write_all(yaml.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(temp, staging.with_extension("yaml"))?;
-        File::open(&self.staging_dir)?.sync_all()?;
-        Ok(())
+        crate::persist::write_yaml(&staging.with_extension("yaml"), &record).map_err(ObsError::from)
     }
 
     fn mark_pending(&mut self, path: &str, staging: &Path) -> Result<(), ObsError> {
-        if self.pending.contains(staging) {
+        let ino = self
+            .path_to_ino
+            .get(path)
+            .copied()
+            .ok_or_else(|| ObsError::Other(format!("missing inode for {path}")))?;
+        if self.files.get(&ino).is_some_and(|f| f.pending) {
             return Ok(());
         }
         self.save_recovery(path, staging)?;
-        self.pending.insert(staging.to_owned());
+        self.files
+            .get_mut(&ino)
+            .ok_or_else(|| ObsError::Other("missing file state".into()))?
+            .pending = true;
         Ok(())
     }
 
@@ -896,13 +887,6 @@ impl Inner {
         if let Some(meta) = self.meta_cache.get_mut(path) {
             meta.size = size;
             meta.mtime = SystemTime::now();
-            if let Some(unix) = meta.unix.as_mut() {
-                unix.mtime = meta
-                    .mtime
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-            }
             meta.expires = Instant::now() + Duration::from_secs(5);
         }
     }
@@ -972,45 +956,6 @@ impl Inner {
         }
     }
 
-    /// Resolve what to report to `statfs`.
-    ///
-    /// OBS does not model a "disk": a bucket has a *used* figure
-    /// (`GET /?storageinfo`) and, optionally, a byte *quota* (`GET /?quota`).
-    /// So:
-    /// * quota > 0: real total, real used, real free. This is the only case
-    ///   where `df` means something.
-    /// * quota == 0: no limit configured. Reporting 0 free would make
-    ///   monitoring scream "disk full" and can make writers bail out on a
-    ///   statvfs() precheck, so report a large synthetic ceiling instead and
-    ///   flag it as synthetic.
-    /// * query fails: keep the last good answer, or fall back to the
-    ///   synthetic ceiling without usage numbers.
-    fn usage_snapshot(&mut self) -> UsageSnapshot {
-        if let Some((at, cached)) = self.usage_cache
-            && at.elapsed() < USAGE_TTL
-        {
-            return cached;
-        }
-        let used = self
-            .client
-            .bucket_storage_size()
-            .ok()
-            .flatten()
-            .or_else(|| self.usage_cache.map(|(_, c)| c.used))
-            .unwrap_or(0);
-        let quota = self.client.bucket_quota().ok().flatten();
-        let snapshot = decide_usage(used, quota);
-        if snapshot.total_is_synthetic {
-            tracing::debug!(
-                used,
-                synthetic_total = SYNTHETIC_TOTAL,
-                "no bucket quota configured; statfs reports a synthetic capacity"
-            );
-        }
-        self.usage_cache = Some((Instant::now(), snapshot));
-        snapshot
-    }
-
     /// Merge attribute changes, preserving other metadata, and persist them
     /// through SetObjectMetadata or the staged file's recovery record.
     #[allow(clippy::too_many_arguments)]
@@ -1028,7 +973,7 @@ impl Inner {
             .extra_meta
             .retain(|(k, _)| !extra.iter().any(|(ek, _)| ek == k));
         current.extra_meta.extend_from_slice(extra);
-        let base = current.unix.unwrap_or(UnixMeta {
+        let base = current.unix.unwrap_or(UnixAttrs {
             mode: if current.is_dir {
                 libc::S_IFDIR | 0o755
             } else {
@@ -1036,18 +981,16 @@ impl Inner {
             },
             uid: 0,
             gid: 0,
-            mtime: unix_seconds(current.mtime),
         });
-        current.unix = Some(UnixMeta {
+        current.unix = Some(UnixAttrs {
             mode: mode
                 .map(|m| (base.mode & libc::S_IFMT) | (m & 0o7777))
                 .unwrap_or(base.mode),
             uid: uid.unwrap_or(base.uid),
             gid: gid.unwrap_or(base.gid),
-            mtime: mtime.map(unix_seconds).unwrap_or(base.mtime),
         });
-        if let Some(unix) = current.unix {
-            current.mtime = unix_time(unix.mtime);
+        if let Some(mtime) = mtime {
+            current.mtime = mtime;
         }
         current.expires = Instant::now() + Duration::from_secs(5);
         self.persist_meta(path, current)
@@ -1064,7 +1007,9 @@ impl Inner {
                     .ok_or_else(|| ObsError::Other(format!("missing inode for {path}")))?;
                 let staging = self.staging_path(*ino);
                 self.save_recovery(path, &staging)?;
-                self.pending.insert(staging);
+                if let Some(file) = self.files.get_mut(ino) {
+                    file.pending = true;
+                }
                 Ok(())
             } else {
                 self.client
@@ -1081,62 +1026,164 @@ impl Inner {
         result
     }
 
-    fn upload_staged_path(&mut self, key: &str, staging: &Path) -> Result<(), ObsError> {
-        self.save_recovery(key, staging)?;
-        File::open(staging)?.sync_all()?;
-        let meta = self.metadata_headers(key)?;
-        // Debug, not info: a backup writes thousands of files, and the staging
-        // path is a local detail nobody needs in a journal.
-        let size = fs::metadata(staging).map(|m| m.len()).unwrap_or(0);
-        tracing::debug!(key, size, "uploading to OBS");
-        self.client
-            .upload_file_with_meta(key, staging, self.upload, &meta)?;
-        self.pending.remove(staging);
+    fn prepare_upload(&mut self, ino: u64) -> Result<Option<UploadTask>, ObsError> {
+        let file = self
+            .files
+            .get(&ino)
+            .ok_or_else(|| ObsError::Other("missing file state".into()))?;
+        let staging = self.staging_path(ino);
+        let Some(key) = file.path.clone() else {
+            if staging.is_file() {
+                File::open(staging)?.sync_all()?;
+            }
+            return Ok(None);
+        };
+        if !file.pending {
+            return Ok(None);
+        }
+        self.save_recovery(&key, &staging)?;
+        let metadata = self.metadata_headers(&key)?;
+        if let Some(file) = self.files.get_mut(&ino) {
+            file.uploading = true;
+        }
+        Ok(Some(UploadTask {
+            ino,
+            key,
+            staging,
+            metadata,
+            tuning: self.upload,
+        }))
+    }
+
+    fn finish_upload(&mut self, task: &UploadTask, result: &Result<(), ObsError>) {
+        if let Some(file) = self.files.get_mut(&task.ino) {
+            file.uploading = false;
+            match result {
+                Ok(()) => {
+                    file.pending = false;
+                    file.reported_failure = false;
+                }
+                Err(e) => {
+                    if !file.reported_failure {
+                        tracing::error!(key=%task.key, error=%e, path=%task.staging.display(), "upload failed; recovery data retained");
+                        file.reported_failure = true;
+                    } else {
+                        tracing::debug!(key=%task.key, error=%e, "upload still failing");
+                    }
+                }
+            }
+        }
+    }
+
+    // Namespace transactions keep their lock through copy/delete. Ordinary
+    // flush/fsync use ObsFs::flush_handle to release it during the transfer.
+    fn upload_staged_path(&mut self, key: &str) -> Result<(), ObsError> {
+        let ino = *self
+            .path_to_ino
+            .get(key)
+            .ok_or_else(|| ObsError::Other("missing inode".into()))?;
+        if let Some(task) = self.prepare_upload(ino)? {
+            let result = task.run(&self.client);
+            self.finish_upload(&task, &result);
+            result?;
+        }
         Ok(())
     }
+}
 
-    fn upload_error_reply(&self, e: &ObsError) -> Errno {
-        errno_for_obs(e)
+struct UploadTask {
+    ino: u64,
+    key: String,
+    staging: PathBuf,
+    metadata: Vec<(String, String)>,
+    tuning: crate::obs::UploadTuning,
+}
+
+impl UploadTask {
+    fn run(&self, client: &ObsClient) -> Result<(), ObsError> {
+        File::open(&self.staging)?.sync_all()?;
+        client.upload_file_with_meta(&self.key, &self.staging, self.tuning, &self.metadata)
+    }
+}
+
+impl ObsFs {
+    /// Resolve what to report to `statfs`.
+    ///
+    /// OBS does not model a "disk": a bucket has a *used* figure
+    /// (`GET /?storageinfo`) and, optionally, a byte *quota* (`GET /?quota`).
+    /// So:
+    /// * quota > 0: real total, real used, real free. This is the only case
+    ///   where `df` means something.
+    /// * quota == 0: no limit configured. Reporting 0 free would make
+    ///   monitoring scream "disk full" and can make writers bail out on a
+    ///   statvfs() precheck, so report a large synthetic ceiling instead and
+    ///   flag it as synthetic.
+    /// * query fails: keep the last good answer, or fall back to the
+    ///   synthetic ceiling without usage numbers.
+    fn usage_snapshot(&self) -> UsageSnapshot {
+        let previous = self.inner.lock().unwrap().usage_cache;
+        if let Some((at, cached)) = previous
+            && at.elapsed() < USAGE_TTL
+        {
+            return cached;
+        }
+        let used = self
+            .client
+            .bucket_storage_size()
+            .ok()
+            .flatten()
+            .or_else(|| previous.map(|(_, c)| c.used))
+            .unwrap_or(0);
+        let quota = self.client.bucket_quota().ok().flatten();
+        let snapshot = decide_usage(used, quota);
+        if snapshot.total_is_synthetic {
+            tracing::debug!(
+                used,
+                synthetic_total = SYNTHETIC_TOTAL,
+                "no bucket quota configured; statfs reports a synthetic capacity"
+            );
+        }
+        self.inner.lock().unwrap().usage_cache = Some((Instant::now(), snapshot));
+        snapshot
     }
 
-    /// Shared flush/fsync body; dirty state belongs to the shared staging
-    /// file, so any handle can flush it. Failed uploads remain pending.
-    fn flush_handle(&mut self, fh: u64) -> Option<Errno> {
-        let Some(open) = self.open_files.get(&fh) else {
-            return Some(Errno::EBADF);
-        };
-        let staging = open.staging.clone()?;
-        if open.deleted {
-            return File::open(&staging)
-                .and_then(|f| f.sync_all())
-                .err()
-                .map(|e| io_errno(&e));
+    // Same-inode writes wait for their upload; other files can keep working.
+    fn lock_inode(&self, ino: u64) -> MutexGuard<'_, Inner> {
+        self.uploads_done
+            .wait_while(self.inner.lock().unwrap(), |inner| {
+                inner.files.get(&ino).is_some_and(|f| f.uploading)
+            })
+            .unwrap()
+    }
+
+    fn lock_namespace(&self) -> MutexGuard<'_, Inner> {
+        self.uploads_done
+            .wait_while(self.inner.lock().unwrap(), |inner| {
+                inner.files.values().any(|f| f.uploading)
+            })
+            .unwrap()
+    }
+
+    fn flush_handle(&self, fh: u64) -> Result<(), Errno> {
+        let ino = self
+            .inner
+            .lock()
+            .unwrap()
+            .open_files
+            .get(&fh)
+            .map(|f| f.ino)
+            .ok_or(Errno::EBADF)?;
+        let task = self
+            .lock_inode(ino)
+            .prepare_upload(ino)
+            .map_err(|e| errno_for_obs(&e))?;
+        if let Some(task) = task {
+            let result = task.run(&self.client);
+            self.inner.lock().unwrap().finish_upload(&task, &result);
+            self.uploads_done.notify_all();
+            result.map_err(|e| errno_for_obs(&e))?;
         }
-        if !self.pending.contains(&staging) {
-            return None;
-        }
-        let key = open.key.clone();
-        match self.upload_staged_path(&key, &staging) {
-            Ok(()) => {
-                self.reported_failure.remove(&staging);
-                None
-            }
-            Err(e) => {
-                // flush, fsync and release all land here, so one bad upload
-                // would otherwise log the same error several times in a row.
-                if self.reported_failure.insert(staging.clone()) {
-                    tracing::error!(
-                        key = %key,
-                        error = %e,
-                        path = %staging.display(),
-                        "upload failed; data and recovery metadata kept, retried on next close"
-                    );
-                } else {
-                    tracing::debug!(key = %key, error = %e, "upload still failing");
-                }
-                Some(self.upload_error_reply(&e))
-            }
-        }
+        Ok(())
     }
 }
 
@@ -1186,7 +1233,7 @@ impl Filesystem for ObsFs {
         let Some(parent_path) = (if parent == INodeNo::ROOT {
             Some(String::new())
         } else {
-            inner.ino_to_path.get(&parent.0).cloned()
+            inner.path(&parent.0).cloned()
         }) else {
             reply.error(Errno::ENOENT);
             return;
@@ -1223,7 +1270,7 @@ impl Filesystem for ObsFs {
             reply.attr(&TTL, &attr);
             return;
         }
-        if let Some(meta) = inner.detached.get(&ino.0) {
+        if let Some(meta) = inner.files.get(&ino.0).and_then(|f| f.detached.as_ref()) {
             let mut attr = inner.attr_with_meta(
                 req,
                 ino.0,
@@ -1236,7 +1283,7 @@ impl Filesystem for ObsFs {
             reply.attr(&TTL, &attr);
             return;
         }
-        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+        let Some(path) = inner.path(&ino.0).cloned() else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -1268,7 +1315,7 @@ impl Filesystem for ObsFs {
         let Some(path) = (if ino == INodeNo::ROOT {
             Some(String::new())
         } else {
-            inner.ino_to_path.get(&ino.0).cloned()
+            inner.path(&ino.0).cloned()
         }) else {
             reply.error(Errno::ENOENT);
             return;
@@ -1287,7 +1334,7 @@ impl Filesystem for ObsFs {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(path, error = %e, "list_dir failed");
-                    let err = inner.upload_error_reply(&e);
+                    let err = errno_for_obs(&e);
                     reply.error(err);
                     return;
                 }
@@ -1386,7 +1433,7 @@ impl Filesystem for ObsFs {
     /// Check existence; this shared mount does not enforce stored Unix modes.
     fn access(&self, _req: &Request, ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
         let mut inner = self.inner.lock().unwrap();
-        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+        let Some(path) = inner.path(&ino.0).cloned() else {
             // The root inode is not in the map; it always exists.
             if ino.0 == ROOT_INO {
                 reply.ok();
@@ -1403,8 +1450,8 @@ impl Filesystem for ObsFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+        let mut inner = self.lock_inode(ino.0);
+        let Some(path) = inner.path(&ino.0).cloned() else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -1445,10 +1492,7 @@ impl Filesystem for ObsFs {
                 fh,
                 OpenFile {
                     ino: ino.0,
-                    deleted: false,
                     etag,
-                    key: path,
-                    staging: None,
                     size,
                     window: None,
                 },
@@ -1466,10 +1510,7 @@ impl Filesystem for ObsFs {
                 fh,
                 OpenFile {
                     ino: ino.0,
-                    deleted: false,
                     etag: None,
-                    key: path,
-                    staging: Some(staging.clone()),
                     size: fs::metadata(&staging).ok().map(|m| m.len()),
                     window: None,
                 },
@@ -1506,10 +1547,7 @@ impl Filesystem for ObsFs {
             fh,
             OpenFile {
                 ino: ino.0,
-                deleted: false,
                 etag: None,
-                key: path,
-                staging: Some(staging),
                 size: None,
                 window: None,
             },
@@ -1536,22 +1574,21 @@ impl Filesystem for ObsFs {
         // link speed purely because reads could not overlap.
         let (key, file_size, staging, etag) = {
             let inner = self.inner.lock().unwrap();
-            match inner.open_files.get(&fh.0) {
-                Some(open) => match open.size {
-                    Some(file_size) => (
-                        open.key.clone(),
-                        file_size,
-                        open.staging.clone(),
-                        open.etag.clone(),
-                    ),
-                    // Size unknown (write handle): fall back to the locked path.
-                    None => (String::new(), 0, open.staging.clone(), None),
-                },
-                None => {
-                    reply.error(Errno::EBADF);
-                    return;
-                }
-            }
+            let Some(open) = inner.open_files.get(&fh.0) else {
+                reply.error(Errno::EBADF);
+                return;
+            };
+            let Some(file) = inner.files.get(&open.ino) else {
+                reply.error(Errno::EBADF);
+                return;
+            };
+            let staging = inner.staging_path(open.ino);
+            (
+                file.path.clone().unwrap_or_default(),
+                open.size.unwrap_or(0),
+                staging.is_file().then_some(staging),
+                open.etag.clone(),
+            )
         };
         if let Some(staging) = staging {
             return read_staging(&staging, offset, size, reply);
@@ -1585,8 +1622,10 @@ impl Filesystem for ObsFs {
             reply.error(Errno::EIO);
             return;
         };
-        let client = self.client.clone();
-        let data = match client.get_range_checked(&key, offset, fetch_len, &etag, file_size) {
+        let data = match self
+            .client
+            .get_range_checked(&key, offset, fetch_len, &etag, file_size)
+        {
             Ok(d) => d,
             Err(e) => {
                 if let Some(open) = self.inner.lock().unwrap().open_files.get_mut(&fh.0) {
@@ -1596,33 +1635,19 @@ impl Filesystem for ObsFs {
                 return;
             }
         };
-        if data.len() != fetch_len {
-            tracing::error!(
-                key,
-                offset,
-                expected = fetch_len,
-                received = data.len(),
-                "incomplete range read"
-            );
-            reply.error(Errno::EIO);
-            return;
-        }
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(open) = inner.open_files.get_mut(&fh.0) {
-                open.window = Some(ReadWindow {
-                    start: offset,
-                    data: data.clone(),
-                });
-            }
-        }
         reply.data(&data[..want]);
+        if let Some(open) = self.inner.lock().unwrap().open_files.get_mut(&fh.0) {
+            open.window = Some(ReadWindow {
+                start: offset,
+                data,
+            });
+        }
     }
 
     fn write(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: fuser::FileHandle,
         offset: u64,
         data: &[u8],
@@ -1631,18 +1656,24 @@ impl Filesystem for ObsFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inode(ino.0);
         let Some(open) = inner.open_files.get(&fh.0) else {
             reply.error(Errno::EBADF);
             return;
         };
-        let Some(staging) = open.staging.clone() else {
+        let ino = open.ino;
+        let Some(file) = inner.files.get(&ino) else {
             reply.error(Errno::EBADF);
             return;
         };
-        let key = open.key.clone();
-        let deleted = open.deleted;
-        let ino = open.ino;
+        let key = file.path.clone();
+        let deleted = key.is_none();
+        let key = key.unwrap_or_default();
+        let staging = inner.staging_path(ino);
+        if !staging.is_file() {
+            reply.error(Errno::EBADF);
+            return;
+        }
         let current_size = fs::metadata(&staging).map(|m| m.len()).unwrap_or(0);
         let end = if flags.0 & libc::O_APPEND != 0 {
             current_size
@@ -1677,12 +1708,10 @@ impl Filesystem for ObsFs {
         match result {
             Ok(size) => {
                 if deleted {
-                    if let Some(meta) = inner.detached.get_mut(&ino) {
+                    if let Some(meta) = inner.files.get_mut(&ino).and_then(|f| f.detached.as_mut())
+                    {
                         meta.size = size;
                         meta.mtime = SystemTime::now();
-                        if let Some(unix) = &mut meta.unix {
-                            unix.mtime = unix_seconds(meta.mtime);
-                        }
                     }
                 } else {
                     inner.content_changed(&key, size);
@@ -1703,11 +1732,11 @@ impl Filesystem for ObsFs {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_namespace();
         let Some(parent_path) = (if parent == INodeNo::ROOT {
             Some(String::new())
         } else {
-            inner.ino_to_path.get(&parent.0).cloned()
+            inner.path(&parent.0).cloned()
         }) else {
             reply.error(Errno::ENOENT);
             return;
@@ -1740,14 +1769,10 @@ impl Filesystem for ObsFs {
             return;
         }
         let mut cached = synthetic_meta(0, false, SystemTime::now());
-        cached.unix = Some(UnixMeta {
+        cached.unix = Some(UnixAttrs {
             mode: libc::S_IFREG | (mode & !umask & 0o7777),
             uid: req.uid(),
             gid: req.gid(),
-            mtime: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
         });
         inner.meta_cache.insert(path.clone(), cached);
         if let Err(e) = inner.mark_pending(&path, &staging) {
@@ -1760,10 +1785,8 @@ impl Filesystem for ObsFs {
             fh,
             OpenFile {
                 ino,
-                deleted: false,
+
                 etag: None,
-                key: path.clone(),
-                staging: Some(staging),
                 size: Some(0),
                 window: None,
             },
@@ -1796,10 +1819,9 @@ impl Filesystem for ObsFs {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        let mut inner = self.inner.lock().unwrap();
-        match inner.flush_handle(fh.0) {
-            Some(err) => reply.error(err),
-            None => reply.ok(),
+        match self.flush_handle(fh.0) {
+            Err(err) => reply.error(err),
+            Ok(()) => reply.ok(),
         }
     }
 
@@ -1814,10 +1836,9 @@ impl Filesystem for ObsFs {
         // Same as flush: OBS objects are immutable, so an fsync is a full
         // re-upload of the staged file. Apps that fsync often (databases,
         // VM images) must not run on this mount.
-        let mut inner = self.inner.lock().unwrap();
-        match inner.flush_handle(fh.0) {
-            Some(err) => reply.error(err),
-            None => reply.ok(),
+        match self.flush_handle(fh.0) {
+            Err(err) => reply.error(err),
+            Ok(()) => reply.ok(),
         }
     }
 
@@ -1831,17 +1852,15 @@ impl Filesystem for ObsFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let result = self.flush_handle(fh.0);
         let mut inner = self.inner.lock().unwrap();
-        let error = inner.flush_handle(fh.0);
-        if let Some(open) = inner.open_files.remove(&fh.0)
-            && let Some(staging) = open.staging
-        {
-            inner.release_staging(&staging);
+        if let Some(open) = inner.open_files.remove(&fh.0) {
+            inner.release_staging(open.ino);
         }
         inner.maybe_reclaim();
-        match error {
-            Some(e) => reply.error(e),
-            None => reply.ok(),
+        match result {
+            Err(e) => reply.error(e),
+            Ok(()) => reply.ok(),
         }
     }
 
@@ -1854,11 +1873,11 @@ impl Filesystem for ObsFs {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_namespace();
         let Some(parent_path) = (if parent == INodeNo::ROOT {
             Some(String::new())
         } else {
-            inner.ino_to_path.get(&parent.0).cloned()
+            inner.path(&parent.0).cloned()
         }) else {
             reply.error(Errno::ENOENT);
             return;
@@ -1878,17 +1897,16 @@ impl Filesystem for ObsFs {
         });
         if let Err(e) = inner.client.put_object_with_meta(&placeholder, &[], &meta) {
             tracing::error!(error = %e, "mkdir placeholder upload failed");
-            let err = inner.upload_error_reply(&e);
+            let err = errno_for_obs(&e);
             reply.error(err);
             return;
         }
         let ino = inner.alloc_ino(&path);
         let mut cached = synthetic_meta(4096, true, SystemTime::now());
-        cached.unix = Some(UnixMeta {
+        cached.unix = Some(UnixAttrs {
             mode: libc::S_IFDIR | (mode & !umask & 0o7777),
             uid: req.uid(),
             gid: req.gid(),
-            mtime: now,
         });
         inner.meta_cache.insert(path.clone(), cached);
         let attr = inner.attr_with_meta(
@@ -1904,11 +1922,11 @@ impl Filesystem for ObsFs {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_namespace();
         let Some(parent_path) = (if parent == INodeNo::ROOT {
             Some(String::new())
         } else {
-            inner.ino_to_path.get(&parent.0).cloned()
+            inner.path(&parent.0).cloned()
         }) else {
             reply.error(Errno::ENOENT);
             return;
@@ -1934,13 +1952,13 @@ impl Filesystem for ObsFs {
                 }
             }
             Err(e) => {
-                let err = inner.upload_error_reply(&e);
+                let err = errno_for_obs(&e);
                 reply.error(err);
                 return;
             }
         }
         if let Err(e) = inner.client.delete_object(&prefix) {
-            let err = inner.upload_error_reply(&e);
+            let err = errno_for_obs(&e);
             reply.error(err);
             return;
         }
@@ -1949,11 +1967,11 @@ impl Filesystem for ObsFs {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_namespace();
         let Some(parent_path) = (if parent == INodeNo::ROOT {
             Some(String::new())
         } else {
-            inner.ino_to_path.get(&parent.0).cloned()
+            inner.path(&parent.0).cloned()
         }) else {
             reply.error(Errno::ENOENT);
             return;
@@ -1964,7 +1982,7 @@ impl Filesystem for ObsFs {
             return;
         }
         if let Err(e) = inner.client.delete_object(&path) {
-            let err = inner.upload_error_reply(&e);
+            let err = errno_for_obs(&e);
             reply.error(err);
             return;
         }
@@ -1982,11 +2000,11 @@ impl Filesystem for ObsFs {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_namespace();
         let old_parent = if parent == INodeNo::ROOT {
             String::new()
         } else {
-            match inner.ino_to_path.get(&parent.0) {
+            match inner.path(&parent.0) {
                 Some(p) => p.clone(),
                 None => {
                     reply.error(Errno::ENOENT);
@@ -1997,7 +2015,7 @@ impl Filesystem for ObsFs {
         let new_parent = if newparent == INodeNo::ROOT {
             String::new()
         } else {
-            match inner.ino_to_path.get(&newparent.0) {
+            match inner.path(&newparent.0) {
                 Some(p) => p.clone(),
                 None => {
                     reply.error(Errno::ENOENT);
@@ -2018,8 +2036,7 @@ impl Filesystem for ObsFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        let mut inner = self.inner.lock().unwrap();
-        let usage = inner.usage_snapshot();
+        let usage = self.usage_snapshot();
         let bs = STATFS_BLOCK_SIZE as u64;
         let total_blocks = usage.total / bs;
         let used_blocks = (usage.used / bs).min(total_blocks);
@@ -2050,8 +2067,8 @@ impl Filesystem for ObsFs {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+        let mut inner = self.lock_inode(ino.0);
+        let Some(path) = inner.path(&ino.0).cloned() else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -2084,7 +2101,7 @@ impl Filesystem for ObsFs {
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let mut inner = self.inner.lock().unwrap();
-        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+        let Some(path) = inner.path(&ino.0).cloned() else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -2119,7 +2136,7 @@ impl Filesystem for ObsFs {
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let mut inner = self.inner.lock().unwrap();
-        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+        let Some(path) = inner.path(&ino.0).cloned() else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -2148,8 +2165,8 @@ impl Filesystem for ObsFs {
     }
 
     fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+        let mut inner = self.lock_inode(ino.0);
+        let Some(path) = inner.path(&ino.0).cloned() else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -2184,11 +2201,11 @@ impl Filesystem for ObsFs {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_namespace();
         let Some(parent_path) = (if parent == INodeNo::ROOT {
             Some(String::new())
         } else {
-            inner.ino_to_path.get(&parent.0).cloned()
+            inner.path(&parent.0).cloned()
         }) else {
             reply.error(Errno::ENOENT);
             return;
@@ -2211,19 +2228,20 @@ impl Filesystem for ObsFs {
         ));
         if let Err(e) = inner.client.put_object_with_meta(&path, &[], &meta) {
             tracing::error!(path = %path, error = %e, "symlink creation failed");
-            let err = inner.upload_error_reply(&e);
+            let err = errno_for_obs(&e);
             reply.error(err);
             return;
         }
         let ino = inner.alloc_ino(&path);
         let mut cached = synthetic_meta(0, false, SystemTime::now());
-        cached.unix = Some(UnixMeta {
+        cached.unix = Some(UnixAttrs {
             mode: libc::S_IFLNK | 0o777,
             uid: req.uid(),
             gid: req.gid(),
-            mtime: now,
         });
-        cached.symlink_target = Some(target_str);
+        cached
+            .extra_meta
+            .push((crate::obs::meta_keys::SYMLINK_TARGET.into(), target_str));
         inner.meta_cache.insert(path, cached.clone());
         let attr =
             inner.attr_with_meta(req, ino, FileType::Symlink, 0, cached.mtime, Some(&cached));
@@ -2233,14 +2251,14 @@ impl Filesystem for ObsFs {
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         let inner = self.inner.lock().unwrap();
-        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+        let Some(path) = inner.path(&ino.0).cloned() else {
             reply.error(Errno::ENOENT);
             return;
         };
         if let Some(target) = inner
             .meta_cache
             .get(&path)
-            .and_then(|c| c.symlink_target.clone())
+            .and_then(|c| crate::obs::symlink_target(&c.extra_meta))
         {
             reply.data(target.as_bytes());
             return;
@@ -2256,7 +2274,7 @@ impl Filesystem for ObsFs {
             }
             Ok(None) => reply.error(Errno::ENOENT),
             Err(e) => {
-                let err = inner.upload_error_reply(&e);
+                let err = errno_for_obs(&e);
                 reply.error(err);
             }
         }
@@ -2284,8 +2302,13 @@ impl Filesystem for ObsFs {
         // metadata, so chmod/chown/utimes use SetObjectMetadata.
         // Truncation still needs the
         // data path: download -> truncate -> re-upload.
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(mut meta) = inner.detached.get(&ino.0).cloned() {
+        let mut inner = self.lock_inode(ino.0);
+        if let Some(mut meta) = inner
+            .files
+            .get(&ino.0)
+            .and_then(|f| f.detached.as_ref())
+            .cloned()
+        {
             let staging = inner.staging_path(ino.0);
             if let Some(size) = size {
                 if size > crate::obs::MAX_OBJECT_SIZE {
@@ -2307,11 +2330,10 @@ impl Filesystem for ObsFs {
                 meta.size = size;
                 meta.mtime = SystemTime::now();
             }
-            let mut unix = meta.unix.unwrap_or(UnixMeta {
+            let mut unix = meta.unix.unwrap_or(UnixAttrs {
                 mode: libc::S_IFREG | 0o644,
                 uid: req.uid(),
                 gid: req.gid(),
-                mtime: unix_seconds(meta.mtime),
             });
             if let Some(mode) = mode {
                 unix.mode = (unix.mode & libc::S_IFMT) | (mode & 0o7777);
@@ -2328,7 +2350,6 @@ impl Filesystem for ObsFs {
                     TimeOrNow::SpecificTime(t) => t,
                 };
             }
-            unix.mtime = unix_seconds(meta.mtime);
             meta.unix = Some(unix);
             let mut attr = inner.attr_with_meta(
                 req,
@@ -2339,11 +2360,13 @@ impl Filesystem for ObsFs {
                 Some(&meta),
             );
             attr.nlink = 0;
-            inner.detached.insert(ino.0, meta);
+            if let Some(file) = inner.files.get_mut(&ino.0) {
+                file.detached = Some(meta);
+            }
             reply.attr(&TTL, &attr);
             return;
         }
-        let Some(path) = inner.ino_to_path.get(&ino.0).cloned() else {
+        let Some(path) = inner.path(&ino.0).cloned() else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -2353,7 +2376,7 @@ impl Filesystem for ObsFs {
                 TimeOrNow::SpecificTime(t) => t,
             });
             if let Err(e) = inner.update_unix_meta(&path, mode, uid, gid, when, &[]) {
-                let err = inner.upload_error_reply(&e);
+                let err = errno_for_obs(&e);
                 reply.error(err);
                 return;
             }
@@ -2388,11 +2411,11 @@ impl Filesystem for ObsFs {
                 return;
             }
             inner.content_changed(&path, size);
-            if let Err(e) = inner.upload_staged_path(&path, &staging) {
+            if let Err(e) = inner.upload_staged_path(&path) {
                 reply.error(errno_for_obs(&e));
                 return;
             }
-            inner.release_staging(&staging);
+            inner.release_staging(ino.0);
         }
         match inner.resolve(&path) {
             Ok(Some((_, is_dir, size, mtime))) => {
@@ -2414,6 +2437,33 @@ impl Filesystem for ObsFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn detaching_open_remote_file_fetches_metadata_once() {
+        let mock = crate::test_support::MockObs::new("[]");
+        let mut inner = mock_inner(&mock);
+        inner
+            .client
+            .put_object_with_meta("data", b"original", &[])
+            .unwrap();
+        let ino = inner.alloc_ino("data");
+        let etag = inner.client.head_object("data").unwrap().unwrap().etag;
+        inner.open_files.insert(
+            1,
+            OpenFile {
+                ino,
+                etag,
+                size: Some(8),
+                window: None,
+            },
+        );
+        let before = mock.stats().requests["HEAD data"];
+        inner.prepare_detach("data").unwrap();
+        assert_eq!(mock.stats().requests["HEAD data"] - before, 1);
+        assert_eq!(fs::read(inner.staging_path(ino)).unwrap(), b"original");
+        inner.detach_path("data");
+        assert!(inner.path(&ino).is_none());
+        assert!(inner.staging_path(ino).exists());
+    }
     #[test]
     fn external_mtime_and_epoch_are_preserved() {
         let mut meta = crate::obs::ObjectMeta {
@@ -2534,19 +2584,16 @@ mod tests {
             staging_dir: std::env::temp_dir().join("obs-mount-test-staging"),
             upload: crate::obs::UploadTuning::default(),
             next_ino: 2,
-            ino_to_path: HashMap::new(),
+            files: HashMap::new(),
             path_to_ino: HashMap::new(),
             meta_cache: HashMap::new(),
             open_files: HashMap::new(),
             next_fh: 1,
-            detached: HashMap::new(),
             lookups: HashMap::new(),
             directories: HashMap::new(),
             min_free_space: 0,
             cache_limit: 10_000,
             last_reclaim: Instant::now(),
-            pending: HashSet::new(),
-            reported_failure: HashSet::new(),
             usage_cache: None,
         }
     }
@@ -2592,7 +2639,7 @@ mod tests {
 
         inner.remap_subtree("old.txt", "new.txt");
 
-        assert_eq!(inner.ino_to_path.get(&ino), Some(&"new.txt".to_string()));
+        assert_eq!(inner.path(&ino), Some(&"new.txt".to_string()));
         assert_eq!(inner.path_to_ino.get("new.txt"), Some(&ino));
         assert!(!inner.path_to_ino.contains_key("old.txt"));
         assert_eq!(
@@ -2612,12 +2659,9 @@ mod tests {
 
         inner.remap_subtree("d", "e");
 
-        assert_eq!(inner.ino_to_path.get(&dir_ino), Some(&"e".to_string()));
-        assert_eq!(inner.ino_to_path.get(&file_ino), Some(&"e/f".to_string()));
-        assert_eq!(
-            inner.ino_to_path.get(&nested_ino),
-            Some(&"e/s/g".to_string())
-        );
+        assert_eq!(inner.path(&dir_ino), Some(&"e".to_string()));
+        assert_eq!(inner.path(&file_ino), Some(&"e/f".to_string()));
+        assert_eq!(inner.path(&nested_ino), Some(&"e/s/g".to_string()));
         assert!(!inner.path_to_ino.contains_key("d/f"));
     }
 
@@ -2629,8 +2673,7 @@ mod tests {
         inner.open_files.insert(
             7,
             OpenFile {
-                key: "a.txt".into(),
-                staging: Some(inner.staging_path(ino)),
+                ino,
                 size: None,
                 window: None,
                 ..Default::default()
@@ -2640,7 +2683,11 @@ mod tests {
         inner.remap_subtree("a.txt", "b.txt");
 
         assert_eq!(
-            inner.open_files.get(&7).map(|f| f.key.as_str()),
+            inner
+                .open_files
+                .get(&7)
+                .and_then(|f| inner.path(&f.ino))
+                .map(String::as_str),
             Some("b.txt")
         );
     }
@@ -2674,6 +2721,7 @@ mod tests {
     fn only_the_last_handle_unlinks_staging() {
         let dir = std::env::temp_dir().join("obs-mount-test-staging");
         std::fs::create_dir_all(&dir).unwrap();
+        let ino = 99;
         let staging = dir.join("ino-99");
         std::fs::write(&staging, b"data").unwrap();
 
@@ -2683,8 +2731,7 @@ mod tests {
             inner.open_files.insert(
                 fh,
                 OpenFile {
-                    key: "k".into(),
-                    staging: Some(staging.clone()),
+                    ino,
                     size: None,
                     window: None,
                     ..Default::default()
@@ -2694,11 +2741,11 @@ mod tests {
 
         // First handle leaving must keep the file for the second one.
         inner.open_files.remove(&1);
-        inner.release_staging(&staging);
+        inner.release_staging(ino);
         assert!(staging.exists(), "staging removed while still referenced");
 
         inner.open_files.remove(&2);
-        inner.release_staging(&staging);
+        inner.release_staging(ino);
         assert!(
             !staging.exists(),
             "staging should be removed with the last handle"
@@ -2847,19 +2894,21 @@ mod tests {
             inner.open_files.insert(
                 fh,
                 OpenFile {
-                    key: "backup".into(),
-                    staging: Some(staging.clone()),
+                    ino,
                     window: None,
                     size: None,
                     ..Default::default()
                 },
             );
         }
-        assert_eq!(inner.flush_handle(1), Some(Errno::EACCES));
+        assert_eq!(
+            errno_for_obs(&inner.upload_staged_path("backup").unwrap_err()),
+            Errno::EACCES
+        );
         inner.open_files.remove(&1);
-        inner.release_staging(&staging);
+        inner.release_staging(ino);
         inner.open_files.remove(&2);
-        inner.release_staging(&staging);
+        inner.release_staging(ino);
         assert_eq!(fs::read(&staging).unwrap(), b"only copy");
         assert!(
             fs::read_to_string(staging.with_extension("yaml"))
@@ -2876,8 +2925,8 @@ mod tests {
             staging.exists(),
             "constructing another filesystem must not clean old staging"
         );
-        inner.upload_staged_path("backup", &staging).unwrap();
-        inner.release_staging(&staging);
+        inner.upload_staged_path("backup").unwrap();
+        inner.release_staging(ino);
         assert!(!staging.exists());
         assert!(!staging.with_extension("yaml").exists());
         assert_eq!(
@@ -2914,8 +2963,8 @@ mod tests {
         inner
             .update_unix_meta("backup", None, Some(4321), None, None, &[])
             .unwrap();
-        inner.upload_staged_path("backup", &staged).unwrap();
-        inner.release_staging(&staged);
+        inner.upload_staged_path("backup").unwrap();
+        inner.release_staging(ino);
         // A new HEAD, with an empty cache, must recover attributes from OBS.
         inner.meta_cache.clear();
         inner.resolve("backup").unwrap();
@@ -2940,7 +2989,7 @@ mod tests {
             .set_len(4)
             .unwrap();
         inner.content_changed("backup", 4);
-        inner.upload_staged_path("backup", &staged).unwrap();
+        inner.upload_staged_path("backup").unwrap();
         let meta = inner.client.head_object("backup").unwrap().unwrap();
         assert_eq!(meta.unix.unwrap().mode, unix.mode);
         assert!(
@@ -3013,6 +3062,67 @@ mod tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt, chown, symlink};
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
+
+        fn concurrent_writeback(mock: &MockObs, root: &Path) {
+            use std::sync::mpsc;
+            use std::thread;
+            mock.client()
+                .put_object_with_meta("parallel-read", b"readable", &[])
+                .unwrap();
+            let mut reader = File::open(root.join("parallel-read")).unwrap();
+            let mut other = File::create(root.join("parallel-other")).unwrap();
+            let mut writer = File::create(root.join("parallel-upload")).unwrap();
+            writer.write_all(b"first").unwrap();
+            let syncing = writer.try_clone().unwrap();
+            thread::scope(|scope| {
+                let upload = scope.spawn(move || syncing.sync_all().unwrap());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while mock
+                    .stats()
+                    .requests
+                    .get("PUT parallel-upload")
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+                {
+                    assert!(Instant::now() < deadline, "upload did not reach OBS");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let (same_tx, same_rx) = mpsc::channel();
+                let same = scope.spawn(move || {
+                    writer.write_all(b"-later").unwrap();
+                    same_tx.send(()).unwrap();
+                    writer.sync_all().unwrap();
+                });
+                let (other_tx, other_rx) = mpsc::channel();
+                let independent = scope.spawn(move || {
+                    let mut bytes = Vec::new();
+                    reader.read_to_end(&mut bytes).unwrap();
+                    assert_eq!(bytes, b"readable");
+                    other.write_all(b"independent").unwrap();
+                    other.sync_all().unwrap();
+                    other_tx.send(()).unwrap();
+                });
+                let unrelated = other_rx.recv_timeout(Duration::from_secs(1));
+                let same_blocked = same_rx.try_recv().is_err();
+                upload.join().unwrap();
+                same.join().unwrap();
+                independent.join().unwrap();
+                assert!(unrelated.is_ok(), "unrelated read/write blocked by upload");
+                assert!(
+                    same_blocked,
+                    "same-inode write changed in-flight upload bytes"
+                );
+            });
+            assert_eq!(
+                fs::read(root.join("parallel-upload")).unwrap(),
+                b"first-later"
+            );
+            assert_eq!(
+                fs::read(root.join("parallel-other")).unwrap(),
+                b"independent"
+            );
+        }
 
         fn lifecycle_regressions(mock: &MockObs, root: &Path) {
             // Publish a still-open temporary file under its final name.
@@ -3215,7 +3325,9 @@ mod tests {
                 .write(true)
                 .open("/dev/fuse")
                 .expect("this test requires an accessible /dev/fuse");
-            let mock = MockObs::new("[]");
+            let mock = MockObs::new(
+                r#"[{"method":"PUT","key":"parallel-upload","status":503,"delay_ms":3000}]"#,
+            );
             // All test data stays inside this fresh directory. Use a numeric
             // unprivileged UID for cross-user checks; never create OS accounts.
             fs::set_permissions(&mock.staging, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3223,6 +3335,7 @@ mod tests {
             assert!(mount.wait_mounted(), "mount failed: {}", mount.log());
             let root = &mount.mountpoint;
             lifecycle_regressions(&mock, root);
+            concurrent_writeback(&mock, root);
 
             write_file(&root.join("small.txt"), b"hello\n");
             assert_eq!(fs::read(root.join("small.txt")).unwrap(), b"hello\n");
