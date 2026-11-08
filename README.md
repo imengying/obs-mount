@@ -6,16 +6,16 @@
 
 ## 安装与运行
 
-按 `uname -m` 选择 Release 中的静态包，支持 Debian 13 / Ubuntu：
+按 `uname -m` 选择 Release 中的 glibc 动态链接包，支持 Debian 13 / Ubuntu 24.04 及更新版本。发布包在 Ubuntu 24.04 构建，以 [glibc 2.39](https://packages.ubuntu.com/noble/libc6) 为运行基线，需要系统提供 glibc 和 `libgcc_s.so.1`。
 
 | 架构 | 下载文件 |
 |---|---|
-| x86_64（Intel / AMD） | `obs-mount-x86_64-linux-musl.tar.gz` |
-| aarch64 / ARM64 | `obs-mount-aarch64-linux-musl.tar.gz` |
+| x86_64（Intel / AMD） | `obs-mount-x86_64-linux-gnu.tar.gz` |
+| aarch64 / ARM64 | `obs-mount-aarch64-linux-gnu.tar.gz` |
 
 ```sh
-sudo apt-get install -y fuse3  # Debian / Ubuntu；其他发行版安装对应的 FUSE 3 包
-tar -xzf "obs-mount-$(uname -m)-linux-musl.tar.gz"
+sudo apt-get install -y fuse3 libgcc-s1 ca-certificates  # Debian / Ubuntu
+tar -xzf "obs-mount-$(uname -m)-linux-gnu.tar.gz"
 sudo install -d /etc/obs /mnt/obs
 sudo install -m 0755 obs /etc/obs/obs
 sudo install -m 0600 obs-mount.yaml.example /etc/obs/obs.yaml
@@ -83,6 +83,10 @@ sudo env RUST_LOG=debug /etc/obs/obs -c /etc/obs/obs.yaml
 
 需要 Rust stable（源码至少 1.88）和 C/C++ 构建工具（Debian / Ubuntu：`build-essential cmake perl pkg-config`）。
 
+在 glibc 系统上构建；本地二进制的运行库要求取决于构建环境。CI 分别使用 `x86_64-unknown-linux-gnu` 和 `aarch64-unknown-linux-gnu` 目标，并检查动态加载器、共享库是否可加载，以及引用的 glibc 符号版本不超过 2.39。HTTPS 使用系统 CA 证书，需要安装 `ca-certificates`。
+
+Release 构建启用 Thin LTO、单个代码生成单元和符号裁剪，以减少跨库重复代码与产物体积；完整符号可通过开发构建保留。发布包使用各架构的默认 CPU 指令集，避免依赖构建机特有指令。
+
 源码集中在 `src/`：`main.rs` 负责启动和配置，`fs.rs` 实现 FUSE，`obs.rs` 封装 OBS API。测试直接写在各模块的 `#[cfg(test)] mod tests` 中；`test_support.rs` 提供仅在测试时编译的模拟服务和临时资源管理。
 
 ```sh
@@ -97,4 +101,4 @@ cargo test -- --ignored --nocapture
 
 测试在进程内启动模拟 OBS 服务，覆盖签名、响应正文错误、读取版本校验、原生元数据更新、分段复制、分段上传及取消失败恢复；真实挂载测试覆盖打开文件时重命名、删除、覆盖、远端对象变化以及慢上传期间的并发读写，无需 Python 或云端凭据。CLI 和挂载测试默认标记为 `ignored`，可用 `OBS_MOUNT_BIN` 指定待测二进制；CI 在 x86_64、ARM64 的 Ubuntu 24.04 原生 runner 上分别构建并强制执行挂载测试，任一架构失败都会阻止发布。真实 OBS、长期稳定性和断网恢复仍需另外验证。
 
-推送 `v*` tag 触发 CI 构建并发布静态 musl 包；构建与发布步骤见 [CI 配置](.github/workflows/ci.yml)。
+推送 `v*` tag 触发 CI 构建并发布 glibc 动态链接包；构建与发布步骤见 [CI 配置](.github/workflows/ci.yml)。

@@ -20,6 +20,7 @@
 
 use crate::obs::{ObsClient, ObsError, UnixMeta};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use bytes::Bytes;
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
@@ -29,7 +30,7 @@ use fuser::{
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
@@ -96,7 +97,8 @@ impl From<UnixMeta> for UnixAttrs {
 /// A span of an object fetched ahead of demand.
 struct ReadWindow {
     start: u64,
-    data: Vec<u8>,
+    // Retain the HTTP response buffer without copying its contents.
+    data: Bytes,
 }
 
 impl ReadWindow {
@@ -200,24 +202,21 @@ pub struct ObsFs {
     client: ObsClient,
 }
 
-/// Serve a read out of a local staging file.
-fn read_staging(staging: &Path, offset: u64, size: u32, reply: ReplyData) {
-    let mut f = match File::open(staging) {
-        Ok(f) => f,
-        Err(e) => {
-            reply.error(io_errno(&e));
-            return;
-        }
-    };
-    if f.seek(SeekFrom::Start(offset)).is_err() {
-        reply.error(Errno::EIO);
-        return;
-    }
+/// Read a complete range, or stop at EOF, without a separate seek syscall.
+fn read_staging(staging: &Path, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
+    let file = File::open(staging)?;
     let mut buf = vec![0u8; size as usize];
-    match f.read(&mut buf) {
-        Ok(n) => reply.data(&buf[..n]),
-        Err(e) => reply.error(io_errno(&e)),
+    let mut read = 0;
+    while read < buf.len() {
+        match file.read_at(&mut buf[read..], offset + read as u64) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
     }
+    buf.truncate(read);
+    Ok(buf)
 }
 
 /// Map an OBS error to an errno without needing `&Inner`.
@@ -1591,7 +1590,11 @@ impl Filesystem for ObsFs {
             )
         };
         if let Some(staging) = staging {
-            return read_staging(&staging, offset, size, reply);
+            match read_staging(&staging, offset, size) {
+                Ok(data) => reply.data(&data),
+                Err(e) => reply.error(io_errno(&e)),
+            }
+            return;
         }
         if key.is_empty() {
             reply.error(Errno::EBADF);
@@ -1674,13 +1677,20 @@ impl Filesystem for ObsFs {
             reply.error(Errno::EBADF);
             return;
         }
-        let current_size = fs::metadata(&staging).map(|m| m.len()).unwrap_or(0);
-        let end = if flags.0 & libc::O_APPEND != 0 {
+        let current_size = match fs::metadata(&staging) {
+            Ok(meta) => meta.len(),
+            Err(e) => {
+                reply.error(io_errno(&e));
+                return;
+            }
+        };
+        // The inode lock keeps the append offset stable through the write.
+        let offset = if flags.0 & libc::O_APPEND != 0 {
             current_size
         } else {
             offset
         };
-        let Some(end) = end
+        let Some(end) = offset
             .checked_add(data.len() as u64)
             .filter(|end| *end <= crate::obs::MAX_OBJECT_SIZE)
         else {
@@ -1696,13 +1706,8 @@ impl Filesystem for ObsFs {
             return;
         }
         let result = (|| -> std::io::Result<u64> {
-            let mut file = OpenOptions::new().write(true).open(&staging)?;
-            file.seek(if flags.0 & libc::O_APPEND != 0 {
-                SeekFrom::End(0)
-            } else {
-                SeekFrom::Start(offset)
-            })?;
-            file.write_all(data)?;
+            let file = OpenOptions::new().write(true).open(&staging)?;
+            file.write_all_at(data, offset)?;
             Ok(file.metadata()?.len())
         })();
         match result {
@@ -2496,8 +2501,14 @@ mod tests {
             .put_object_with_meta("old/b", b"b", &[])
             .unwrap();
         assert!(inner.rename_path("old", "new", 0).is_err());
-        assert_eq!(inner.client.get_range("old/a", 0, 1).unwrap(), b"a");
-        assert_eq!(inner.client.get_range("old/b", 0, 1).unwrap(), b"b");
+        assert_eq!(
+            inner.client.get_range("old/a", 0, 1).unwrap().as_ref(),
+            b"a"
+        );
+        assert_eq!(
+            inner.client.get_range("old/b", 0, 1).unwrap().as_ref(),
+            b"b"
+        );
     }
 
     #[test]
@@ -2528,7 +2539,10 @@ mod tests {
             ),
             Errno::EOPNOTSUPP
         );
-        assert_eq!(inner.client.get_range("b", 0, 6).unwrap(), b"target");
+        assert_eq!(
+            inner.client.get_range("b", 0, 6).unwrap().as_ref(),
+            b"target"
+        );
         let before = inner.ensure_meta("a").unwrap().clone();
         assert!(
             inner
@@ -2543,7 +2557,10 @@ mod tests {
                 .is_err()
         );
         assert_eq!(inner.meta_cache["a"].extra_meta, before.extra_meta);
-        assert_eq!(inner.client.get_range("a", 0, 6).unwrap(), b"source");
+        assert_eq!(
+            inner.client.get_range("a", 0, 6).unwrap().as_ref(),
+            b"source"
+        );
     }
 
     #[test]
@@ -2614,7 +2631,7 @@ mod tests {
     fn read_window_never_returns_partial_data_across_its_boundary() {
         let window = ReadWindow {
             start: 100,
-            data: b"abcdefgh".to_vec(),
+            data: Bytes::from_static(b"abcdefgh"),
         };
         assert_eq!(window.slice(100, 8), Some(&b"abcdefgh"[..]));
         assert_eq!(window.slice(104, 4), Some(&b"efgh"[..]));
@@ -2624,6 +2641,24 @@ mod tests {
         assert_eq!(window.slice(108, 1), None);
         assert_eq!(window.slice(u64::MAX, 8), None);
         assert_eq!(window.slice(101, usize::MAX), None);
+    }
+
+    #[test]
+    fn staging_reads_respect_offsets_and_eof() {
+        let dir = crate::staging_dir_for(&std::env::temp_dir(), crate::current_uid()).unwrap();
+        let path = dir.join("data");
+        fs::write(&path, b"0123456789").unwrap();
+        assert_eq!(read_staging(&path, 3, 4).unwrap(), b"3456");
+        assert_eq!(read_staging(&path, 8, 8).unwrap(), b"89");
+        assert!(read_staging(&path, 10, 4).unwrap().is_empty());
+        assert!(read_staging(&path, 20, 4).unwrap().is_empty());
+        assert!(read_staging(&path, 3, 0).unwrap().is_empty());
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read_staging(&path, 0, 4).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Regression for `mv a b && cat b` returning ENOENT: a rename must keep
@@ -2930,7 +2965,7 @@ mod tests {
         assert!(!staging.exists());
         assert!(!staging.with_extension("yaml").exists());
         assert_eq!(
-            inner.client.get_range("backup", 0, 9).unwrap(),
+            inner.client.get_range("backup", 0, 9).unwrap().as_ref(),
             b"only copy"
         );
     }
@@ -2996,7 +3031,10 @@ mod tests {
             meta.x_obs_meta
                 .contains(&(xattr_key("user.colour"), B64.encode(b"blue")))
         );
-        assert_eq!(inner.client.get_range("backup", 0, 4).unwrap(), b"repl");
+        assert_eq!(
+            inner.client.get_range("backup", 0, 4).unwrap().as_ref(),
+            b"repl"
+        );
         assert_eq!(mock.stats().signature_failures, 0);
     }
 
@@ -3058,10 +3096,64 @@ mod tests {
         use super::*;
         use crate::test_support::{MockObs, MountProcess};
         use std::ffi::{CStr, CString};
+        use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{MetadataExt, PermissionsExt, chown, symlink};
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
+
+        fn positional_staging_io(mock: &MockObs, root: &Path) {
+            let client = mock.client();
+            client
+                .put_object_with_meta("positional.bin", b"0123456789", &[])
+                .unwrap();
+            let path = root.join("positional.bin");
+            // Open the direct-I/O reader before staging exists. Its subsequent
+            // reads reach FUSE even when the writer has populated kernel pages.
+            let reader = File::open(&path).unwrap();
+            let writer = OpenOptions::new().write(true).open(&path).unwrap();
+            let mut middle = [0; 4];
+            reader.read_exact_at(&mut middle, 3).unwrap();
+            assert_eq!(&middle, b"3456");
+
+            writer.write_all_at(b"XY", 3).unwrap();
+            writer.write_all_at(b"tail", 8197).unwrap();
+            let mut first = OpenOptions::new().append(true).open(&path).unwrap();
+            let mut second = OpenOptions::new().append(true).open(&path).unwrap();
+            // Each append must use the current EOF, regardless of its cursor
+            // or of another descriptor having extended the file.
+            first.seek(SeekFrom::Start(0)).unwrap();
+            first.write_all(b"-one").unwrap();
+            second.seek(SeekFrom::Start(0)).unwrap();
+            second.write_all(b"-two").unwrap();
+            first.write_all(b"-three").unwrap();
+            writer.write_all_at(b"Z", 1).unwrap();
+
+            let mut expected = b"0Z2XY56789".to_vec();
+            expected.resize(8197, 0);
+            expected.extend_from_slice(b"tail-one-two-three");
+            let mut actual = vec![0xff; expected.len()];
+            reader.read_exact_at(&mut actual, 0).unwrap();
+            assert_eq!(actual, expected);
+            let mut tail = [0xff; 8];
+            assert_eq!(
+                reader
+                    .read_at(&mut tail, expected.len() as u64 - 3)
+                    .unwrap(),
+                3
+            );
+            assert_eq!(&tail[..3], b"ree");
+            assert_eq!(reader.read_at(&mut tail, expected.len() as u64).unwrap(), 0);
+
+            writer.sync_all().unwrap();
+            drop((first, second, writer, reader));
+            assert_eq!(
+                client
+                    .get_range("positional.bin", 0, expected.len())
+                    .unwrap(),
+                expected
+            );
+        }
 
         fn concurrent_writeback(mock: &MockObs, root: &Path) {
             use std::sync::mpsc;
@@ -3336,6 +3428,7 @@ mod tests {
             let root = &mount.mountpoint;
             lifecycle_regressions(&mock, root);
             concurrent_writeback(&mock, root);
+            positional_staging_io(&mock, root);
 
             write_file(&root.join("small.txt"), b"hello\n");
             assert_eq!(fs::read(root.join("small.txt")).unwrap(), b"hello\n");

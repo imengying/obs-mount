@@ -18,6 +18,7 @@
 //! NOT enter the signature.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use bytes::Bytes;
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest as _, Md5};
@@ -862,7 +863,7 @@ impl ObsClient {
     }
 
     #[cfg(test)]
-    pub fn get_range(&self, key: &str, start: u64, len: usize) -> Result<Vec<u8>> {
+    pub fn get_range(&self, key: &str, start: u64, len: usize) -> Result<Bytes> {
         let meta = self
             .head_object(key)?
             .ok_or_else(|| ObsError::Other("object missing".into()))?;
@@ -884,9 +885,9 @@ impl ObsClient {
         len: usize,
         etag: &str,
         total: u64,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         if len == 0 {
-            return Ok(Vec::new());
+            return Ok(Bytes::new());
         }
         let end = start
             .checked_add(len as u64 - 1)
@@ -917,7 +918,7 @@ impl ObsClient {
                     data.len()
                 )));
             }
-            Ok(data.to_vec())
+            Ok(data)
         })
     }
 
@@ -1753,7 +1754,10 @@ mod tests {
                 .contains(&("cache-control".into(), "max-age=3600".into()))
         );
         client.copy_object_with_limit("src", "dst", 4).unwrap();
-        assert_eq!(client.get_range("dst", 0, 11).unwrap(), b"abcdefghijk");
+        assert_eq!(
+            client.get_range("dst", 0, 11).unwrap().as_ref(),
+            b"abcdefghijk"
+        );
         let copied = client.head_object("dst").unwrap().unwrap();
         assert_eq!(copied.system_meta, meta.system_meta);
         assert_eq!(copied.x_obs_meta, meta.x_obs_meta);
@@ -1816,7 +1820,10 @@ mod tests {
             .unwrap();
         assert!(!record.exists());
         assert_eq!(mock.stats().uploads, 0);
-        assert_eq!(client.get_range("backup", 0, 12).unwrap(), b"local backup");
+        assert_eq!(
+            client.get_range("backup", 0, 12).unwrap().as_ref(),
+            b"local backup"
+        );
     }
 
     #[test]
@@ -1845,7 +1852,10 @@ mod tests {
         client
             .upload_file_with_meta("data", &file, tuning, &[])
             .unwrap();
-        assert_eq!(client.get_range("data", 0, 10).unwrap(), b"recover me");
+        assert_eq!(
+            client.get_range("data", 0, 10).unwrap().as_ref(),
+            b"recover me"
+        );
         assert!(!journal.exists());
         assert_eq!(mock.stats().uploads, 0);
     }
@@ -2000,7 +2010,7 @@ mod tests {
             );
             let meta = client.head_object(key).unwrap().unwrap();
             assert_eq!(meta.size, 7);
-            assert_eq!(client.get_range(key, 0, 7).unwrap(), b"payload");
+            assert_eq!(client.get_range(key, 0, 7).unwrap().as_ref(), b"payload");
             // Listing is what a failing `ls` actually exercises, and a
             // delimiter-ed listing only returns the first path component, so
             // list without one.

@@ -18,26 +18,29 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Build and exercise each static binary on its own CPU architecture.
+  # Build and exercise each glibc binary on its own CPU architecture.
   build:
-    name: build & test (${{ matrix.arch }}, static)
+    name: build & test (${{ matrix.arch }}, glibc)
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
+            target: x86_64-unknown-linux-gnu
             machine: Advanced Micro Devices X86-64
+            interpreter: /lib64/ld-linux-x86-64.so.2
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-gnu
             machine: AArch64
+            interpreter: /lib/ld-linux-aarch64.so.1
     runs-on: ${{ matrix.runner }}
     env:
       BUILD_TARGET: ${{ matrix.target }}
-      ARCHIVE: obs-mount-${{ matrix.arch }}-linux-musl.tar.gz
+      ARCHIVE: obs-mount-${{ matrix.arch }}-linux-gnu.tar.gz
       ELF_MACHINE: ${{ matrix.machine }}
+      ELF_INTERPRETER: ${{ matrix.interpreter }}
       OBS_MOUNT_BIN: ${{ github.workspace }}/target/${{ matrix.target }}/release/obs-mount
     steps:
       - name: Require FUSE device
@@ -54,11 +57,11 @@ jobs:
           # fuse3: the ignored Rust test mounts a real FUSE filesystem.
           # jq locates the compiled test harness; only that harness runs as root.
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential cmake musl-tools perl pkg-config file binutils fuse3 jq
+            build-essential cmake perl pkg-config file binutils fuse3 jq ca-certificates
 
       - uses: actions/checkout@v7
 
-      - name: Install Rust (musl target)
+      - name: Install Rust (GNU target)
         run: |
           set -eux
           # The hosted runner already supplies rustup. Match rust-toolchain.toml.
@@ -78,12 +81,8 @@ jobs:
       - name: cargo test
         run: cargo test --all-features
 
-      - name: Build static binary
+      - name: Build glibc binary
         env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CC_aarch64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           # A tag build stamps its version into the binary so `--version`
           # matches the release name; branch builds fall back to Cargo.toml.
           OBS_MOUNT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
@@ -95,11 +94,25 @@ jobs:
           bin="$OBS_MOUNT_BIN"
           file "$bin"
           readelf -hW "$bin" | grep -F "Machine:" | grep -F "$ELF_MACHINE"
-          # Inspect ELF headers instead of relying on distro-specific ldd output.
+          # Require the architecture's glibc loader and a dynamic libc dependency.
           readelf -lW "$bin" > program-headers.txt
           readelf -dW "$bin" > dynamic-section.txt
-          if grep -q INTERP program-headers.txt || grep -q NEEDED dynamic-section.txt; then
-            echo "binary requires a dynamic loader or shared libraries"
+          grep -F "[Requesting program interpreter: $ELF_INTERPRETER]" program-headers.txt
+          grep -F '(NEEDED)' dynamic-section.txt | grep -F '[libc.so.6]'
+          ldd "$bin" > shared-libraries.txt
+          cat shared-libraries.txt
+          if grep -q 'not found' shared-libraries.txt; then
+            echo "binary has unresolved shared library dependencies"
+            exit 1
+          fi
+          # Keep the Ubuntu 24.04 runtime baseline even as Rust/dependencies evolve.
+          readelf --version-info -W "$bin" > version-info.txt
+          glibc_max=$(grep -oE 'Name: GLIBC_[0-9]+(\.[0-9]+)+' version-info.txt \
+            | cut -d_ -f2 | sort -Vu | tail -n 1)
+          test -n "$glibc_max"
+          echo "Highest referenced glibc version: $glibc_max (maximum: 2.39)"
+          if [ "$(printf '%s\n' "$glibc_max" 2.39 | sort -V | tail -n 1)" != 2.39 ]; then
+            echo "::error::binary exceeds the Ubuntu 24.04 glibc 2.39 baseline"
             exit 1
           fi
           "$bin" --version
@@ -150,7 +163,7 @@ jobs:
       - name: Upload tarball
         uses: actions/upload-artifact@v7
         with:
-          name: obs-mount-${{ matrix.arch }}-linux-musl
+          name: obs-mount-${{ matrix.arch }}-linux-gnu
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 
@@ -175,7 +188,7 @@ jobs:
           mkdir -p dist
           # Each archive was already executed on its own native build runner.
           for arch in x86_64 aarch64; do
-            archive="obs-mount-$arch-linux-musl.tar.gz"
+            archive="obs-mount-$arch-linux-gnu.tar.gz"
             test -s "artifacts/$archive"
             cp "artifacts/$archive" dist/
           done
@@ -186,7 +199,7 @@ jobs:
       - uses: softprops/action-gh-release@v3
         with:
           files: |
-            dist/obs-mount-x86_64-linux-musl.tar.gz
-            dist/obs-mount-aarch64-linux-musl.tar.gz
+            dist/obs-mount-x86_64-linux-gnu.tar.gz
+            dist/obs-mount-aarch64-linux-gnu.tar.gz
           generate_release_notes: true
           fail_on_unmatched_files: true
