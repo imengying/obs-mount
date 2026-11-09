@@ -444,12 +444,9 @@ impl Inner {
             .values()
             .map(|f| f.ino)
             .chain(self.directories.values().map(|d| d.ino))
-            .chain(
-                self.lookups
-                    .iter()
-                    .filter(|(_, n)| **n > 0)
-                    .map(|(ino, _)| *ino),
-            )
+            // Every entry left in `lookups` is positive: `forget` removes it
+            // as soon as the kernel's count reaches zero.
+            .chain(self.lookups.keys().copied())
             .collect();
         let removable: Vec<_> = self
             .files
@@ -506,7 +503,9 @@ impl Inner {
                 file.pending = false;
                 file.reported_failure = false;
             }
-            // Keep unfinished upload journals for manual cancellation.
+            // The name is gone, so there is nothing left to upload to: drop
+            // the recovery record too. The staged bytes stay while handles
+            // are open, and release_staging removes them after the last one.
             let _ = fs::remove_file(self.staging_path(ino).with_extension("yaml"));
             self.release_staging(ino);
         }
@@ -1429,22 +1428,15 @@ impl Filesystem for ObsFs {
         reply.ok();
     }
 
-    /// Check existence; this shared mount does not enforce stored Unix modes.
+    /// Accept root and inodes with a known path; otherwise return ENOENT.
+    /// This shared mount does not enforce stored Unix modes. Lookup/getattr
+    /// refresh remote existence; access itself does not issue network requests.
     fn access(&self, _req: &Request, ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(path) = inner.path(&ino.0).cloned() else {
-            // The root inode is not in the map; it always exists.
-            if ino.0 == ROOT_INO {
-                reply.ok();
-            } else {
-                reply.error(Errno::ENOENT);
-            }
-            return;
-        };
-        match inner.resolve(&path) {
-            Ok(Some(_)) => reply.ok(),
-            Ok(None) => reply.error(Errno::ENOENT),
-            Err(e) => reply.error(errno_for_obs(&e)),
+        let inner = self.inner.lock().unwrap();
+        if ino.0 == ROOT_INO || inner.path(&ino.0).is_some() {
+            reply.ok();
+        } else {
+            reply.error(Errno::ENOENT);
         }
     }
 
@@ -2888,6 +2880,106 @@ mod tests {
         inner.client = mock.client();
         inner.staging_dir = mock.staging.clone();
         inner
+    }
+
+    #[test]
+    fn completed_upload_can_be_renamed_and_rewritten_after_journal_cleanup_failure() {
+        let mock = crate::test_support::MockObs::new("[]");
+        let mut inner = mock_inner(&mock);
+        inner.upload.threshold = 1;
+        inner.client.remove_upload_journal =
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let ino = inner.alloc_ino("before");
+        let staging = inner.staging_path(ino);
+        let journal = staging.with_extension("upload.yaml");
+        fs::write(&staging, b"original").unwrap();
+        inner
+            .meta_cache
+            .insert("before".into(), synthetic_meta(8, false, SystemTime::now()));
+        inner.open_files.insert(
+            1,
+            OpenFile {
+                ino,
+                ..Default::default()
+            },
+        );
+        inner.mark_pending("before", &staging).unwrap();
+        inner.upload_staged_path("before").unwrap();
+        assert!(!inner.files[&ino].pending);
+        assert!(journal.exists());
+        assert_eq!(mock.stats().uploads, 0);
+
+        inner.rename_path("before", "after", 0).unwrap();
+        assert_eq!(inner.path(&ino).map(String::as_str), Some("after"));
+        assert!(inner.client.head_object("before").unwrap().is_none());
+        assert_eq!(
+            inner.client.get_range("after", 0, 8).unwrap().as_ref(),
+            b"original"
+        );
+
+        inner.client.remove_upload_journal = |path| fs::remove_file(path);
+        inner.mark_pending("after", &staging).unwrap();
+        fs::write(&staging, b"rewritten").unwrap();
+        inner.content_changed("after", 9);
+        inner.upload_staged_path("after").unwrap();
+        assert!(!journal.exists());
+        assert!(!inner.files[&ino].pending);
+        assert_eq!(
+            inner.client.get_range("after", 0, 9).unwrap().as_ref(),
+            b"rewritten"
+        );
+        assert_eq!(mock.stats().uploads, 0);
+        assert_eq!(mock.stats().requests.get("DELETE after"), None);
+        inner.open_files.remove(&1);
+        inner.release_staging(ino);
+        assert!(!staging.exists());
+        assert!(!staging.with_extension("yaml").exists());
+    }
+
+    #[test]
+    fn failed_completion_record_keeps_staging_pending_until_retry() {
+        let mock = crate::test_support::MockObs::new("[]");
+        let mut inner = mock_inner(&mock);
+        inner.upload.threshold = 1;
+        inner.client.remove_upload_journal = |path| {
+            // Block the atomic journal replacement as well as its removal.
+            let mut temp = path.as_os_str().to_owned();
+            temp.push(".tmp");
+            fs::create_dir(temp)?;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        };
+        let ino = inner.alloc_ino("before");
+        let staging = inner.staging_path(ino);
+        let journal = staging.with_extension("upload.yaml");
+        fs::write(&staging, b"recover me").unwrap();
+        inner.meta_cache.insert(
+            "before".into(),
+            synthetic_meta(10, false, SystemTime::now()),
+        );
+        inner.mark_pending("before", &staging).unwrap();
+        assert!(inner.upload_staged_path("before").is_err());
+        assert!(inner.files[&ino].pending);
+        assert!(!inner.files[&ino].uploading);
+        inner.release_staging(ino);
+        assert_eq!(fs::read(&staging).unwrap(), b"recover me");
+        assert!(staging.with_extension("yaml").exists());
+        assert!(journal.exists());
+        assert!(inner.rename_path("before", "after", 0).is_err());
+        assert_eq!(inner.path(&ino).map(String::as_str), Some("before"));
+
+        fs::remove_dir(staging.with_extension("upload.yaml.tmp")).unwrap();
+        inner.client.remove_upload_journal = |path| fs::remove_file(path);
+        inner.rename_path("before", "after", 0).unwrap();
+        assert!(!inner.files[&ino].pending);
+        assert!(!journal.exists());
+        assert_eq!(
+            inner.client.get_range("after", 0, 10).unwrap().as_ref(),
+            b"recover me"
+        );
+        assert!(inner.client.head_object("before").unwrap().is_none());
+        assert_eq!(mock.stats().uploads, 0);
+        inner.release_staging(ino);
+        assert!(!staging.exists());
     }
 
     #[test]

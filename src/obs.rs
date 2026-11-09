@@ -331,6 +331,9 @@ pub struct ObsClient {
     http: Client,
     request_timeout: Duration,
     transfer_timeout: Duration,
+    // Per-client injection keeps journal cleanup failures isolated in tests.
+    #[cfg(test)]
+    pub(crate) remove_upload_journal: fn(&Path) -> std::io::Result<()>,
 }
 
 /// Whether an endpoint must be addressed path-style (`/bucket/key`).
@@ -470,6 +473,8 @@ impl ObsClient {
             http,
             request_timeout: Duration::from_secs(120),
             transfer_timeout: Duration::from_secs(3600),
+            #[cfg(test)]
+            remove_upload_journal: |path| std::fs::remove_file(path),
         }
     }
 
@@ -1169,20 +1174,28 @@ impl ObsClient {
         let len = File::open(path)?.metadata()?.len();
         validate_object_size(len)?;
         let journal_path = path.with_extension("upload.yaml");
+        #[cfg(not(test))]
+        let remove_journal = std::fs::remove_file::<&Path>;
+        #[cfg(test)]
+        let remove_journal = self.remove_upload_journal;
         if journal_path.exists() {
             let previous: UploadJournal =
                 serde_yaml::from_str(&std::fs::read_to_string(&journal_path)?)
                     .map_err(|e| ObsError::Other(format!("invalid upload recovery record: {e}")))?;
             if previous.bucket != self.bucket
                 || previous.endpoint != self.endpoint
-                || previous.key != key
+                || (previous.key != key && previous.phase != UploadPhase::Completed)
             {
                 return Err(ObsError::Other(
                     "upload recovery record belongs to another object; inspect before retry".into(),
                 ));
             }
-            self.abort_multipart(key, &previous.upload_id)?;
-            std::fs::remove_file(&journal_path)?;
+            // A completed record only needs local cleanup; the inode may
+            // have been renamed since OBS confirmed the original upload.
+            if previous.phase != UploadPhase::Completed {
+                self.abort_multipart(key, &previous.upload_id)?;
+            }
+            remove_journal(&journal_path)?;
         }
         if len == 0 || (len < tuning.threshold && len <= MAX_SINGLE_SIZE) {
             let resp = self.send(
@@ -1210,7 +1223,7 @@ impl ObsClient {
             upload_id: id.clone(),
             size: len,
             parts: Vec::new(),
-            completing: false,
+            phase: UploadPhase::Uploading,
         });
         if let Err(e) = write_journal(&journal_path, &journal.lock().unwrap()) {
             if let Err(abort) = self.abort_multipart(key, &id) {
@@ -1269,8 +1282,12 @@ impl ObsClient {
         });
         if let Err(e) = result {
             match self.abort_multipart(key, &id) {
+                // Report the upload failure, not a failure to tidy up after
+                // it: the abort succeeded, so the journal is now stale.
                 Ok(()) => {
-                    std::fs::remove_file(&journal_path)?;
+                    if let Err(remove) = remove_journal(&journal_path) {
+                        tracing::warn!(key, error=%remove, "could not remove stale upload journal");
+                    }
                 }
                 Err(abort) => {
                     tracing::error!(key, upload_id=%id, error=%abort, "multipart cancellation failed; recovery record retained")
@@ -1280,11 +1297,18 @@ impl ObsClient {
         }
         let mut journal = journal.into_inner().unwrap();
         journal.parts.sort_by_key(|(n, _)| *n);
-        journal.completing = true;
+        journal.phase = UploadPhase::Completing;
         write_journal(&journal_path, &journal)?;
         // If completion is ambiguous, keep both the staged bytes and journal.
         self.complete_multipart(key, &id, &journal.parts)?;
-        std::fs::remove_file(journal_path)?;
+        if let Err(e) = remove_journal(&journal_path) {
+            // Only report success after removing the journal or durably
+            // marking it completed. An ambiguous old-key record would block
+            // subsequent writes after a rename.
+            journal.phase = UploadPhase::Completed;
+            write_journal(&journal_path, &journal)?;
+            tracing::warn!(key, error=%e, "multipart upload succeeded; completed journal retained for cleanup");
+        }
         Ok(())
     }
 }
@@ -1297,7 +1321,15 @@ struct UploadJournal {
     upload_id: String,
     size: u64,
     parts: Vec<(u32, String)>,
-    completing: bool,
+    phase: UploadPhase,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UploadPhase {
+    Uploading,
+    Completing,
+    Completed,
 }
 
 fn write_journal(path: &Path, journal: &UploadJournal) -> Result<()> {
@@ -1846,9 +1878,14 @@ mod tests {
         let journal = file.with_extension("upload.yaml");
         let record: UploadJournal =
             serde_yaml::from_str(&std::fs::read_to_string(&journal).unwrap()).unwrap();
-        assert!(record.completing);
+        assert_eq!(record.phase, UploadPhase::Completing);
         assert_eq!(record.parts.len(), 1);
         assert_eq!(std::fs::read(&file).unwrap(), b"recover me");
+        assert!(matches!(
+            client.upload_file_with_meta("renamed", &file, tuning, &[]),
+            Err(ObsError::Other(message)) if message.contains("belongs to another object")
+        ));
+        assert_eq!(mock.stats().uploads, 1);
         client
             .upload_file_with_meta("data", &file, tuning, &[])
             .unwrap();
@@ -2184,7 +2221,8 @@ mod tests {
         // obsfs-style 10 MB parts.
         let ten_mb = 10 * 1024 * 1024;
         assert_eq!(multipart_part_size_with(30 * 1024 * 1024, ten_mb), ten_mb);
-        // Never below the OBS 5 MiB minimum, even if configured lower.
+        // Never below the OBS minimum for non-final parts, even if
+        // configured lower.
         assert_eq!(
             multipart_part_size_with(30 * 1024 * 1024, 1024),
             MIN_PART_SIZE

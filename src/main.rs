@@ -95,8 +95,8 @@ struct Args {
     #[arg(short = 'c', env = "OBS_MOUNT_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Local directory to mount on (must exist and be empty).
-    /// Falls back to `mountpoint` in the config file.
+    /// Local directory to mount on (must already exist; anything in it stays
+    /// hidden behind the mount). Falls back to `mountpoint` in the file.
     mountpoint: Option<PathBuf>,
 
     /// OBS bucket name. Defaults to $OBS_BUCKET, else config file.
@@ -124,7 +124,8 @@ struct Args {
     multipart_threshold: Option<u64>,
 
     /// Multipart chunk size in bytes (default 10485760, i.e. 10 MB, matching
-    /// Huawei's obsfs). Allowed range: 100 KiB to 5 GiB.
+    /// Huawei's obsfs). Allowed range: 100 KiB (the OBS minimum for non-final
+    /// parts) to 5 GiB.
     #[arg(long, env = "OBS_MULTIPART_PART_SIZE")]
     multipart_part_size: Option<usize>,
     /// Number of upload workers, 1..32 (default 4).
