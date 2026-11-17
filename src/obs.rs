@@ -1216,6 +1216,12 @@ impl ObsClient {
         }
         let part = multipart_part_size_with(len as usize, tuning.part_size) as u64;
         let id = self.initiate_multipart_with_meta(key, meta)?;
+        // The on-disk journal records only the upload identity; `parts` is
+        // in-memory state for the completion request. Recovery never replays
+        // a partial part list (a retry aborts the recorded upload and starts
+        // over from the staged bytes), so rewriting the journal after every
+        // part would only turn a 10000-part upload into ~2.5 GB of YAML
+        // rewrites and two fsyncs per part without adding any recoverability.
         let journal = Mutex::new(UploadJournal {
             endpoint: self.endpoint.clone(),
             bucket: self.bucket.clone(),
@@ -1244,21 +1250,19 @@ impl ObsClient {
                                 break;
                             }
                             let offset = (number as u64 - 1) * part;
-                            let result = (|| {
-                                let etag = self.upload_part(
-                                    key,
-                                    &id,
-                                    number,
-                                    RequestBody::File {
-                                        path: path.to_owned(),
-                                        offset,
-                                        len: part.min(len - offset),
-                                    },
-                                )?;
-                                let mut journal = journal.lock().unwrap();
-                                journal.parts.push((number, etag));
-                                write_journal(&journal_path, &journal)
-                            })();
+                            let result = self.upload_part(
+                                key,
+                                &id,
+                                number,
+                                RequestBody::File {
+                                    path: path.to_owned(),
+                                    offset,
+                                    len: part.min(len - offset),
+                                },
+                            );
+                            if let Ok(etag) = &result {
+                                journal.lock().unwrap().parts.push((number, etag.clone()));
+                            }
                             if result.is_err() {
                                 failed.store(true, Ordering::Relaxed);
                             }
@@ -1420,14 +1424,21 @@ fn checked_result(
             Event::Text(e) if depth == 0 && !e.as_ref().trim().is_empty() => {
                 return Err(ObsError::Other("text outside response root".into()));
             }
-            Event::Text(e) if in_etag => etag.push_str(&e.xml10_content()),
-            Event::CData(e) if in_etag => etag.push_str(&e.xml10_content()),
+            event @ (Event::Text(_) | Event::CData(_)) if in_etag => {
+                push_xml_content(&mut etag, &event)
+            }
+            // An unknown entity inside the ETag is fatal here rather than
+            // passed through: the value goes into CompleteMultipartUpload,
+            // where a literal `&foo;` would corrupt the request.
             Event::GeneralRef(e) if in_etag => match e.resolve_char_ref() {
                 Ok(Some(ch)) => etag.push(ch),
-                _ => etag.push_str(
-                    quick_xml::escape::resolve_predefined_entity(e.as_ref())
-                        .ok_or_else(|| ObsError::Other("unknown XML entity in ETag".into()))?,
-                ),
+                _ => {
+                    if let Some(text) = quick_xml::escape::resolve_predefined_entity(e.as_ref()) {
+                        etag.push_str(text);
+                    } else {
+                        return Err(ObsError::Other("unknown XML entity in ETag".into()));
+                    }
+                }
             },
             Event::End(e) => {
                 if e.local_name().as_ref() == "ETag" {
@@ -1458,6 +1469,26 @@ fn checked_result(
     Ok(etag.to_string())
 }
 
+/// Accumulate XML character content across events.
+///
+/// One logical value can arrive as several events: character references such
+/// as `&amp;` are reported as their own `GeneralRef` event between `Text`
+/// events, so a naive "keep the last Text" would silently truncate `a&b`.
+/// Every parser in this module funnels through here so the rule stays fixed.
+fn push_xml_content<'e>(out: &mut String, event: &Event<'e>) {
+    match event {
+        Event::Text(e) => out.push_str(&e.xml10_content()),
+        Event::CData(e) => out.push_str(&e.xml10_content()),
+        Event::GeneralRef(e) => match e.resolve_char_ref() {
+            Ok(Some(ch)) => out.push(ch),
+            _ => out.push_str(
+                quick_xml::escape::resolve_predefined_entity(e.as_ref()).unwrap_or(e.as_ref()),
+            ),
+        },
+        _ => {}
+    }
+}
+
 /// Extract the text of the first `<tag>...</tag>` element.
 ///
 /// OBS always prefixes its XML responses with an `<?xml ... ?>` declaration,
@@ -1485,27 +1516,9 @@ fn parse_tag(xml: &str, tag: &str) -> Option<String> {
                     return None;
                 }
             }
-            Ok(Event::Text(e)) => {
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_))) => {
                 if in_tag {
-                    text.push_str(&e.xml10_content());
-                }
-            }
-            // `&amp;` and friends arrive as their own event; resolve them so
-            // values containing '&' / '<' are not silently dropped.
-            Ok(Event::GeneralRef(e)) => {
-                if in_tag {
-                    match e.resolve_char_ref() {
-                        Ok(Some(ch)) => text.push(ch),
-                        _ => text.push_str(
-                            quick_xml::escape::resolve_predefined_entity(e.as_ref())
-                                .unwrap_or(e.as_ref()),
-                        ),
-                    }
-                }
-            }
-            Ok(Event::CData(e)) => {
-                if in_tag {
-                    text.push_str(&e.xml10_content());
+                    push_xml_content(&mut text, &event);
                 }
             }
             Ok(Event::End(e)) => {
@@ -1547,24 +1560,13 @@ fn parse_list_xml(xml: &str) -> Result<ListResult> {
                 stack.push(name.clone());
                 cur_text_elem = Some(name);
             }
-            Ok(Event::Text(e)) => {
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_))) => {
                 if cur_text_elem.is_some() {
                     // Accumulate instead of assigning: one element can arrive
                     // as several Text events when it contains a character
                     // reference (`a&amp;b` is Text + GeneralRef + Text), and
                     // assigning would keep only the last fragment.
-                    cur_text.push_str(&e.xml10_content());
-                }
-            }
-            Ok(Event::GeneralRef(e)) => {
-                if cur_text_elem.is_some() {
-                    match e.resolve_char_ref() {
-                        Ok(Some(ch)) => cur_text.push(ch),
-                        _ => cur_text.push_str(
-                            quick_xml::escape::resolve_predefined_entity(e.as_ref())
-                                .unwrap_or(e.as_ref()),
-                        ),
-                    }
+                    push_xml_content(&mut cur_text, &event);
                 }
             }
             Ok(Event::End(e)) => {

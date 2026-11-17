@@ -44,6 +44,10 @@ const READ_AHEAD_BYTES: u64 = 1024 * 1024;
 /// How long a statfs answer is reused before asking OBS again. `df` is often
 /// polled by monitoring every few seconds and each miss costs two requests.
 const USAGE_TTL: Duration = Duration::from_secs(60);
+/// How long a cached object attribute survives before a HEAD refresh is
+/// required. Short on purpose: external clients can change objects at any
+/// time, and a longer window makes their writes invisible to this mount.
+const META_TTL: Duration = Duration::from_secs(5);
 /// Capacity reported when the bucket has no quota configured. It is not a
 /// real limit -- it only keeps tools that precheck free space from treating
 /// the mount as full.
@@ -137,6 +141,12 @@ struct FileState {
     pending: bool,
     reported_failure: bool,
     uploading: bool,
+    /// Cached write handle on the staging file. FUSE writes arrive in 128 KiB
+    /// chunks, and reopening the file for every chunk costs two syscalls plus
+    /// a metadata read per write. The handle is positioned per write via
+    /// `write_all_at`, so no seek state is shared, and it is dropped whenever
+    /// the staging file must disappear (release, detach, reclaim).
+    writer: Option<File>,
 }
 
 struct Inner {
@@ -200,6 +210,25 @@ pub struct ObsFs {
     /// Clone of the client for paths that must not hold the global lock
     /// across a network round-trip (see `read`).
     client: ObsClient,
+}
+
+/// Reply kinds that carry a `FileAttr` plus TTL. Implementations forward to
+/// the fuser reply types so the resolve→attr tail of lookup/getattr/setattr
+/// lives in one place.
+trait ReplyAttributes {
+    fn attributes(self, ttl: &Duration, attr: &FileAttr);
+}
+
+impl ReplyAttributes for ReplyEntry {
+    fn attributes(self, ttl: &Duration, attr: &FileAttr) {
+        self.entry(ttl, attr, Generation(0));
+    }
+}
+
+impl ReplyAttributes for ReplyAttr {
+    fn attributes(self, ttl: &Duration, attr: &FileAttr) {
+        self.attr(ttl, attr);
+    }
 }
 
 /// Read a complete range, or stop at EOF, without a separate seek syscall.
@@ -304,7 +333,7 @@ fn cached_from_meta(meta: &crate::obs::ObjectMeta, is_dir: bool) -> CachedMeta {
                     .map(|t| unix_time(t.timestamp()))
             })
             .unwrap_or(SystemTime::UNIX_EPOCH),
-        expires: Instant::now() + Duration::from_secs(5),
+        expires: Instant::now() + META_TTL,
         unix: meta.unix.map(Into::into),
         system_meta: meta.system_meta.clone(),
         extra_meta: meta
@@ -323,7 +352,7 @@ fn synthetic_meta(size: u64, is_dir: bool, mtime: SystemTime) -> CachedMeta {
         size,
         is_dir,
         mtime,
-        expires: Instant::now() + Duration::from_secs(5),
+        expires: Instant::now() + META_TTL,
         unix: None,
         extra_meta: Vec::new(),
         system_meta: Vec::new(),
@@ -494,6 +523,44 @@ impl Inner {
         self.files.get(ino)?.path.as_ref()
     }
 
+    /// Path of a directory inode; the root maps to the empty key prefix.
+    fn parent_path_of(&self, parent: &INodeNo) -> Option<String> {
+        if parent == &INodeNo::ROOT {
+            Some(String::new())
+        } else {
+            self.path(&parent.0).cloned()
+        }
+    }
+
+    /// Same, phrased for the directory itself (readdir/statfs style).
+    fn directory_path(&self, ino: &INodeNo) -> Option<String> {
+        self.parent_path_of(ino)
+    }
+
+    /// Answer lookup/getattr/setattr with the resolved (is_dir, size, mtime),
+    /// honouring Unix attributes persisted in object metadata.
+    fn reply_resolved(
+        &self,
+        req: &Request,
+        reply: impl ReplyAttributes,
+        ino: u64,
+        path: &str,
+        resolved: (bool, u64, SystemTime),
+    ) {
+        let (is_dir, size, mtime) = resolved;
+        let kind = if is_dir {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        };
+        // Prefer the cached Unix attributes: `resolve` reports "now" for
+        // anything it synthesized, and cached mode/uid/gid must survive
+        // until their TTL even when a fresh HEAD was skipped.
+        let cached = self.meta_cache.get(path);
+        let attr = self.attr_with_meta(req, ino, kind, size, mtime, cached);
+        reply.attributes(&TTL, &attr);
+    }
+
     fn detach_path(&mut self, path: &str) {
         if let Some(ino) = self.path_to_ino.remove(path) {
             let meta = self.meta_cache.remove(path);
@@ -502,6 +569,7 @@ impl Inner {
                 file.detached = meta;
                 file.pending = false;
                 file.reported_failure = false;
+                file.writer = None;
             }
             // The name is gone, so there is nothing left to upload to: drop
             // the recovery record too. The staged bytes stay while handles
@@ -624,6 +692,37 @@ impl Inner {
         self.open_files.values().filter(|f| f.ino == ino).count()
     }
 
+    /// A write handle on the staging file of `ino`, cached across writes.
+    ///
+    /// FUSE writes arrive in 128 KiB chunks, and reopening the staging file
+    /// for every chunk costs an open and a metadata read per write. The first
+    /// write opens the file and parks it in `FileState::writer`; the handle is
+    /// positioned per write (`write_all_at`), so no seek state is shared.
+    /// Callers that already own a handle pass it as `borrowed` and it is used
+    /// in place without being cached.
+    fn staging_writer(&mut self, ino: u64) -> std::io::Result<&mut File> {
+        let staging = self.staging_path(ino);
+        let state = self
+            .files
+            .get_mut(&ino)
+            .ok_or_else(|| std::io::Error::other("missing file state for staging writer"))?;
+        if state.writer.is_none() {
+            state.writer = Some(OpenOptions::new().write(true).open(&staging)?);
+        }
+        Ok(state.writer.as_mut().expect("just set"))
+    }
+
+    /// Invalidate the cached staging writer so the file can be replaced or
+    /// removed. Must run before any code that truncates via a fresh handle,
+    /// recreates the staging file, or deletes it: a cached handle would keep
+    /// the old inode alive (disk space not reclaimed) and writes through it
+    /// would land in a file nobody reads anymore.
+    fn drop_staging_writer(&mut self, ino: u64) {
+        if let Some(state) = self.files.get_mut(&ino) {
+            state.writer = None;
+        }
+    }
+
     fn release_staging(&mut self, ino: u64) {
         if self.staging_refs(ino) == 0
             && self
@@ -631,6 +730,7 @@ impl Inner {
                 .get(&ino)
                 .is_none_or(|f| !f.pending && !f.uploading)
         {
+            self.drop_staging_writer(ino);
             let staging = self.staging_path(ino);
             let _ = fs::remove_file(&staging);
             let _ = fs::remove_file(staging.with_extension("yaml"));
@@ -808,6 +908,9 @@ impl Inner {
             return Err(std::io::Error::from_raw_os_error(libc::ESTALE).into());
         }
         self.ensure_space(if truncate { 0 } else { meta.size })?;
+        // The staging file is about to be created or replaced; a cached
+        // writer from a previous generation must not survive that.
+        self.drop_staging_writer(ino);
         if truncate {
             File::create(&staging)?;
         } else {
@@ -864,6 +967,7 @@ impl Inner {
         crate::persist::write_yaml(&staging.with_extension("yaml"), &record).map_err(ObsError::from)
     }
 
+    /// Mark a staged file as needing upload, writing its recovery record.
     fn mark_pending(&mut self, path: &str, staging: &Path) -> Result<(), ObsError> {
         let ino = self
             .path_to_ino
@@ -885,7 +989,7 @@ impl Inner {
         if let Some(meta) = self.meta_cache.get_mut(path) {
             meta.size = size;
             meta.mtime = SystemTime::now();
-            meta.expires = Instant::now() + Duration::from_secs(5);
+            meta.expires = Instant::now() + META_TTL;
         }
     }
 
@@ -990,7 +1094,7 @@ impl Inner {
         if let Some(mtime) = mtime {
             current.mtime = mtime;
         }
-        current.expires = Instant::now() + Duration::from_secs(5);
+        current.expires = Instant::now() + META_TTL;
         self.persist_meta(path, current)
     }
 
@@ -1228,11 +1332,7 @@ impl Filesystem for ObsFs {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let mut inner = self.inner.lock().unwrap();
         inner.maybe_reclaim();
-        let Some(parent_path) = (if parent == INodeNo::ROOT {
-            Some(String::new())
-        } else {
-            inner.path(&parent.0).cloned()
-        }) else {
+        let Some(parent_path) = inner.parent_path_of(&parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -1240,15 +1340,8 @@ impl Filesystem for ObsFs {
         let path = join_path(&parent_path, &name);
         match inner.resolve(&path) {
             Ok(Some((ino, is_dir, size, mtime))) => {
-                let kind = if is_dir {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                };
-                let cached = inner.meta_cache.get(&path).cloned();
-                let attr = inner.attr_with_meta(req, ino, kind, size, mtime, cached.as_ref());
+                inner.reply_resolved(req, reply, ino, &path, (is_dir, size, mtime));
                 *inner.lookups.entry(ino).or_default() += 1;
-                reply.entry(&TTL, &attr, Generation(0));
             }
             Ok(None) => reply.error(Errno::ENOENT),
             Err(e) => reply.error(errno_for_obs(&e)),
@@ -1286,15 +1379,8 @@ impl Filesystem for ObsFs {
             return;
         };
         match inner.resolve(&path) {
-            Ok(Some((_, is_dir, size, mtime))) => {
-                let kind = if is_dir {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                };
-                let cached = inner.meta_cache.get(&path).cloned();
-                let attr = inner.attr_with_meta(req, ino.0, kind, size, mtime, cached.as_ref());
-                reply.attr(&TTL, &attr);
+            Ok(Some((file_ino, is_dir, size, mtime))) => {
+                inner.reply_resolved(req, reply, file_ino, &path, (is_dir, size, mtime));
             }
             Ok(None) => reply.error(Errno::ENOENT),
             Err(e) => reply.error(errno_for_obs(&e)),
@@ -1310,11 +1396,7 @@ impl Filesystem for ObsFs {
         mut reply: ReplyDirectory,
     ) {
         let mut inner = self.inner.lock().unwrap();
-        let Some(path) = (if ino == INodeNo::ROOT {
-            Some(String::new())
-        } else {
-            inner.path(&ino.0).cloned()
-        }) else {
+        let Some(path) = inner.directory_path(&ino) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -1522,11 +1604,8 @@ impl Filesystem for ObsFs {
                 reply.error(errno_for_obs(&e));
                 return;
             }
-            if let Err(e) = OpenOptions::new()
-                .write(true)
-                .open(&staging)
-                .and_then(|f| f.set_len(0))
-            {
+            inner.drop_staging_writer(ino.0);
+            if let Err(e) = inner.staging_writer(ino.0).and_then(|f| f.set_len(0)) {
                 reply.error(io_errno(&e));
                 return;
             }
@@ -1698,7 +1777,7 @@ impl Filesystem for ObsFs {
             return;
         }
         let result = (|| -> std::io::Result<u64> {
-            let file = OpenOptions::new().write(true).open(&staging)?;
+            let file = inner.staging_writer(ino)?;
             file.write_all_at(data, offset)?;
             Ok(file.metadata()?.len())
         })();
@@ -1730,11 +1809,7 @@ impl Filesystem for ObsFs {
         reply: ReplyCreate,
     ) {
         let mut inner = self.lock_namespace();
-        let Some(parent_path) = (if parent == INodeNo::ROOT {
-            Some(String::new())
-        } else {
-            inner.path(&parent.0).cloned()
-        }) else {
+        let Some(parent_path) = inner.parent_path_of(&parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -1782,7 +1857,6 @@ impl Filesystem for ObsFs {
             fh,
             OpenFile {
                 ino,
-
                 etag: None,
                 size: Some(0),
                 window: None,
@@ -1871,11 +1945,7 @@ impl Filesystem for ObsFs {
         reply: ReplyEntry,
     ) {
         let mut inner = self.lock_namespace();
-        let Some(parent_path) = (if parent == INodeNo::ROOT {
-            Some(String::new())
-        } else {
-            inner.path(&parent.0).cloned()
-        }) else {
+        let Some(parent_path) = inner.parent_path_of(&parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -1920,11 +1990,7 @@ impl Filesystem for ObsFs {
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let mut inner = self.lock_namespace();
-        let Some(parent_path) = (if parent == INodeNo::ROOT {
-            Some(String::new())
-        } else {
-            inner.path(&parent.0).cloned()
-        }) else {
+        let Some(parent_path) = inner.parent_path_of(&parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -1965,11 +2031,7 @@ impl Filesystem for ObsFs {
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let mut inner = self.lock_namespace();
-        let Some(parent_path) = (if parent == INodeNo::ROOT {
-            Some(String::new())
-        } else {
-            inner.path(&parent.0).cloned()
-        }) else {
+        let Some(parent_path) = inner.parent_path_of(&parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -1998,27 +2060,13 @@ impl Filesystem for ObsFs {
         reply: ReplyEmpty,
     ) {
         let mut inner = self.lock_namespace();
-        let old_parent = if parent == INodeNo::ROOT {
-            String::new()
-        } else {
-            match inner.path(&parent.0) {
-                Some(p) => p.clone(),
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
+        let Some(old_parent) = inner.parent_path_of(&parent) else {
+            reply.error(Errno::ENOENT);
+            return;
         };
-        let new_parent = if newparent == INodeNo::ROOT {
-            String::new()
-        } else {
-            match inner.path(&newparent.0) {
-                Some(p) => p.clone(),
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            }
+        let Some(new_parent) = inner.parent_path_of(&newparent) else {
+            reply.error(Errno::ENOENT);
+            return;
         };
         let old_path = join_path(&old_parent, &name.to_string_lossy());
         let new_path = join_path(&new_parent, &newname.to_string_lossy());
@@ -2199,11 +2247,7 @@ impl Filesystem for ObsFs {
         reply: ReplyEntry,
     ) {
         let mut inner = self.lock_namespace();
-        let Some(parent_path) = (if parent == INodeNo::ROOT {
-            Some(String::new())
-        } else {
-            inner.path(&parent.0).cloned()
-        }) else {
+        let Some(parent_path) = inner.parent_path_of(&parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -2306,7 +2350,6 @@ impl Filesystem for ObsFs {
             .and_then(|f| f.detached.as_ref())
             .cloned()
         {
-            let staging = inner.staging_path(ino.0);
             if let Some(size) = size {
                 if size > crate::obs::MAX_OBJECT_SIZE {
                     reply.error(Errno::EFBIG);
@@ -2316,11 +2359,8 @@ impl Filesystem for ObsFs {
                     reply.error(errno_for_obs(&e));
                     return;
                 }
-                if let Err(e) = OpenOptions::new()
-                    .write(true)
-                    .open(&staging)
-                    .and_then(|f| f.set_len(size))
-                {
+                inner.drop_staging_writer(ino.0);
+                if let Err(e) = inner.staging_writer(ino.0).and_then(|f| f.set_len(size)) {
                     reply.error(io_errno(&e));
                     return;
                 }
@@ -2399,11 +2439,8 @@ impl Filesystem for ObsFs {
                 reply.error(errno_for_obs(&e));
                 return;
             }
-            if let Err(e) = OpenOptions::new()
-                .write(true)
-                .open(&staging)
-                .and_then(|f| f.set_len(size))
-            {
+            inner.drop_staging_writer(ino.0);
+            if let Err(e) = inner.staging_writer(ino.0).and_then(|f| f.set_len(size)) {
                 reply.error(io_errno(&e));
                 return;
             }
@@ -2416,14 +2453,7 @@ impl Filesystem for ObsFs {
         }
         match inner.resolve(&path) {
             Ok(Some((_, is_dir, size, mtime))) => {
-                let kind = if is_dir {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                };
-                let cached = inner.meta_cache.get(&path).cloned();
-                let attr = inner.attr_with_meta(req, ino.0, kind, size, mtime, cached.as_ref());
-                reply.attr(&TTL, &attr);
+                inner.reply_resolved(req, reply, ino.0, &path, (is_dir, size, mtime));
             }
             Ok(None) => reply.error(Errno::ENOENT),
             Err(e) => reply.error(errno_for_obs(&e)),
