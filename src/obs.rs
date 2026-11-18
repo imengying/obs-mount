@@ -12,8 +12,8 @@
 //! ```
 //! CanonicalizedHeaders: `x-obs-*` headers only, lower-cased, sorted,
 //! `name:value\n` each. CanonicalizedResource: `/<bucket>/<key>` plus
-//! whitelisted sub-resources only (e.g. `uploads`, `uploadId`, `partNumber`,
-//! `delete`), sorted and `&`-joined. Plain query parameters such as
+//! signed sub-resources (e.g. `uploads`, `uploadId`, `partNumber`),
+//! sorted and `&`-joined. Plain query parameters such as
 //! `prefix`, `delimiter`, `marker`, `max-keys` are sent in the URL but do
 //! NOT enter the signature.
 
@@ -28,10 +28,7 @@ use sha1::Sha1;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, AtomicU32, Ordering},
-};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -116,55 +113,24 @@ pub enum ObsError {
 
 pub type Result<T> = std::result::Result<T, ObsError>;
 
-/// Sub-resources that participate in the signature (whitelist, not exhaustive
-/// for bucket configuration, but complete for mount operations).
+/// Signed OBS subresources used by mount operations.
 fn is_subresource(name: &str) -> bool {
     matches!(
         name,
-        "acl"
-            | "cors"
-            | "lifecycle"
-            | "location"
-            | "policy"
-            | "tagging"
-            | "versioning"
-            | "uploads"
-            | "uploadId"
-            | "partNumber"
-            | "delete"
-            | "website"
-            | "storagePolicy"
-            | "storageinfo"
-            | "quota"
-            | "encryption"
-            | "metadata"
-            | "versionId"
-            | "response-content-type"
-            | "response-content-language"
-            | "response-expires"
-            | "response-cache-control"
-            | "response-content-disposition"
-            | "response-content-encoding"
+        "uploads" | "uploadId" | "partNumber" | "metadata" | "storageinfo" | "quota"
     )
-}
-
-/// Percent-encode one path segment (keeps unreserved chars, encodes the rest).
-fn encode_segment(s: &str) -> String {
-    urlencoding::encode(s).into_owned()
 }
 
 /// Encode a key, preserving `/` as the separator.
 fn encode_key(key: &str) -> String {
     key.split('/')
-        .map(encode_segment)
+        .map(urlencoding::encode)
         .collect::<Vec<_>>()
         .join("/")
 }
 
 pub fn md5_base64(data: &[u8]) -> String {
-    let mut h = Md5::new();
-    h.update(data);
-    B64.encode(h.finalize())
+    B64.encode(Md5::digest(data))
 }
 
 fn obs_signature(
@@ -305,8 +271,7 @@ fn classify_bucket(bucket_type: &str, fs_interface: &str) -> BucketKind {
 pub struct ListResult {
     pub keys: Vec<String>,
     pub prefixes: Vec<String>, // directory prefixes, each ending with '/'
-    pub is_truncated: bool,
-    pub next_marker: Option<String>,
+    next_marker: Option<String>,
 }
 
 #[derive(Clone)]
@@ -514,31 +479,25 @@ impl ObsClient {
         extra_x_obs: &[(String, String)],
     ) -> (String, String, Vec<(String, String)>) {
         let date = httpdate::fmt_http_date(std::time::SystemTime::now());
-        let mut x_obs: Vec<(String, String)> = vec![("x-obs-date".to_string(), date.clone())];
-        for (k, v) in extra_x_obs {
-            x_obs.push((k.clone(), v.clone()));
-        }
-        let resource = canonical_resource(&self.bucket, key, query);
+        let mut x_obs = vec![("x-obs-date".to_string(), date)];
+        x_obs.extend_from_slice(extra_x_obs);
+        let encoded_key = encode_key(key);
+        let resource = canonical_resource(&self.bucket, &encoded_key, query);
         let sig = obs_signature(
             &self.sk,
             method,
             content_md5,
             content_type,
-            // Empty on purpose: the date travels in `x-obs-date` instead.
-            // OBS fills the StringToSign Date slot only when that header is
-            // absent; sending both leaves the server signing an empty slot
-            // while we signed a populated one, and every request comes back
-            // SignatureDoesNotMatch. The error body shows what the server
-            // used: "GET\n\n\n\nx-obs-date:..." -- four newlines, no date.
+            // The Date slot is empty when x-obs-date is signed.
             "",
             &x_obs,
             &resource,
         );
         let auth = format!("OBS {}:{}", self.ak, sig);
         let url = if query.is_empty() {
-            format!("{}/{}", self.object_base(), encode_key(key))
+            format!("{}/{encoded_key}", self.object_base())
         } else {
-            format!("{}/{}?{}", self.object_base(), encode_key(key), query)
+            format!("{}/{encoded_key}?{query}", self.object_base())
         };
         // The canonical resource above is always /<bucket>/<key>; only the
         // URL shape differs between virtual-hosted and path-style requests.
@@ -857,12 +816,9 @@ impl ObsClient {
             let page = self.list_objects(prefix, delimiter, marker.as_deref(), 1000)?;
             out.keys.extend(page.keys);
             out.prefixes.extend(page.prefixes);
-            if !page.is_truncated {
+            let Some(next) = page.next_marker else {
                 break;
-            }
-            let next = page.next_marker.ok_or_else(|| {
-                ObsError::Other("truncated listing has no continuation marker".into())
-            })?;
+            };
             if marker.as_ref().is_some_and(|previous| next <= *previous) {
                 return Err(ObsError::Other("listing marker did not advance".into()));
             }
@@ -1182,7 +1138,7 @@ impl ObsClient {
         let remove_journal = std::fs::remove_file::<&Path>;
         #[cfg(test)]
         let remove_journal = self.remove_upload_journal;
-        if journal_path.exists() {
+        if journal_path.try_exists()? {
             let previous: UploadJournal =
                 yaml_serde::from_str(&std::fs::read_to_string(&journal_path)?)
                     .map_err(|e| ObsError::Other(format!("invalid upload recovery record: {e}")))?;
@@ -1220,13 +1176,9 @@ impl ObsClient {
         }
         let part = multipart_part_size_with(len as usize, tuning.part_size) as u64;
         let id = self.initiate_multipart_with_meta(key, meta)?;
-        // The on-disk journal records only the upload identity; `parts` is
-        // in-memory state for the completion request. Recovery never replays
-        // a partial part list (a retry aborts the recorded upload and starts
-        // over from the staged bytes), so rewriting the journal after every
-        // part would only turn a 10000-part upload into ~2.5 GB of YAML
-        // rewrites and two fsyncs per part without adding any recoverability.
-        let journal = Mutex::new(UploadJournal {
+        // Recovery uses the upload ID to abort. Persist the full part list
+        // once, immediately before completion.
+        let mut journal = UploadJournal {
             endpoint: self.endpoint.clone(),
             bucket: self.bucket.clone(),
             key: key.into(),
@@ -1234,12 +1186,12 @@ impl ObsClient {
             size: len,
             parts: Vec::new(),
             phase: UploadPhase::Uploading,
-        });
-        if let Err(e) = write_journal(&journal_path, &journal.lock().unwrap()) {
+        };
+        if let Err(e) = crate::persist::write_yaml(&journal_path, &journal) {
             if let Err(abort) = self.abort_multipart(key, &id) {
                 tracing::error!(key, upload_id=%id, error=%abort, "multipart cancellation failed");
             }
-            return Err(e);
+            return Err(e.into());
         }
         let next = AtomicU32::new(1);
         let failed = AtomicBool::new(false);
@@ -1247,43 +1199,42 @@ impl ObsClient {
         let result = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..tuning.concurrency.min(count as usize))
                 .map(|_| {
-                    scope.spawn(|| -> Result<()> {
+                    scope.spawn(|| -> Result<Vec<_>> {
+                        let mut parts = Vec::new();
                         while !failed.load(Ordering::Relaxed) {
                             let number = next.fetch_add(1, Ordering::Relaxed);
                             if number > count {
                                 break;
                             }
                             let offset = (number as u64 - 1) * part;
-                            let result = self.upload_part(
-                                key,
-                                &id,
-                                number,
-                                RequestBody::File {
-                                    path: path.to_owned(),
-                                    offset,
-                                    len: part.min(len - offset),
-                                },
-                            );
-                            if let Ok(etag) = &result {
-                                journal.lock().unwrap().parts.push((number, etag.clone()));
-                            }
-                            if result.is_err() {
-                                failed.store(true, Ordering::Relaxed);
-                            }
-                            result?;
+                            let etag = self
+                                .upload_part(
+                                    key,
+                                    &id,
+                                    number,
+                                    RequestBody::File {
+                                        path: path.to_owned(),
+                                        offset,
+                                        len: part.min(len - offset),
+                                    },
+                                )
+                                .inspect_err(|_| failed.store(true, Ordering::Relaxed))?;
+                            parts.push((number, etag));
                         }
-                        Ok(())
+                        Ok(parts)
                     })
                 })
                 .collect();
             let mut error = None;
             for worker in workers {
-                if let Err(e) = worker
+                match worker
                     .join()
                     .unwrap_or_else(|_| Err(ObsError::Other("upload worker panicked".into())))
-                    && error.is_none()
                 {
-                    error = Some(e);
+                    Ok(parts) => journal.parts.extend(parts),
+                    Err(e) => {
+                        error.get_or_insert(e);
+                    }
                 }
             }
             error.map_or(Ok(()), Err)
@@ -1303,10 +1254,9 @@ impl ObsClient {
             }
             return Err(e);
         }
-        let mut journal = journal.into_inner().unwrap();
-        journal.parts.sort_by_key(|(n, _)| *n);
+        journal.parts.sort_unstable_by_key(|(n, _)| *n);
         journal.phase = UploadPhase::Completing;
-        write_journal(&journal_path, &journal)?;
+        crate::persist::write_yaml(&journal_path, &journal)?;
         // If completion is ambiguous, keep both the staged bytes and journal.
         self.complete_multipart(key, &id, &journal.parts)?;
         if let Err(e) = remove_journal(&journal_path) {
@@ -1314,7 +1264,7 @@ impl ObsClient {
             // marking it completed. An ambiguous old-key record would block
             // subsequent writes after a rename.
             journal.phase = UploadPhase::Completed;
-            write_journal(&journal_path, &journal)?;
+            crate::persist::write_yaml(&journal_path, &journal)?;
             tracing::warn!(key, error=%e, "multipart upload succeeded; completed journal retained for cleanup");
         }
         Ok(())
@@ -1322,6 +1272,7 @@ impl ObsClient {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UploadJournal {
     endpoint: String,
     bucket: String,
@@ -1338,10 +1289,6 @@ enum UploadPhase {
     Uploading,
     Completing,
     Completed,
-}
-
-fn write_journal(path: &Path, journal: &UploadJournal) -> Result<()> {
-    crate::persist::write_yaml(path, journal).map_err(ObsError::from)
 }
 
 fn validate_object_size(len: u64) -> Result<()> {
@@ -1589,19 +1536,21 @@ fn parse_list_xml(xml: &str) -> Result<ListResult> {
             }
         }
     }
-    out.is_truncated =
-        truncated.ok_or_else(|| ObsError::Other("OBS listing has no IsTruncated".into()))?;
-    out.next_marker = out.next_marker.filter(|m| !m.is_empty());
-    // Some endpoints omit NextMarker. Keys and grouped prefixes are both ordered.
-    if out.is_truncated && out.next_marker.is_none() {
-        out.next_marker = out.keys.last().max(out.prefixes.last()).cloned();
+    if truncated.ok_or_else(|| ObsError::Other("OBS listing has no IsTruncated".into()))? {
+        if out.next_marker.as_deref().unwrap_or("").is_empty() {
+            return Err(ObsError::Other(
+                "truncated OBS listing has no NextMarker".into(),
+            ));
+        }
+    } else {
+        out.next_marker = None;
     }
     Ok(out)
 }
 
 /// Sign the encoded path exactly as sent, plus sorted OBS subresources.
-fn canonical_resource(bucket: &str, key: &str, query: &str) -> String {
-    let mut resource = format!("/{bucket}/{}", encode_key(key));
+fn canonical_resource(bucket: &str, encoded_key: &str, query: &str) -> String {
+    let mut resource = format!("/{bucket}/{encoded_key}");
     if !query.is_empty() {
         let mut subs: Vec<&str> = query
             .split('&')
@@ -1805,6 +1754,32 @@ mod tests {
         assert_eq!(mock.stats().uploads, 1);
         client.abort_multipart("data", &id).unwrap();
         assert_eq!(mock.stats().uploads, 0);
+    }
+
+    #[test]
+    fn obsolete_upload_records_leave_staged_data_and_remote_uploads_untouched() {
+        let mock = crate::test_support::MockObs::new("[]");
+        let client = mock.client();
+        let source = mock.staging.join("source");
+        let journal = source.with_extension("upload.yaml");
+        std::fs::write(&source, b"data").unwrap();
+        let fields = format!(
+            "endpoint: {}\nbucket: {}\nkey: backup\nupload_id: old\nsize: 4\nparts: []\n",
+            client.endpoint(),
+            client.bucket()
+        );
+        for state in ["completing: false", "phase: uploading\ncompleting: false"] {
+            let record = format!("{fields}{state}\n");
+            std::fs::write(&journal, &record).unwrap();
+            let result =
+                client.upload_file_with_meta("backup", &source, UploadTuning::default(), &[]);
+            assert!(
+                matches!(result, Err(ObsError::Other(ref e)) if e.contains("invalid upload recovery record"))
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), b"data");
+            assert_eq!(std::fs::read_to_string(&journal).unwrap(), record);
+            assert!(mock.stats().requests.is_empty());
+        }
     }
 
     #[test]
@@ -2057,7 +2032,7 @@ mod tests {
         let r = parse_list_xml(xml).unwrap();
         assert_eq!(r.keys, ["backups/a.tar.gz"]);
         assert_eq!(r.prefixes, vec!["backups/sub/"]);
-        assert!(!r.is_truncated);
+        assert!(r.next_marker.is_none());
     }
 
     /// Regression: the `<?xml ... ?>` declaration used to abort parsing
@@ -2282,6 +2257,8 @@ mod tests {
             "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a</Key></Contents>",
             "<ListBucketResult><IsTruncated>maybe</IsTruncated></ListBucketResult>",
             "<ListBucketResult><Contents><Key>a</Key></Contents></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>a</Key></Contents></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>true</IsTruncated><NextMarker/><CommonPrefixes><Prefix>dir/</Prefix></CommonPrefixes></ListBucketResult>",
             "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult><extra/>",
         ] {
             assert!(parse_list_xml(xml).is_err(), "accepted {xml:?}");

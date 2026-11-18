@@ -30,6 +30,7 @@ use fuser::{
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard};
@@ -212,25 +213,6 @@ pub struct ObsFs {
     client: ObsClient,
 }
 
-/// Reply kinds that carry a `FileAttr` plus TTL. Implementations forward to
-/// the fuser reply types so the resolve→attr tail of lookup/getattr/setattr
-/// lives in one place.
-trait ReplyAttributes {
-    fn attributes(self, ttl: &Duration, attr: &FileAttr);
-}
-
-impl ReplyAttributes for ReplyEntry {
-    fn attributes(self, ttl: &Duration, attr: &FileAttr) {
-        self.entry(ttl, attr, Generation(0));
-    }
-}
-
-impl ReplyAttributes for ReplyAttr {
-    fn attributes(self, ttl: &Duration, attr: &FileAttr) {
-        self.attr(ttl, attr);
-    }
-}
-
 /// Read a complete range, or stop at EOF, without a separate seek syscall.
 fn read_staging(staging: &Path, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
     let file = File::open(staging)?;
@@ -259,25 +241,34 @@ fn errno_for_obs(e: &ObsError) -> Errno {
     }
 }
 
-/// Hex uses a case-insensitive alphabet, unlike base64 in HTTP header names.
-fn xattr_key(name: &str) -> String {
-    let encoded: String = name.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    format!("{}{encoded}", crate::obs::meta_keys::XATTR_PREFIX)
+fn xattr_key(name: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let prefix = crate::obs::meta_keys::XATTR_PREFIX;
+    let mut key = String::with_capacity(prefix.len() + name.len() * 2);
+    key.push_str(prefix);
+    for &byte in name {
+        key.push(HEX[(byte >> 4) as usize] as char);
+        key.push(HEX[(byte & 15) as usize] as char);
+    }
+    key
 }
 
 fn xattr_name_from_key(key: &str) -> Option<Vec<u8>> {
     let encoded = key.strip_prefix(crate::obs::meta_keys::XATTR_PREFIX)?;
-    if encoded.len() % 2 != 0 {
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    if pairs.is_empty() || !remainder.is_empty() {
         return None;
     }
-    encoded
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
+    let digit = |b| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    };
+    pairs
         .iter()
-        .map(|pair| {
-            let hex = std::str::from_utf8(pair).ok()?;
-            u8::from_str_radix(hex, 16).ok()
+        .map(|&[hi, lo]| {
+            let byte = digit(hi)? << 4 | digit(lo)?;
+            (byte != 0).then_some(byte)
         })
         .collect()
 }
@@ -288,11 +279,8 @@ fn xattr_header_key(key: &str) -> String {
     format!("x-obs-meta-{key}")
 }
 
-fn parent_path(path: &str) -> String {
-    match path.rfind('/') {
-        Some(i) => path[..i].to_string(),
-        None => String::new(),
-    }
+fn parent_path(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
 fn file_name(path: &str) -> &str {
@@ -512,7 +500,7 @@ impl Inner {
         let Some(ino) = self.path_to_ino.get(path).copied() else {
             return Ok(());
         };
-        if self.open_files.values().any(|f| f.ino == ino) {
+        if self.is_open(ino) {
             self.stage_existing(ino, path, false)?;
         }
         Ok(())
@@ -523,46 +511,30 @@ impl Inner {
     }
 
     /// Path of a directory inode; the root maps to the empty key prefix.
-    fn parent_path_of(&self, parent: &INodeNo) -> Option<String> {
-        if parent == &INodeNo::ROOT {
-            Some(String::new())
+    fn directory_path(&self, ino: INodeNo) -> Option<&str> {
+        if ino == INodeNo::ROOT {
+            Some("")
         } else {
-            self.path(&parent.0).cloned()
+            self.path(&ino.0).map(String::as_str)
         }
     }
 
-    /// Same, phrased for the directory itself (readdir/statfs style).
-    fn directory_path(&self, ino: &INodeNo) -> Option<String> {
-        self.parent_path_of(ino)
-    }
-
-    /// Answer lookup/getattr/setattr with the resolved (is_dir, size, mtime),
-    /// honouring Unix attributes persisted in object metadata.
-    fn reply_resolved(
-        &self,
-        req: &Request,
-        reply: impl ReplyAttributes,
-        ino: u64,
-        path: &str,
-        resolved: (bool, u64, SystemTime),
-    ) {
-        let (is_dir, size, mtime) = resolved;
+    fn resolve_attr(&mut self, req: &Request, path: &str) -> Result<FileAttr, Errno> {
+        let (ino, is_dir, size, mtime) = self
+            .resolve(path)
+            .map_err(|e| errno_for_obs(&e))?
+            .ok_or(Errno::ENOENT)?;
         let kind = if is_dir {
             FileType::Directory
         } else {
             FileType::RegularFile
         };
-        // Prefer the cached Unix attributes: `resolve` reports "now" for
-        // anything it synthesized, and cached mode/uid/gid must survive
-        // until their TTL even when a fresh HEAD was skipped.
-        let cached = self.meta_cache.get(path);
-        let attr = self.attr_with_meta(req, ino, kind, size, mtime, cached);
-        reply.attributes(&TTL, &attr);
+        Ok(self.attr_with_meta(req, ino, kind, size, mtime, self.meta_cache.get(path)))
     }
 
     fn detach_path(&mut self, path: &str) {
+        let meta = self.meta_cache.remove(path);
         if let Some(ino) = self.path_to_ino.remove(path) {
-            let meta = self.meta_cache.remove(path);
             if let Some(file) = self.files.get_mut(&ino) {
                 file.path = None;
                 file.detached = meta;
@@ -576,7 +548,6 @@ impl Inner {
             let _ = fs::remove_file(self.staging_path(ino).with_extension("yaml"));
             self.release_staging(ino);
         }
-        self.meta_cache.remove(path);
     }
 
     fn rename_path(&mut self, old: &str, new: &str, flags: u32) -> Result<(), ObsError> {
@@ -687,8 +658,8 @@ impl Inner {
         }
     }
 
-    fn staging_refs(&self, ino: u64) -> usize {
-        self.open_files.values().filter(|f| f.ino == ino).count()
+    fn is_open(&self, ino: u64) -> bool {
+        self.open_files.values().any(|f| f.ino == ino)
     }
 
     /// Reuse the open file for positional writes.
@@ -718,7 +689,7 @@ impl Inner {
     }
 
     fn release_staging(&mut self, ino: u64) {
-        if self.staging_refs(ino) != 0 {
+        if self.is_open(ino) {
             return;
         }
         if let Some(state) = self.files.get_mut(&ino) {
@@ -778,19 +749,6 @@ impl Inner {
         self.staging_dir.join(format!("ino-{ino}"))
     }
 
-    fn attr(
-        &self,
-        req: &Request,
-        ino: u64,
-        kind: FileType,
-        size: u64,
-        mtime: SystemTime,
-    ) -> FileAttr {
-        self.attr_with_meta(req, ino, kind, size, mtime, None)
-    }
-
-    /// Like `attr`, but honours attributes persisted in object metadata.
-    ///
     /// External objects without Unix attributes use 0755/0644 and the
     /// requesting user as their owner.
     fn attr_with_meta(
@@ -1005,31 +963,19 @@ impl Inner {
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             return Ok(Some((ino, false, size, mtime)));
         }
-        // Copy the cached entry out first so the borrow does not overlap
-        // the mutable alloc_ino() call below.
-        if let Some(c) = self.meta_cache.get(path).cloned()
+        if let Some(c) = self.meta_cache.get(path)
             && c.expires > Instant::now()
         {
-            let ino = self.alloc_ino(path);
-            return Ok(Some((ino, c.is_dir, c.size, c.mtime)));
+            let (is_dir, size, mtime) = (c.is_dir, c.size, c.mtime);
+            return Ok(Some((self.alloc_ino(path), is_dir, size, mtime)));
         }
         // File?
-        match self.client.head_object(path) {
-            Ok(Some(meta)) => {
-                // A symlink is stored as a zero-byte object whose mode says
-                // S_IFLNK, so it shows up here as a "file" but must be
-                // reported as a link.
-                let cached = cached_from_meta(&meta, false);
-                let mtime = cached.mtime;
-                let size = meta.size;
-                self.meta_cache.insert(path.to_string(), cached);
-                let ino = self.alloc_ino(path);
-                return Ok(Some((ino, false, size, mtime)));
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return Err(e);
-            }
+        if let Some(meta) = self.client.head_object(path)? {
+            let cached = cached_from_meta(&meta, false);
+            let mtime = cached.mtime;
+            self.meta_cache.insert(path.to_string(), cached);
+            let ino = self.alloc_ino(path);
+            return Ok(Some((ino, false, meta.size, mtime)));
         }
         // Directory placeholder object?
         let placeholder = format!("{path}/");
@@ -1329,19 +1275,17 @@ impl Filesystem for ObsFs {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let mut inner = self.inner.lock().unwrap();
         inner.maybe_reclaim();
-        let Some(parent_path) = inner.parent_path_of(&parent) else {
+        let Some(parent_path) = inner.directory_path(parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        let name = name.to_string_lossy().into_owned();
-        let path = join_path(&parent_path, &name);
-        match inner.resolve(&path) {
-            Ok(Some((ino, is_dir, size, mtime))) => {
-                inner.reply_resolved(req, reply, ino, &path, (is_dir, size, mtime));
-                *inner.lookups.entry(ino).or_default() += 1;
+        let path = join_path(parent_path, &name.to_string_lossy());
+        match inner.resolve_attr(req, &path) {
+            Ok(attr) => {
+                *inner.lookups.entry(attr.ino.0).or_default() += 1;
+                reply.entry(&TTL, &attr, Generation(0));
             }
-            Ok(None) => reply.error(Errno::ENOENT),
-            Err(e) => reply.error(errno_for_obs(&e)),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -1354,7 +1298,14 @@ impl Filesystem for ObsFs {
     ) {
         let mut inner = self.inner.lock().unwrap();
         if ino == INodeNo::ROOT {
-            let attr = inner.attr(req, ROOT_INO, FileType::Directory, 4096, SystemTime::now());
+            let attr = inner.attr_with_meta(
+                req,
+                ROOT_INO,
+                FileType::Directory,
+                4096,
+                SystemTime::now(),
+                None,
+            );
             reply.attr(&TTL, &attr);
             return;
         }
@@ -1375,12 +1326,9 @@ impl Filesystem for ObsFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        match inner.resolve(&path) {
-            Ok(Some((file_ino, is_dir, size, mtime))) => {
-                inner.reply_resolved(req, reply, file_ino, &path, (is_dir, size, mtime));
-            }
-            Ok(None) => reply.error(Errno::ENOENT),
-            Err(e) => reply.error(errno_for_obs(&e)),
+        match inner.resolve_attr(req, &path) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -1393,7 +1341,7 @@ impl Filesystem for ObsFs {
         mut reply: ReplyDirectory,
     ) {
         let mut inner = self.inner.lock().unwrap();
-        let Some(path) = inner.directory_path(&ino) else {
+        let Some(path) = inner.directory_path(ino).map(str::to_owned) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -1472,7 +1420,7 @@ impl Filesystem for ObsFs {
         } else {
             inner
                 .path_to_ino
-                .get(&parent_path(&path))
+                .get(parent_path(&path))
                 .copied()
                 .unwrap_or(ROOT_INO)
         };
@@ -1805,12 +1753,11 @@ impl Filesystem for ObsFs {
         reply: ReplyCreate,
     ) {
         let mut inner = self.lock_namespace();
-        let Some(parent_path) = inner.parent_path_of(&parent) else {
+        let Some(parent_path) = inner.directory_path(parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        let name = name.to_string_lossy().into_owned();
-        let path = join_path(&parent_path, &name);
+        let path = join_path(parent_path, &name.to_string_lossy());
         match inner.resolve(&path) {
             Ok(Some(_)) => {
                 reply.error(if flags & libc::O_EXCL != 0 {
@@ -1825,10 +1772,6 @@ impl Filesystem for ObsFs {
                 return;
             }
             _ => {}
-        }
-        if let Err(e) = inner.ensure_space(0) {
-            reply.error(errno_for_obs(&e));
-            return;
         }
         let ino = inner.alloc_ino(&path);
         let staging = inner.staging_path(ino);
@@ -1941,12 +1884,11 @@ impl Filesystem for ObsFs {
         reply: ReplyEntry,
     ) {
         let mut inner = self.lock_namespace();
-        let Some(parent_path) = inner.parent_path_of(&parent) else {
+        let Some(parent_path) = inner.directory_path(parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        let name = name.to_string_lossy().into_owned();
-        let path = join_path(&parent_path, &name);
+        let path = join_path(parent_path, &name.to_string_lossy());
         let placeholder = format!("{path}/");
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1986,11 +1928,11 @@ impl Filesystem for ObsFs {
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let mut inner = self.lock_namespace();
-        let Some(parent_path) = inner.parent_path_of(&parent) else {
+        let Some(parent_path) = inner.directory_path(parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        let path = join_path(&parent_path, &name.to_string_lossy());
+        let path = join_path(parent_path, &name.to_string_lossy());
         let prefix = dir_prefix(&path);
         if inner
             .path_to_ino
@@ -2027,11 +1969,11 @@ impl Filesystem for ObsFs {
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let mut inner = self.lock_namespace();
-        let Some(parent_path) = inner.parent_path_of(&parent) else {
+        let Some(parent_path) = inner.directory_path(parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        let path = join_path(&parent_path, &name.to_string_lossy());
+        let path = join_path(parent_path, &name.to_string_lossy());
         if let Err(e) = inner.prepare_detach(&path) {
             reply.error(errno_for_obs(&e));
             return;
@@ -2056,16 +1998,16 @@ impl Filesystem for ObsFs {
         reply: ReplyEmpty,
     ) {
         let mut inner = self.lock_namespace();
-        let Some(old_parent) = inner.parent_path_of(&parent) else {
+        let Some(old_parent) = inner.directory_path(parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        let Some(new_parent) = inner.parent_path_of(&newparent) else {
+        let Some(new_parent) = inner.directory_path(newparent) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        let old_path = join_path(&old_parent, &name.to_string_lossy());
-        let new_path = join_path(&new_parent, &newname.to_string_lossy());
+        let old_path = join_path(old_parent, &name.to_string_lossy());
+        let new_path = join_path(new_parent, &newname.to_string_lossy());
         if old_path == new_path {
             reply.ok();
             return;
@@ -2120,7 +2062,7 @@ impl Filesystem for ObsFs {
                 return;
             }
         };
-        let key = xattr_key(&name.to_string_lossy());
+        let key = xattr_key(name.as_bytes());
         let mut current = current.clone();
         let exists = current.extra_meta.iter().any(|(k, _)| k == &key);
         if flags & libc::XATTR_CREATE != 0 && exists {
@@ -2153,19 +2095,15 @@ impl Filesystem for ObsFs {
                 return;
             }
         };
-        let key = xattr_key(&name.to_string_lossy());
-        let Some(encoded) = current
-            .extra_meta
-            .iter()
-            .find(|(k, _)| k == &key)
-            .map(|(_, v)| v.clone())
-        else {
+        let key = xattr_key(name.as_bytes());
+        let Some((_, encoded)) = current.extra_meta.iter().find(|(k, _)| k == &key) else {
             reply.error(Errno::ENODATA);
             return;
         };
-        let value = B64
-            .decode(encoded.as_bytes())
-            .unwrap_or_else(|_| encoded.into_bytes());
+        let Ok(value) = B64.decode(encoded) else {
+            reply.error(Errno::EIO);
+            return;
+        };
         if size == 0 {
             reply.size(value.len() as u32);
         } else if (size as usize) < value.len() {
@@ -2219,7 +2157,7 @@ impl Filesystem for ObsFs {
             }
         };
         let mut current = current.clone();
-        let key = xattr_key(&name.to_string_lossy());
+        let key = xattr_key(name.as_bytes());
         if !current.extra_meta.iter().any(|(k, _)| k == &key) {
             reply.error(Errno::ENODATA);
             return;
@@ -2243,11 +2181,11 @@ impl Filesystem for ObsFs {
         reply: ReplyEntry,
     ) {
         let mut inner = self.lock_namespace();
-        let Some(parent_path) = inner.parent_path_of(&parent) else {
+        let Some(parent_path) = inner.directory_path(parent) else {
             reply.error(Errno::ENOENT);
             return;
         };
-        let path = join_path(&parent_path, &link_name.to_string_lossy());
+        let path = join_path(parent_path, &link_name.to_string_lossy());
         let target_str = target.to_string_lossy().into_owned();
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -2445,12 +2383,9 @@ impl Filesystem for ObsFs {
             }
             inner.release_staging(ino.0);
         }
-        match inner.resolve(&path) {
-            Ok(Some((_, is_dir, size, mtime))) => {
-                inner.reply_resolved(req, reply, ino.0, &path, (is_dir, size, mtime));
-            }
-            Ok(None) => reply.error(Errno::ENOENT),
-            Err(e) => reply.error(errno_for_obs(&e)),
+        match inner.resolve_attr(req, &path) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(e) => reply.error(e),
         }
     }
 }
@@ -2568,7 +2503,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    &[(xattr_key("user.large"), "a".repeat(8192))]
+                    &[(xattr_key(b"user.large"), "a".repeat(8192))]
                 )
                 .is_err()
         );
@@ -2743,31 +2678,6 @@ mod tests {
         );
     }
 
-    /// Encoded xattr names must remain valid HTTP header names.
-    #[test]
-    fn xattr_keys_are_header_safe() {
-        for name in [
-            "user.colour",
-            "user.owner",
-            "security.selinux",
-            "a",
-            "user.x.y",
-        ] {
-            let key = xattr_key(name);
-            let suffix = key
-                .strip_prefix(crate::obs::meta_keys::XATTR_PREFIX)
-                .expect("prefix present");
-            assert!(
-                suffix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-                "key {key} is not HTTP-header safe"
-            );
-            // And it must round-trip back to the original name.
-            assert_eq!(xattr_name_from_key(&key), Some(name.as_bytes().to_vec()));
-        }
-    }
-
     #[test]
     fn only_the_last_handle_unlinks_staging() {
         let dir = std::env::temp_dir().join("obs-mount-test-staging");
@@ -2841,20 +2751,34 @@ mod tests {
 
     #[test]
     fn xattr_round_trips_through_http_header_names() {
-        for name in ["user.colour", "user.Colour", "user.中文"] {
+        for name in [
+            b"user.colour".as_slice(),
+            b"user.Colour",
+            b"security.selinux",
+            "user.中文".as_bytes(),
+            b"user.\xff",
+        ] {
             let key = xattr_key(name);
             let header =
                 reqwest::header::HeaderName::from_bytes(xattr_header_key(&key).as_bytes()).unwrap();
             let received = header.as_str().strip_prefix("x-obs-meta-").unwrap();
             assert_eq!(received, key);
-            assert_eq!(
-                xattr_name_from_key(received),
-                Some(name.as_bytes().to_vec())
-            );
+            assert_eq!(xattr_name_from_key(received).as_deref(), Some(name));
         }
-        assert_ne!(xattr_key("user.colour"), xattr_key("user.Colour"));
-        assert_eq!(xattr_key("user.colour"), "xdg.757365722e636f6c6f7572");
-        assert_eq!(xattr_name_from_key("xdg.zz"), None);
+        assert_ne!(xattr_key(b"user.colour"), xattr_key(b"user.Colour"));
+        assert_eq!(xattr_key(b"user.colour"), "xdg.757365722e636f6c6f7572");
+        for key in [
+            "xdg.",
+            "xdg.f",
+            "xdg.zz",
+            "xdg.+1",
+            "xdg.AA",
+            "xdg.610062",
+            "xdg.dxnlci5jb2xvdxi",
+            "xdg2.75736572",
+        ] {
+            assert_eq!(xattr_name_from_key(key), None, "{key}");
+        }
     }
 
     #[test]
@@ -3108,7 +3032,7 @@ mod tests {
         };
         let mut headers = crate::obs::unix_meta_headers(unix);
         headers.push((
-            xattr_header_key(&xattr_key("user.colour")),
+            xattr_header_key(&xattr_key(b"user.colour")),
             B64.encode(b"blue"),
         ));
         headers.push(("x-obs-meta-backup-id".into(), "job-42".into()));
@@ -3135,7 +3059,7 @@ mod tests {
         assert_eq!(meta.unix.unwrap().gid, unix.gid);
         assert!(
             meta.extra_meta
-                .contains(&(xattr_key("user.colour"), B64.encode(b"blue")))
+                .contains(&(xattr_key(b"user.colour"), B64.encode(b"blue")))
         );
         assert!(
             meta.extra_meta
@@ -3151,7 +3075,7 @@ mod tests {
         assert_eq!(meta.unix.unwrap().mode, unix.mode);
         assert!(
             meta.x_obs_meta
-                .contains(&(xattr_key("user.colour"), B64.encode(b"blue")))
+                .contains(&(xattr_key(b"user.colour"), B64.encode(b"blue")))
         );
         assert_eq!(
             inner.client.get_range("backup", 0, 4).unwrap().as_ref(),
@@ -3219,7 +3143,6 @@ mod tests {
         use crate::test_support::{MockObs, MountProcess};
         use std::ffi::{CStr, CString};
         use std::io::{Read, Seek, SeekFrom, Write};
-        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{MetadataExt, PermissionsExt, chown, symlink};
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
@@ -3665,6 +3588,42 @@ mod tests {
             assert_eq!(fs::read(root.join("link.txt")).unwrap(), b"target");
 
             // Direct syscalls keep xattr coverage independent of external tools.
+            mock.client()
+                .put_object_with_meta(
+                    "xattr-format",
+                    b"",
+                    &[
+                        (
+                            xattr_header_key(&xattr_key(b"user.note")),
+                            "plain text".into(),
+                        ),
+                        ("x-obs-meta-xdg.dxnlci5jb2xvdxi".into(), B64.encode(b"blue")),
+                    ],
+                )
+                .unwrap();
+            let format_path = root.join("xattr-format");
+            assert_eq!(list_xattrs(&format_path), ["user.note"]);
+            assert_eq!(
+                get_xattr(&format_path, c"user.note")
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EIO)
+            );
+            assert_eq!(
+                get_xattr(&format_path, c"user.colour")
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ENODATA)
+            );
+            let raw_name = c"user.\xff";
+            set_xattr(&format_path, raw_name, b"\0\xff");
+            assert_eq!(get_xattr(&format_path, raw_name).unwrap(), b"\0\xff");
+            assert_eq!(
+                get_xattr(&format_path, c"user.�")
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ENODATA)
+            );
             set_xattr(&meta, c"user.colour", b"blue");
             assert_eq!(get_xattr(&meta, c"user.colour").unwrap(), b"blue");
             assert!(list_xattrs(&meta).contains(&"user.colour".to_string()));
