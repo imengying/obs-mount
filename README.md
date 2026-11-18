@@ -67,7 +67,7 @@ sudo systemctl enable --now obs
 
 连接失败、HTTP 暂时错误和下载正文中断共用最多 5 次请求尝试；每次按配置超时，重试间指数退避。
 
-上传失败时，数据保留在 `obs-mount-staging-*` 目录，日志会输出路径。同名 `.yaml` 文件记录 endpoint、桶、对象 key 和元数据，不含凭据。分段上传另有 `.upload.yaml`，记录 uploadId、已上传段和完成阶段；取消失败或完成结果不确定时保留记录。上传成功但本地日志删除失败时，记录为 `phase: completed`，表示远端已确认完成，后续仅清理这份本地日志。
+上传失败时，数据保留在 `obs-mount-staging-*` 目录，日志会输出路径。同名 `.yaml` 文件记录 endpoint、桶、对象 key 和元数据，不含凭据。分段上传另有 `.upload.yaml`，开始时记录 uploadId，在请求合并前写入完整分段清单。取消失败或完成结果不确定时会保留记录。上传成功但本地日志删除失败时，记录为 `phase: completed`，表示远端已确认完成，后续仅清理这份本地日志。
 
 当前会话可重新打开文件并通过 `fsync` / 关闭重试；有上次未完成的分段记录时先取消该任务，再从暂存文件重新上传，取消失败则停止重试并保留数据。重启后需按记录人工恢复，不会自动覆盖远端。不要按目录年龄删除待恢复数据，并留意系统临时目录清理策略。重启后会在默认日志级别提示遗留目录。对 `.upload.yaml` 中的未完成任务，可在核对 endpoint、桶、key 和 uploadId 后使用 OBS 工具定向取消；取消只释放未完成分段，不回滚已完成对象。桶的未完成分段生命周期规则可作为崩溃时的清理补充。不同挂载各用独立目录，运行中的目录由锁保护。
 
@@ -90,13 +90,13 @@ Release 构建启用 Thin LTO、单个代码生成单元和符号裁剪，以减
 源码集中在 `src/`：`main.rs` 负责启动和配置，`fs.rs` 实现 FUSE，`obs.rs` 封装 OBS API。测试直接写在各模块的 `#[cfg(test)] mod tests` 中；`test_support.rs` 提供仅在测试时编译的模拟服务和临时资源管理。
 
 ```sh
-cargo build --release  # target/release/obs-mount
+cargo build --locked --release  # target/release/obs-mount
 cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
 
 # 显式运行 CLI 和真实挂载测试，需要上面构建的二进制、/dev/fuse 和 fuse3
-cargo test -- --ignored --nocapture
+cargo test --locked -- --ignored --nocapture
 ```
 
 测试在进程内启动模拟 OBS 服务，覆盖签名、响应正文错误、读取版本校验、原生元数据更新、分段复制、分段上传及取消失败恢复；真实挂载测试覆盖打开文件时重命名、删除、覆盖、远端对象变化以及慢上传期间的并发读写，无需 Python 或云端凭据。CLI 和挂载测试默认标记为 `ignored`，可用 `OBS_MOUNT_BIN` 指定待测二进制；CI 在 x86_64、ARM64 的 Ubuntu 24.04 原生 runner 上分别构建并强制执行挂载测试，任一架构失败都会阻止发布。真实 OBS、长期稳定性和断网恢复仍需另外验证。

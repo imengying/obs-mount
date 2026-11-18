@@ -19,7 +19,6 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use bytes::Bytes;
-use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest as _, Md5};
 use quick_xml::Reader;
@@ -160,10 +159,6 @@ fn encode_key(key: &str) -> String {
         .map(encode_segment)
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn rfc1123_now() -> String {
-    Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 pub fn md5_base64(data: &[u8]) -> String {
@@ -518,7 +513,7 @@ impl ObsClient {
         content_type: &str,
         extra_x_obs: &[(String, String)],
     ) -> (String, String, Vec<(String, String)>) {
-        let date = rfc1123_now();
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now());
         let mut x_obs: Vec<(String, String)> = vec![("x-obs-date".to_string(), date.clone())];
         for (k, v) in extra_x_obs {
             x_obs.push((k.clone(), v.clone()));
@@ -810,7 +805,18 @@ impl ObsClient {
         let resp = self.send("GET", "", &query, None, "", &[], &[])?;
         let resp = Self::check(resp, "GET", "")?;
         let text = resp.text()?;
-        parse_list_xml(&text)
+        let page = parse_list_xml(&text)?;
+        if page
+            .keys
+            .iter()
+            .chain(&page.prefixes)
+            .any(|k| !k.starts_with(prefix))
+        {
+            return Err(ObsError::Other(
+                "OBS listing returned a key outside the requested prefix".into(),
+            ));
+        }
+        Ok(page)
     }
 
     /// List every key under `prefix` (no delimiter), following pagination.
@@ -854,15 +860,13 @@ impl ObsClient {
             if !page.is_truncated {
                 break;
             }
-            if page.next_marker == marker {
+            let next = page.next_marker.ok_or_else(|| {
+                ObsError::Other("truncated listing has no continuation marker".into())
+            })?;
+            if marker.as_ref().is_some_and(|previous| next <= *previous) {
                 return Err(ObsError::Other("listing marker did not advance".into()));
             }
-            marker = page.next_marker;
-            if marker.is_none() {
-                return Err(ObsError::Other(
-                    "truncated listing has no continuation marker".into(),
-                ));
-            }
+            marker = Some(next);
         }
         Ok(out)
     }
@@ -1180,7 +1184,7 @@ impl ObsClient {
         let remove_journal = self.remove_upload_journal;
         if journal_path.exists() {
             let previous: UploadJournal =
-                serde_yaml::from_str(&std::fs::read_to_string(&journal_path)?)
+                yaml_serde::from_str(&std::fs::read_to_string(&journal_path)?)
                     .map_err(|e| ObsError::Other(format!("invalid upload recovery record: {e}")))?;
             if previous.bucket != self.bucket
                 || previous.endpoint != self.endpoint
@@ -1474,7 +1478,6 @@ fn checked_result(
 /// One logical value can arrive as several events: character references such
 /// as `&amp;` are reported as their own `GeneralRef` event between `Text`
 /// events, so a naive "keep the last Text" would silently truncate `a&b`.
-/// Every parser in this module funnels through here so the rule stays fixed.
 fn push_xml_content<'e>(out: &mut String, event: &Event<'e>) {
     match event {
         Event::Text(e) => out.push_str(&e.xml10_content()),
@@ -1536,81 +1539,62 @@ fn parse_tag(xml: &str, tag: &str) -> Option<String> {
     None
 }
 
-/// Minimal ListBucketResult parser (Contents / CommonPrefixes / IsTruncated /
-/// NextMarker). Uses an event reader so the `xmlns` on the root element does
-/// not matter.
+/// Decode a complete listing before exposing any keys to directory operations.
 fn parse_list_xml(xml: &str) -> Result<ListResult> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    let mut out = ListResult::default();
-    // Stack of element names; Contents/CommonPrefixes are tracked by depth.
-    let mut stack: Vec<String> = Vec::new();
-    let mut cur_key: Option<String> = None;
-    let mut cur_text_elem: Option<String> = None;
-    let mut cur_text = String::new();
+    use serde::Deserialize;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = e.name().as_ref().to_owned();
-                if name == "Contents" {
-                    cur_key = None;
-                }
-                stack.push(name.clone());
-                cur_text_elem = Some(name);
-            }
-            Ok(event @ (Event::Text(_) | Event::GeneralRef(_) | Event::CData(_))) => {
-                if cur_text_elem.is_some() {
-                    // Accumulate instead of assigning: one element can arrive
-                    // as several Text events when it contains a character
-                    // reference (`a&amp;b` is Text + GeneralRef + Text), and
-                    // assigning would keep only the last fragment.
-                    push_xml_content(&mut cur_text, &event);
-                }
-            }
-            Ok(Event::End(e)) => {
-                let name = e.name().as_ref().to_owned();
-                if name == "Contents"
-                    && let Some(key) = cur_key.take()
-                {
-                    out.keys.push(key);
-                }
-                // Commit the element's text now that all fragments are in.
-                if let Some(elem) = cur_text_elem.take() {
-                    let in_contents = stack.iter().any(|s| s == "Contents");
-                    let in_prefix = stack.iter().any(|s| s == "CommonPrefixes");
-                    match elem.as_str() {
-                        "Key" if in_contents => cur_key = Some(std::mem::take(&mut cur_text)),
-                        "Prefix" if in_prefix => out.prefixes.push(std::mem::take(&mut cur_text)),
-                        "IsTruncated" if stack.len() == 2 => {
-                            out.is_truncated = cur_text == "true";
-                            cur_text.clear();
-                        }
-                        "NextMarker" if stack.len() == 2 => {
-                            if !cur_text.is_empty() {
-                                out.next_marker = Some(std::mem::take(&mut cur_text));
-                            } else {
-                                cur_text.clear();
-                            }
-                        }
-                        _ => cur_text.clear(),
-                    }
-                }
-                stack.pop();
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(ObsError::Xml(e)),
-            _ => {}
-        }
-        buf.clear();
+    #[derive(Deserialize)]
+    enum Response {
+        ListBucketResult {
+            // Keys, prefixes and pagination fields can occur in any order.
+            #[serde(rename = "$value", default)]
+            fields: Vec<Field>,
+        },
     }
-    // OBS returns NextMarker only when truncated; fall back to the last key.
-    if out.is_truncated
-        && out.next_marker.is_none()
-        && let Some(last) = out.keys.last()
-    {
-        out.next_marker = Some(last.clone());
+
+    #[derive(Deserialize)]
+    #[serde(rename_all_fields = "PascalCase")]
+    enum Field {
+        Contents {
+            key: String,
+        },
+        CommonPrefixes {
+            prefix: String,
+        },
+        IsTruncated(bool),
+        NextMarker(String),
+        #[serde(other)]
+        Other,
+    }
+
+    let mut reader = quick_xml::de::Deserializer::from_str(xml.trim());
+    let Response::ListBucketResult { fields } = Response::deserialize(&mut reader)
+        .map_err(|e| ObsError::Other(format!("invalid OBS listing: {e}")))?;
+    if !reader.is_empty() {
+        return Err(ObsError::Other("trailing data after OBS listing".into()));
+    }
+    let mut out = ListResult::default();
+    let mut truncated = None;
+    for field in fields {
+        match field {
+            Field::Contents { key } if !key.is_empty() => out.keys.push(key),
+            Field::CommonPrefixes { prefix } if !prefix.is_empty() => out.prefixes.push(prefix),
+            Field::IsTruncated(value) if truncated.is_none() => truncated = Some(value),
+            Field::NextMarker(value) if out.next_marker.is_none() => out.next_marker = Some(value),
+            Field::Other => {}
+            _ => {
+                return Err(ObsError::Other(
+                    "invalid or duplicate OBS listing field".into(),
+                ));
+            }
+        }
+    }
+    out.is_truncated =
+        truncated.ok_or_else(|| ObsError::Other("OBS listing has no IsTruncated".into()))?;
+    out.next_marker = out.next_marker.filter(|m| !m.is_empty());
+    // Some endpoints omit NextMarker. Keys and grouped prefixes are both ordered.
+    if out.is_truncated && out.next_marker.is_none() {
+        out.next_marker = out.keys.last().max(out.prefixes.last()).cloned();
     }
     Ok(out)
 }
@@ -1845,7 +1829,7 @@ mod tests {
         );
         let record = source.with_extension("upload.yaml");
         let journal: UploadJournal =
-            serde_yaml::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+            yaml_serde::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
         assert!(!journal.upload_id.is_empty());
         assert_eq!(journal.key, "backup");
         assert_eq!(mock.stats().uploads, 1);
@@ -1879,7 +1863,7 @@ mod tests {
         );
         let journal = file.with_extension("upload.yaml");
         let record: UploadJournal =
-            serde_yaml::from_str(&std::fs::read_to_string(&journal).unwrap()).unwrap();
+            yaml_serde::from_str(&std::fs::read_to_string(&journal).unwrap()).unwrap();
         assert_eq!(record.phase, UploadPhase::Completing);
         assert_eq!(record.parts.len(), 1);
         assert_eq!(std::fs::read(&file).unwrap(), b"recover me");
@@ -2274,6 +2258,52 @@ mod tests {
 </ListBucketResult>"#;
         let r = parse_list_xml(xml).unwrap();
         assert_eq!(r.keys, ["a&b/中文.txt"]);
+    }
+
+    #[test]
+    fn listing_preserves_object_names_prefixes_and_markers() {
+        let xml = r#"<ListBucketResult>
+            <Contents><Key> a &amp; b </Key></Contents>
+            <Contents><Key> </Key></Contents>
+            <CommonPrefixes><Prefix> dir &amp; sub/</Prefix></CommonPrefixes>
+            <IsTruncated>true</IsTruncated><NextMarker> z &amp; b </NextMarker>
+        </ListBucketResult>"#;
+        let page = parse_list_xml(xml).unwrap();
+        assert_eq!(page.keys, [" a & b ", " "]);
+        assert_eq!(page.prefixes, [" dir & sub/"]);
+        assert_eq!(page.next_marker.as_deref(), Some(" z & b "));
+    }
+
+    #[test]
+    fn listing_rejects_incomplete_or_invalid_pages() {
+        for xml in [
+            "",
+            "<Error><Code>InternalError</Code></Error>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a</Key></Contents>",
+            "<ListBucketResult><IsTruncated>maybe</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><Contents><Key>a</Key></Contents></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult><extra/>",
+        ] {
+            assert!(parse_list_xml(xml).is_err(), "accepted {xml:?}");
+        }
+    }
+
+    #[test]
+    fn listing_stays_within_the_requested_prefix_and_advances() {
+        let mock = crate::test_support::MockObs::new(
+            r#"[
+            {"method":"GET","key":"","status":200,"body":"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>other/file</Key></Contents></ListBucketResult>"},
+            {"method":"GET","key":"","status":200,"body":"<ListBucketResult><IsTruncated>true</IsTruncated><NextMarker>dir/z</NextMarker></ListBucketResult>"},
+            {"method":"GET","key":"","status":200,"body":"<ListBucketResult><IsTruncated>true</IsTruncated><NextMarker>dir/a</NextMarker></ListBucketResult>"}
+        ]"#,
+        );
+        let client = mock.client();
+        assert!(
+            matches!(client.list_all_keys("dir/"), Err(ObsError::Other(e)) if e.contains("outside the requested prefix"))
+        );
+        assert!(
+            matches!(client.list_dir("dir/"), Err(ObsError::Other(e)) if e.contains("marker did not advance"))
+        );
     }
 
     #[test]

@@ -98,9 +98,7 @@ impl Object {
             data,
             meta,
             etag,
-            modified: chrono::Utc::now()
-                .format("%a, %d %b %Y %H:%M:%S GMT")
-                .to_string(),
+            modified: httpdate::fmt_http_date(std::time::SystemTime::now()),
         }
     }
 
@@ -888,7 +886,7 @@ impl MountProcess {
         fs::create_dir(&mountpoint).unwrap();
         fs::create_dir(&temp).unwrap();
         let config = mock.staging.join(format!("{name}.yaml"));
-        let yaml = serde_yaml::to_string(&MountConfig {
+        let yaml = yaml_serde::to_string(&MountConfig {
             mountpoint: &mountpoint,
             bucket: BUCKET,
             endpoint: &mock.endpoint,

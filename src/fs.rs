@@ -329,8 +329,7 @@ fn cached_from_meta(meta: &crate::obs::ObjectMeta, is_dir: bool) -> CachedMeta {
             .or_else(|| {
                 meta.last_modified
                     .as_deref()
-                    .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok())
-                    .map(|t| unix_time(t.timestamp()))
+                    .and_then(|v| httpdate::parse_http_date(v).ok())
             })
             .unwrap_or(SystemTime::UNIX_EPOCH),
         expires: Instant::now() + META_TTL,
@@ -692,49 +691,45 @@ impl Inner {
         self.open_files.values().filter(|f| f.ino == ino).count()
     }
 
-    /// A write handle on the staging file of `ino`, cached across writes.
-    ///
-    /// FUSE writes arrive in 128 KiB chunks, and reopening the staging file
-    /// for every chunk costs an open and a metadata read per write. The first
-    /// write opens the file and parks it in `FileState::writer`; the handle is
-    /// positioned per write (`write_all_at`), so no seek state is shared.
-    /// Callers that already own a handle pass it as `borrowed` and it is used
-    /// in place without being cached.
-    fn staging_writer(&mut self, ino: u64) -> std::io::Result<&mut File> {
+    /// Reuse the open file for positional writes.
+    fn staging_writer(&mut self, ino: u64) -> std::io::Result<&File> {
         let staging = self.staging_path(ino);
         let state = self
             .files
             .get_mut(&ino)
             .ok_or_else(|| std::io::Error::other("missing file state for staging writer"))?;
-        if state.writer.is_none() {
-            state.writer = Some(OpenOptions::new().write(true).open(&staging)?);
+        match state.writer {
+            Some(ref writer) => Ok(writer),
+            None => Ok(state
+                .writer
+                .insert(OpenOptions::new().write(true).open(staging)?)),
         }
-        Ok(state.writer.as_mut().expect("just set"))
     }
 
-    /// Invalidate the cached staging writer so the file can be replaced or
-    /// removed. Must run before any code that truncates via a fresh handle,
-    /// recreates the staging file, or deletes it: a cached handle would keep
-    /// the old inode alive (disk space not reclaimed) and writes through it
-    /// would land in a file nobody reads anymore.
-    fn drop_staging_writer(&mut self, ino: u64) {
-        if let Some(state) = self.files.get_mut(&ino) {
-            state.writer = None;
+    fn truncate_staging(&self, ino: u64, size: u64) -> std::io::Result<()> {
+        if let Some(writer) = self.files.get(&ino).and_then(|state| state.writer.as_ref()) {
+            return writer.set_len(size);
         }
+        // A path-based truncate may never have an open handle to release.
+        OpenOptions::new()
+            .write(true)
+            .open(self.staging_path(ino))?
+            .set_len(size)
     }
 
     fn release_staging(&mut self, ino: u64) {
-        if self.staging_refs(ino) == 0
-            && self
-                .files
-                .get(&ino)
-                .is_none_or(|f| !f.pending && !f.uploading)
-        {
-            self.drop_staging_writer(ino);
-            let staging = self.staging_path(ino);
-            let _ = fs::remove_file(&staging);
-            let _ = fs::remove_file(staging.with_extension("yaml"));
+        if self.staging_refs(ino) != 0 {
+            return;
         }
+        if let Some(state) = self.files.get_mut(&ino) {
+            state.writer = None;
+            if state.pending || state.uploading {
+                return;
+            }
+        }
+        let staging = self.staging_path(ino);
+        let _ = fs::remove_file(&staging);
+        let _ = fs::remove_file(staging.with_extension("yaml"));
     }
 
     /// Move every inode/meta entry under `old` to `new`, keeping the inode
@@ -910,7 +905,9 @@ impl Inner {
         self.ensure_space(if truncate { 0 } else { meta.size })?;
         // The staging file is about to be created or replaced; a cached
         // writer from a previous generation must not survive that.
-        self.drop_staging_writer(ino);
+        if let Some(state) = self.files.get_mut(&ino) {
+            state.writer = None;
+        }
         if truncate {
             File::create(&staging)?;
         } else {
@@ -1604,8 +1601,7 @@ impl Filesystem for ObsFs {
                 reply.error(errno_for_obs(&e));
                 return;
             }
-            inner.drop_staging_writer(ino.0);
-            if let Err(e) = inner.staging_writer(ino.0).and_then(|f| f.set_len(0)) {
+            if let Err(e) = inner.truncate_staging(ino.0, 0) {
                 reply.error(io_errno(&e));
                 return;
             }
@@ -2359,8 +2355,7 @@ impl Filesystem for ObsFs {
                     reply.error(errno_for_obs(&e));
                     return;
                 }
-                inner.drop_staging_writer(ino.0);
-                if let Err(e) = inner.staging_writer(ino.0).and_then(|f| f.set_len(size)) {
+                if let Err(e) = inner.truncate_staging(ino.0, size) {
                     reply.error(io_errno(&e));
                     return;
                 }
@@ -2439,8 +2434,7 @@ impl Filesystem for ObsFs {
                 reply.error(errno_for_obs(&e));
                 return;
             }
-            inner.drop_staging_writer(ino.0);
-            if let Err(e) = inner.staging_writer(ino.0).and_then(|f| f.set_len(size)) {
+            if let Err(e) = inner.truncate_staging(ino.0, size) {
                 reply.error(io_errno(&e));
                 return;
             }
@@ -3042,7 +3036,12 @@ mod tests {
         let mut inner = mock_inner(&mock);
         let ino = inner.alloc_ino("backup");
         let staging = inner.staging_path(ino);
-        fs::write(&staging, b"only copy").unwrap();
+        File::create(&staging).unwrap();
+        inner
+            .staging_writer(ino)
+            .unwrap()
+            .write_all_at(b"only copy", 0)
+            .unwrap();
         inner
             .meta_cache
             .insert("backup".into(), synthetic_meta(9, false, SystemTime::now()));
@@ -3064,8 +3063,13 @@ mod tests {
         );
         inner.open_files.remove(&1);
         inner.release_staging(ino);
+        assert!(inner.files[&ino].writer.is_some());
         inner.open_files.remove(&2);
         inner.release_staging(ino);
+        assert!(
+            inner.files[&ino].writer.is_none(),
+            "failed uploads must release idle descriptors"
+        );
         assert_eq!(fs::read(&staging).unwrap(), b"only copy");
         assert!(
             fs::read_to_string(staging.with_extension("yaml"))
@@ -3139,12 +3143,8 @@ mod tests {
         );
         let staged = inner.stage_existing(ino, "backup", false).unwrap();
         inner.mark_pending("backup", &staged).unwrap();
-        OpenOptions::new()
-            .write(true)
-            .open(&staged)
-            .unwrap()
-            .set_len(4)
-            .unwrap();
+        inner.truncate_staging(ino, 4).unwrap();
+        assert!(inner.files[&ino].writer.is_none());
         inner.content_changed("backup", 4);
         inner.upload_staged_path("backup").unwrap();
         let meta = inner.client.head_object("backup").unwrap().unwrap();
