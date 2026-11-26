@@ -211,19 +211,14 @@ pub mod meta_keys {
     pub const XATTR_PREFIX: &str = "xdg.";
 }
 
-/// Parse the persisted Unix attributes out of an `x-obs-meta-*` list.
+/// Recognize Unix attributes only when all four fields are present and valid.
 fn parse_unix_meta(meta: &[(String, String)]) -> Option<UnixMeta> {
-    let get = |key: &str| {
-        meta.iter()
-            .find(|(k, _)| k == key)
-            .and_then(|(_, v)| v.parse::<i64>().ok())
-    };
-    let mode = get(meta_keys::MODE)?;
+    let get = |key: &str| meta.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
     Some(UnixMeta {
-        mode: mode as u32,
-        uid: get(meta_keys::UID).unwrap_or(0) as u32,
-        gid: get(meta_keys::GID).unwrap_or(0) as u32,
-        mtime: get(meta_keys::MTIME).unwrap_or(0),
+        mode: get(meta_keys::MODE)?.parse().ok()?,
+        uid: get(meta_keys::UID)?.parse().ok()?,
+        gid: get(meta_keys::GID)?.parse().ok()?,
+        mtime: get(meta_keys::MTIME)?.parse().ok()?,
     })
 }
 
@@ -1084,7 +1079,10 @@ impl ObsClient {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ObsError::Other("download requires ETag".into()))?;
         let headers = [("If-Match".into(), format!("\"{etag}\""))];
-        let result = self.send_with("GET", key, "", None, "", &[], &headers, |response| {
+        let cleanup = std::mem::DropGuard::new(&partial, |partial| {
+            let _ = std::fs::remove_file(partial);
+        });
+        self.send_with("GET", key, "", None, "", &[], &headers, |response| {
             let mut response = Self::check(response, "GET", key)?;
             let mut file = File::create(&partial)?;
             let mut copied = 0u64;
@@ -1114,11 +1112,9 @@ impl ObsClient {
             file.sync_all()?;
             std::fs::rename(&partial, path)?;
             Ok(())
-        });
-        if result.is_err() {
-            let _ = std::fs::remove_file(&partial);
-        }
-        result
+        })?;
+        std::mem::DropGuard::dismiss(cleanup);
+        Ok(())
     }
 
     /// Upload a staging file with bounded buffers. Small PUTs also stream from
@@ -1425,7 +1421,7 @@ fn checked_result(
 /// One logical value can arrive as several events: character references such
 /// as `&amp;` are reported as their own `GeneralRef` event between `Text`
 /// events, so a naive "keep the last Text" would silently truncate `a&b`.
-fn push_xml_content<'e>(out: &mut String, event: &Event<'e>) {
+fn push_xml_content(out: &mut String, event: &Event<'_>) {
     match event {
         Event::Text(e) => out.push_str(&e.xml10_content()),
         Event::CData(e) => out.push_str(&e.xml10_content()),
@@ -1439,25 +1435,15 @@ fn push_xml_content<'e>(out: &mut String, event: &Event<'e>) {
     }
 }
 
-/// Extract the text of the first `<tag>...</tag>` element.
-///
-/// OBS always prefixes its XML responses with an `<?xml ... ?>` declaration,
-/// so every event kind that is not the tag we are looking for must be
-/// *skipped*, not treated as end-of-input: an early `break` on e.g.
-/// `Event::Decl` made multipart uploads fail with "no UploadId in response"
-/// against a real bucket.
-///
-/// Text is accumulated across events because character references such as
-/// `&amp;` are reported as separate `Text` events, so stopping at the first
-/// one would silently truncate values like `a&b`.
+/// Extract the first plain `<tag>...</tag>` value, joining text, CDATA and
+/// character references while skipping declarations and comments.
 fn parse_tag(xml: &str, tag: &str) -> Option<String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
     let mut in_tag = false;
     let mut text = String::new();
     loop {
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(e)) => {
                 if e.name().as_ref() == tag {
                     in_tag = true;
@@ -1481,7 +1467,6 @@ fn parse_tag(xml: &str, tag: &str) -> Option<String> {
             Err(_) => break,
             _ => {}
         }
-        buf.clear();
     }
     None
 }
@@ -2215,13 +2200,37 @@ mod tests {
     }
 
     #[test]
-    fn unix_meta_absent_when_mode_missing() {
+    fn unix_meta_requires_complete_valid_fields() {
         assert_eq!(parse_unix_meta(&[]), None);
-        assert_eq!(
-            parse_unix_meta(&[("uid".to_string(), "7".to_string())]),
-            None,
-            "uid alone is not enough to claim the object is annotated"
-        );
+        let expected = UnixMeta {
+            mode: libc::S_IFREG | 0o640,
+            uid: u32::MAX,
+            gid: 7,
+            mtime: -1,
+        };
+        let fields: Vec<_> = unix_meta_headers(expected)
+            .into_iter()
+            .map(|(key, value)| (key.trim_prefix("x-obs-meta-").to_string(), value))
+            .collect();
+        assert_eq!(parse_unix_meta(&fields), Some(expected));
+        for key in ["mode", "uid", "gid", "mtime"] {
+            let mut incomplete = fields.clone();
+            incomplete.retain(|(name, _)| name != key);
+            assert_eq!(parse_unix_meta(&incomplete), None, "missing {key}");
+        }
+        for (key, value) in [
+            ("mode", "-1"),
+            ("mode", "4294967296"),
+            ("uid", "-1"),
+            ("uid", "4294967296"),
+            ("gid", "-1"),
+            ("gid", "4294967296"),
+            ("mtime", "invalid"),
+        ] {
+            let mut invalid = fields.clone();
+            invalid.iter_mut().find(|(name, _)| name == key).unwrap().1 = value.into();
+            assert_eq!(parse_unix_meta(&invalid), None, "{key}={value}");
+        }
     }
 
     #[test]

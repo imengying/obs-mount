@@ -21,7 +21,7 @@ use std::path::PathBuf;
 /// The file itself is the recommended home for AK/SK and the mountpoint:
 /// keep it at 0600, e.g. /etc/obs/obs.yaml.
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     mountpoint: Option<PathBuf>,
     bucket: Option<String>,
@@ -42,52 +42,34 @@ struct FileConfig {
 
 impl FileConfig {
     fn load(path: &PathBuf) -> anyhow::Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("cannot read config file {}: {e}", path.display()))?;
-        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.permissions().mode() & 0o077 != 0
         {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(path)
-                && meta.permissions().mode() & 0o077 != 0
-            {
-                tracing::warn!(
-                    path = %path.display(),
-                    "config file holds credentials but is readable by group/other; run: chmod 0600 {}",
-                    path.display()
-                );
-            }
+            tracing::warn!(
+                path = %path.display(),
+                "config file holds credentials but is readable by group/other; run: chmod 0600 {}",
+                path.display()
+            );
         }
         yaml_serde::from_str(&text)
             .map_err(|e| anyhow::anyhow!("cannot parse config file {}: {e}", path.display()))
     }
 }
 
-/// Version string reported by `--version`.
-///
-/// A release build sets `OBS_MOUNT_VERSION` from the git tag that triggered
-/// it, so the published binary reports exactly the tag it was built from
-/// instead of whatever happened to be in Cargo.toml. Local builds fall back
-/// to the crate version.
-fn version_string() -> &'static str {
-    resolve_version(option_env!("OBS_MOUNT_VERSION"))
-}
-
-/// Pick the version to report.
-///
-/// CI stamps `OBS_MOUNT_VERSION` from the git tag. An *empty* value means a
-/// non-tag build (an unset workflow variable expands to ""), which must fall
-/// back to the crate version rather than printing a bare program name.
-/// A leading "v" from the tag is trimmed so `--version` reads "0.2.0".
+/// Use the release tag set by CI, or Cargo's version for local/branch builds.
 fn resolve_version(injected: Option<&'static str>) -> &'static str {
     match injected {
-        Some(v) if !v.trim().is_empty() => v.trim().trim_start_matches('v'),
+        Some(v) if !v.trim().is_empty() => v.trim().trim_prefix('v'),
         _ => env!("CARGO_PKG_VERSION"),
     }
 }
 
 /// Mount a Huawei Cloud OBS bucket as a local directory via FUSE.
 #[derive(Parser, Debug)]
-#[command(version = version_string(), about)]
+#[command(version = resolve_version(option_env!("OBS_MOUNT_VERSION")), about)]
 struct Args {
     /// Config file (YAML) to read at startup. Defaults to
     /// $OBS_MOUNT_CONFIG, else /etc/obs/obs.yaml if it exists.
@@ -145,74 +127,10 @@ struct Args {
     transfer_timeout_secs: Option<u64>,
 }
 
-struct ActiveMount {
-    unmount: fuser::SessionUnmounter,
-    path: PathBuf,
-    id: String,
-}
-
-/// Mount identity is read without entering the FUSE filesystem. This avoids
-/// detaching a different filesystem if the user has already replaced it.
-fn mount_id(path: &std::path::Path) -> std::io::Result<Option<String>> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut encoded = Vec::new();
-    for &byte in path.as_os_str().as_bytes() {
-        match byte {
-            b' ' => encoded.extend_from_slice(b"\\040"),
-            b'\t' => encoded.extend_from_slice(b"\\011"),
-            b'\n' => encoded.extend_from_slice(b"\\012"),
-            b'\\' => encoded.extend_from_slice(b"\\134"),
-            _ => encoded.push(byte),
-        }
-    }
-    let mounts = std::fs::read("/proc/self/mountinfo")?;
-    Ok(mounts
-        .split(|b| *b == b'\n')
-        .filter_map(|line| {
-            let fields: Vec<_> = line.split(|b| *b == b' ').collect();
-            if fields.get(4).copied() == Some(encoded.as_slice()) {
-                Some(String::from_utf8_lossy(fields[0]).into_owned())
-            } else {
-                None
-            }
-        })
-        .next_back())
-}
-
-impl ActiveMount {
-    fn detach(mut self) -> std::io::Result<()> {
-        use std::os::unix::ffi::OsStrExt;
-        if mount_id(&self.path)?.as_deref() == Some(self.id.as_str()) {
-            let path = std::ffi::CString::new(self.path.as_os_str().as_bytes())?;
-            // Explicit detachment works while workers still service requests.
-            // Closing AutoUnmount's socket alone can leave cleanup to a helper
-            // that has already exited; retain it as abnormal-exit protection.
-            if unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH | libc::UMOUNT_NOFOLLOW) }
-                != 0
-            {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EPERM) {
-                    return Err(error);
-                }
-                let output = std::process::Command::new("fusermount3")
-                    .args(["-uz", "--"])
-                    .arg(&self.path)
-                    .output()?;
-                if !output.status.success() {
-                    return Err(std::io::Error::other(
-                        String::from_utf8_lossy(&output.stderr).into_owned(),
-                    ));
-                }
-            }
-        }
-        self.unmount.unmount()
-    }
-}
-
 /// Receive termination signals on an ordinary thread so unmounting never runs
 /// in an async signal handler. Install before HTTP/FUSE threads are created.
 struct Shutdown {
-    unmount: std::sync::Arc<std::sync::Mutex<Option<ActiveMount>>>,
+    unmount: std::sync::Arc<std::sync::Mutex<Option<fuser::SessionUnmounter>>>,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     previous_mask: libc::sigset_t,
@@ -239,7 +157,7 @@ impl Shutdown {
             }
             (signals.assume_init(), previous.assume_init())
         };
-        let unmount: Arc<Mutex<Option<ActiveMount>>> = Arc::new(Mutex::new(None));
+        let unmount: Arc<Mutex<Option<fuser::SessionUnmounter>>> = Arc::new(Mutex::new(None));
         let done = Arc::new(AtomicBool::new(false));
         let receiver = unmount.clone();
         let stopped = done.clone();
@@ -254,9 +172,9 @@ impl Shutdown {
                     let signal =
                         unsafe { libc::sigtimedwait(&signals, std::ptr::null_mut(), &timeout) };
                     if signal == libc::SIGTERM || signal == libc::SIGINT {
-                        if let Some(mount) = receiver.lock().unwrap().take() {
+                        if let Some(mut mount) = receiver.lock().unwrap().take() {
                             tracing::debug!(signal, "unmounting before exit");
-                            if let Err(e) = mount.detach() {
+                            if let Err(e) = mount.unmount() {
                                 tracing::error!(error=%e,"could not unmount during shutdown");
                                 std::process::exit(1);
                             }
@@ -304,19 +222,8 @@ impl Shutdown {
         }
     }
 
-    fn attach(
-        &self,
-        unmount: fuser::SessionUnmounter,
-        path: &std::path::Path,
-    ) -> std::io::Result<()> {
-        let id = mount_id(path)?
-            .ok_or_else(|| std::io::Error::other("new mount missing from mountinfo"))?;
-        *self.unmount.lock().unwrap() = Some(ActiveMount {
-            unmount,
-            path: path.to_owned(),
-            id,
-        });
-        Ok(())
+    fn attach(&self, unmount: fuser::SessionUnmounter) {
+        *self.unmount.lock().unwrap() = Some(unmount);
     }
 }
 
@@ -438,12 +345,9 @@ fn main() -> anyhow::Result<()> {
     }
     // Startup self-check 2: the bucket must be listable before we mount,
     // otherwise a bad AK/SK or region shows up as an empty-looking mount.
-    match client.list_objects("", "/", None, 1) {
-        Ok(_) => {}
-        Err(e) => {
-            tracing::error!(error = %e, "OBS bucket check failed; refusing to mount (check AK/SK, bucket, region/endpoint, and clock/NTP)");
-            anyhow::bail!("OBS bucket check failed: {e}");
-        }
+    if let Err(e) = client.list_objects("", "/", None, 1) {
+        tracing::error!(error = %e, "OBS bucket check failed; refusing to mount (check AK/SK, bucket, region/endpoint, and clock/NTP)");
+        anyhow::bail!("OBS bucket check failed: {e}");
     }
     let min_free_space = args
         .min_free_space
@@ -512,7 +416,7 @@ fn main() -> anyhow::Result<()> {
     );
     let run = (|| {
         let mut session = fuser::Session::new(fs, &mountpoint, &config)?;
-        shutdown.attach(session.unmount_callable(), &mountpoint)?;
+        shutdown.attach(session.unmount_callable());
         session.run()
     })();
     run.map_err(|e| {
@@ -562,16 +466,13 @@ fn existing_staging_dirs(base: &std::path::Path, uid: u32) -> std::io::Result<Ve
 
 /// Lock the directory inode itself for the lifetime of the returned descriptor.
 fn lock_staging_dir(dir: &std::path::Path) -> std::io::Result<File> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(dir)?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // A concurrent cleaner may have removed the directory between open and flock.
+    file.try_lock()?;
+    // A concurrent cleaner may have removed the directory between open and lock.
     if file.metadata()?.nlink() == 0 {
         return Err(std::io::ErrorKind::NotFound.into());
     }

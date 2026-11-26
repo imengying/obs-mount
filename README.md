@@ -81,7 +81,7 @@ sudo env RUST_LOG=debug /etc/obs/obs -c /etc/obs/obs.yaml
 
 ## 开发与测试
 
-需要 Rust stable（源码至少 1.88）和 C/C++ 构建工具（Debian / Ubuntu：`build-essential cmake perl pkg-config`）。
+需要 Rust stable（源码至少 1.100）和 C/C++ 构建工具（Debian / Ubuntu：`build-essential cmake perl pkg-config`）。Cargo 会拒绝未使用的生产依赖，避免冗余依赖积累。
 
 在 glibc 系统上构建；本地二进制的运行库要求取决于构建环境。CI 分别使用 `x86_64-unknown-linux-gnu` 和 `aarch64-unknown-linux-gnu` 目标，并检查动态加载器、共享库是否可加载，以及引用的 glibc 符号版本不超过 2.39。HTTPS 使用系统 CA 证书，需要安装 `ca-certificates`。
 

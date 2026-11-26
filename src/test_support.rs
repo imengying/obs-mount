@@ -318,7 +318,7 @@ fn strip_bucket(path: &str) -> &str {
     if path == BUCKET {
         ""
     } else {
-        path.strip_prefix("test-bucket/").unwrap_or(path)
+        path.trim_prefix("test-bucket/")
     }
 }
 

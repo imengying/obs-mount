@@ -2,8 +2,8 @@
 name = "obs-mount"
 version = "0.1.0"
 edition = "2024"
-# Let chains require Rust 1.88; stable is selected by rust-toolchain.toml.
-rust-version = "1.88"
+# DropGuard and Cargo's dependency lint require Rust 1.100.
+rust-version = "1.100"
 description = "Mount a Huawei Cloud OBS bucket as a local directory via FUSE, using OBS native REST signing (HMAC-SHA1, x-obs-*), not S3 compatibility."
 license = "MIT"
 
@@ -13,7 +13,7 @@ base64 = "0.23"
 bytes = "1"
 libc = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
-fuser = "0.18"
+fuser = "0.19"
 hmac = "0.13"
 httpdate = "1"
 md-5 = "0.11"
@@ -30,6 +30,9 @@ yaml_serde = "0.10.7"
 [dev-dependencies]
 serde_json = "1"
 tiny_http = "0.12"
+
+[lints.cargo]
+unused_dependencies = "deny"
 
 [profile.release]
 # Optimize across crates and remove symbols from distributed executables.
